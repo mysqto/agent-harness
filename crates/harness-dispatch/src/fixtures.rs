@@ -2,11 +2,16 @@
 //!
 //! The dispatcher's interesting behaviour is ordering — refuse before invoking, dedupe before
 //! anything, filter before posting — and ordering can only be asserted on something that records
-//! whether it was reached. These fakes record; nothing here needs a socket, a store or a clock.
+//! whether it was reached. So the agent, the adapter and the store here all record.
+//!
+//! One exception, at the bottom: [`store_stub`] is a real server on a real port. Where this crate
+//! touches the transport, a fake store would stub out the thing being tested.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use harness_agent::{
     ActionDraft, Agent, AgentId, Capability, Context, Egress, Outcome, Status, Task,
@@ -14,9 +19,9 @@ use harness_agent::{
 use harness_envelope::{Delivery, Envelope};
 use harness_memory::Bundle;
 
-use crate::egress::{Adapter, Filter};
+use crate::egress::{Adapter, Courier, Filter};
 use crate::registry::Registry;
-use crate::route::ContextStore;
+use crate::route::{ContextStore, Dispatcher};
 
 fn guard<T>(lock: &Mutex<T>) -> MutexGuard<'_, T> {
     lock.lock().unwrap_or_else(PoisonError::into_inner)
@@ -60,6 +65,30 @@ pub fn draft(action: &str) -> ActionDraft {
 /// Names the filter list's type where an empty `vec![]` would be ambiguous.
 pub fn filters(filters: Vec<Box<dyn Filter>>) -> Vec<Box<dyn Filter>> {
     filters
+}
+
+/// A dispatcher over `agents`, `store` and `courier`.
+pub fn dispatcher(
+    agents: &[Arc<RecordingAgent>],
+    store: Arc<dyn ContextStore>,
+    courier: Courier,
+) -> Dispatcher {
+    Dispatcher::new(registry(agents), store, courier)
+}
+
+/// A courier with no filters and an adapter nobody inspects, for tests about something else.
+pub fn plain_courier() -> Courier {
+    Courier::new(filters(vec![]), Box::new(RecordingAdapter::working()))
+}
+
+/// An envelope naming one entity, so a store has something to be asked about.
+pub fn envelope_about(body: &str, kind: &str, id: &str) -> Envelope {
+    let mut envelope = envelope(body);
+    envelope.extra.insert(
+        "entities".into(),
+        serde_json::json!([{"kind": kind, "id": id}]),
+    );
+    envelope
 }
 
 /// A registry holding `agents`, which must claim disjoint intents.
@@ -155,7 +184,12 @@ impl<T: Adapter + ?Sized> Adapter for Arc<T> {
 pub struct FakeStore {
     degraded: bool,
     read_error: Option<String>,
+    read_rejection: Option<String>,
+    /// Limits the rejection to reads naming this kind, so a store can refuse one entity and answer
+    /// about another — which is how a rejection actually arrives.
+    rejected_kind: Option<String>,
     write_error: Option<String>,
+    write_rejection: Option<String>,
     records: Vec<serde_json::Value>,
     requested: Mutex<Vec<(String, String)>>,
     submitted: Mutex<Vec<String>>,
@@ -166,7 +200,10 @@ impl FakeStore {
         Self {
             degraded: false,
             read_error: None,
+            read_rejection: None,
+            rejected_kind: None,
             write_error: None,
+            write_rejection: None,
             records: Vec::new(),
             requested: Mutex::new(Vec::new()),
             submitted: Mutex::new(Vec::new()),
@@ -200,10 +237,34 @@ impl FakeStore {
         }
     }
 
-    /// Reads fine, refuses writes.
+    /// Reads fine, refuses writes as briefly unavailable.
     pub fn write_only_failure() -> Self {
         Self {
             write_error: Some("store is read-only".into()),
+            ..Self::healthy()
+        }
+    }
+
+    /// Rejects every read permanently, the way a malformed request is answered.
+    pub fn rejecting_reads() -> Self {
+        Self {
+            read_rejection: Some("unknown entity kind".into()),
+            ..Self::new()
+        }
+    }
+
+    /// Rejects only reads naming `kind`.
+    pub fn rejecting_reads_of(kind: &str) -> Self {
+        Self {
+            rejected_kind: Some(kind.to_owned()),
+            ..Self::rejecting_reads()
+        }
+    }
+
+    /// Rejects a write permanently.
+    pub fn rejecting_writes() -> Self {
+        Self {
+            write_rejection: Some("record failed validation".into()),
             ..Self::healthy()
         }
     }
@@ -227,6 +288,13 @@ impl ContextStore for FakeStore {
         _deadline_ms: u64,
     ) -> harness_memory::Result<Bundle> {
         guard(&self.requested).extend_from_slice(entities);
+        let rejected = self
+            .rejected_kind
+            .as_ref()
+            .is_none_or(|kind| entities.iter().any(|(asked, _)| asked == kind));
+        if let (Some(why), true) = (&self.read_rejection, rejected) {
+            return Err(harness_memory::Error::Rejected(why.clone()));
+        }
         if let Some(why) = &self.read_error {
             return Err(harness_memory::Error::Unavailable(why.clone()));
         }
@@ -238,6 +306,9 @@ impl ContextStore for FakeStore {
     }
 
     async fn submit(&self, draft: &ActionDraft) -> harness_memory::Result<()> {
+        if let Some(why) = &self.write_rejection {
+            return Err(harness_memory::Error::Rejected(why.clone()));
+        }
         if let Some(why) = &self.write_error {
             return Err(harness_memory::Error::Unavailable(why.clone()));
         }
@@ -423,4 +494,94 @@ impl Agent for RecordingAgent {
             records: self.records.clone(),
         })
     }
+}
+
+/// One canned HTTP reply from a stub store.
+pub struct Canned {
+    status: u16,
+    body: String,
+}
+
+/// A `200` carrying a bundle body.
+pub fn served(body: &serde_json::Value) -> Canned {
+    Canned {
+        status: 200,
+        body: body.to_string(),
+    }
+}
+
+/// A bare status, for the paths where only the code matters.
+pub fn refused(status: u16) -> Canned {
+    Canned {
+        status,
+        body: String::new(),
+    }
+}
+
+/// A store on a loopback port, answering `replies` in order.
+///
+/// A real socket rather than a stubbed seam: the point of these tests is that the concrete
+/// [`harness_memory::Client`] behaves as the guard expects, and injecting a seam would replace the
+/// very code under test. Returns the base URL and the requests the stub saw.
+pub async fn store_stub(replies: Vec<Canned>) -> (String, Arc<Mutex<Vec<String>>>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let base_url = format!("http://{}", listener.local_addr().expect("addr"));
+    let seen: Arc<Mutex<Vec<String>>> = Arc::default();
+    let recorded = Arc::clone(&seen);
+    tokio::spawn(async move {
+        for reply in replies {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let request = read_request(&mut stream).await;
+            guard(&recorded).push(request);
+            let head = format!(
+                "HTTP/1.1 {} OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                reply.status,
+                reply.body.len()
+            );
+            // The client may already have given up; that is a case under test, not a failure.
+            let _ = stream.write_all(head.as_bytes()).await;
+            let _ = stream.write_all(reply.body.as_bytes()).await;
+            let _ = stream.shutdown().await;
+        }
+    });
+    (base_url, seen)
+}
+
+/// Reads one request, body included, so a recorded `POST` shows what was sent.
+async fn read_request(stream: &mut tokio::net::TcpStream) -> String {
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while stream.read(&mut byte).await.unwrap_or(0) == 1 {
+        head.push(byte[0]);
+        if head.ends_with(b"\r\n\r\n") {
+            break;
+        }
+    }
+    let text = String::from_utf8_lossy(&head).to_string();
+    let length = text
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().ok())?
+        })
+        .unwrap_or(0);
+    let mut body = vec![0u8; length];
+    if length > 0 {
+        stream.read_exact(&mut body).await.expect("read body");
+    }
+    format!("{text}{}", String::from_utf8_lossy(&body))
+}
+
+/// A client pointed at `base_url`, with no sidecar, as production would build one.
+pub fn client(base_url: &str) -> harness_memory::Client {
+    harness_memory::Client::new(harness_memory::Config {
+        base_url: base_url.to_owned(),
+        sidecar_socket: None,
+        agent: "summariser".into(),
+    })
 }

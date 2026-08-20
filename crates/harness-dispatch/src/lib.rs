@@ -6,9 +6,9 @@
 //! system rather than something each agent has to remember.
 //!
 //! Deduplication and delivery both need somewhere to remember what has already happened, so a
-//! caller holds a [`Seen`] and an [`egress::Courier`] and passes them in. Keeping that state with
-//! the caller rather than in a process-global is what lets two dispatchers share a process, and
-//! what lets a test observe either ledger.
+//! [`Dispatcher`] owns both ledgers and is assembled once with the registry, the store and the one
+//! courier it may post through. Keeping that state in an instance rather than in a process-global is
+//! what lets two dispatchers share a process without sharing either ledger.
 
 #![forbid(unsafe_code)]
 
@@ -22,4 +22,4 @@ mod fixtures;
 
 pub use error::{Error, Result};
 pub use registry::Registry;
-pub use route::{ContextStore, Dispatched, Seen, dispatch};
+pub use route::{ContextStore, Dispatched, Dispatcher};

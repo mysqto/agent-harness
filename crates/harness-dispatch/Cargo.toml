@@ -20,3 +20,7 @@ tracing.workspace = true
 harness-agent = { path = "../harness-agent" }
 harness-envelope = { path = "../harness-envelope" }
 harness-memory = { path = "../harness-memory" }
+
+[dev-dependencies]
+# A stub store on a real socket, for the tests that exercise the concrete memory client.
+tokio = { workspace = true, features = ["net", "io-util"] }

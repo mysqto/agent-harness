@@ -35,8 +35,8 @@ pub trait Adapter: Send + Sync {
 /// Keyed per [`Delivery`] rather than per envelope: one envelope can produce several messages, and
 /// a replay must re-send none of them.
 ///
-/// In memory, like [`crate::Seen`], and with the same limit: it stops a repeat within the life of
-/// the process and claims nothing beyond it.
+/// In memory, like the dispatcher's own dedupe ledger, and with the same limit: it stops a repeat
+/// within the life of the process and claims nothing beyond it.
 #[derive(Debug, Default)]
 pub struct Sent {
     keys: Mutex<HashSet<String>>,

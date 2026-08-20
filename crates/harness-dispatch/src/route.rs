@@ -1,7 +1,7 @@
 //! Turning an envelope into a handled task.
 
 use std::collections::{BTreeMap, HashSet};
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
 use harness_agent::{ActionDraft, Actor, Context, MemoryHandle, Task, TaskId};
@@ -29,7 +29,7 @@ pub struct Dispatched {
 /// A trait rather than the concrete client because the ordering rules below — degrade rather than
 /// fail, refuse a mutation on partial context *before* the agent runs — are the whole point of this
 /// module, and they are only testable if the store can be substituted. [`harness_memory::Client`]
-/// implements it, so production wiring passes one straight through.
+/// implements it, so production wiring hands one straight to [`Dispatcher::new`].
 #[async_trait::async_trait]
 pub trait ContextStore: Send + Sync {
     /// Composes context for the entities a task touches.
@@ -43,8 +43,8 @@ pub trait ContextStore: Send + Sync {
     async fn submit(&self, draft: &ActionDraft) -> harness_memory::Result<()>;
 }
 
-// Pure delegation, and the only part of this crate no test reaches: exercising it would run
-// `harness-memory`'s own bodies, which is that crate's job to cover.
+// Pure delegation. Covered by the `transport` tests below against a stub store rather than a fake
+// client, because a fake here would stub out the transport this impl exists to reach.
 #[async_trait::async_trait]
 impl ContextStore for harness_memory::Client {
     async fn bundle(
@@ -69,17 +69,11 @@ impl ContextStore for harness_memory::Client {
 /// about a redelivery that arrives after a restart. Surviving one needs a durable ledger, which
 /// belongs behind the store rather than here.
 #[derive(Debug, Default)]
-pub struct Seen {
+struct Seen {
     ids: Mutex<HashSet<String>>,
 }
 
 impl Seen {
-    /// An empty ledger.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     fn contains(&self, id: &str) -> bool {
         self.lock().contains(id)
     }
@@ -95,116 +89,152 @@ impl Seen {
     }
 }
 
-/// Handles one envelope end to end.
+/// A running dispatcher: the agents it can route to, the store it reads, the only way it can post,
+/// and what it has already done.
 ///
-/// Order matters: dedupe first so a redelivery costs nothing, then classify, then load context,
-/// then decide whether a mutating task may proceed on what was loaded, and only then invoke the
-/// agent. Checking safety after invoking would mean the side effect had already happened.
-///
-/// `seen` and `courier` hold the two ledgers that make a replay cheap, so a caller keeps them for
-/// as long as redeliveries are possible. The returned deliveries are what the agent asked to send;
-/// what the adapter received is that text with every filter applied.
-pub async fn dispatch(
-    registry: &crate::Registry,
-    memory: &dyn ContextStore,
-    courier: &Courier,
-    seen: &Seen,
-    envelope: Envelope,
-) -> crate::Result<Dispatched> {
-    if seen.contains(&envelope.envelope_id) {
-        tracing::info!(
-            envelope_id = %envelope.envelope_id,
-            attempt = envelope.attempt,
-            "already handled; nothing re-run"
-        );
-        return Ok(Dispatched {
-            deliveries: Vec::new(),
-            records_written: 0,
-            duplicate: true,
-        });
+/// Assembled once and then asked to handle envelopes. Holding the two ledgers here is what makes a
+/// redelivery cheap; holding them in a struct rather than threading them through every call is what
+/// keeps the relationship between them stated in one place. Two dispatchers can share a process
+/// without sharing either ledger, which a process-global would have made impossible.
+pub struct Dispatcher {
+    registry: crate::Registry,
+    store: Arc<dyn ContextStore>,
+    courier: Courier,
+    seen: Seen,
+}
+
+impl Dispatcher {
+    /// Assembles a dispatcher.
+    ///
+    /// The store arrives behind an `Arc` because it is usually shared — with a sidecar client, with
+    /// another dispatcher, or with a test that wants to look at what was written.
+    #[must_use]
+    pub fn new(registry: crate::Registry, store: Arc<dyn ContextStore>, courier: Courier) -> Self {
+        Self {
+            registry,
+            store,
+            courier,
+            seen: Seen::default(),
+        }
     }
 
-    let request = classify(&envelope);
-    let agent = registry.resolve(&request.intent)?;
-    let mutating = agent
-        .capabilities()
-        .iter()
-        .find(|c| c.intent == request.intent)
-        .is_some_and(|c| c.mutating);
-
-    let deadline_ms = deadline_ms(&envelope);
-    let bundle = load(memory, &request.entities, deadline_ms).await;
-
-    if mutating && bundle.degraded {
-        // Before the agent runs, not after: a refusal that arrives once the side effect has
-        // happened is not a refusal.
-        tracing::warn!(
-            envelope_id = %envelope.envelope_id,
-            intent = %request.intent,
-            omitted = ?bundle.omitted,
-            "refusing a mutating task on partial context"
-        );
-        return Err(crate::Error::RefusedDegraded);
+    /// The agents this dispatcher can route to.
+    #[must_use]
+    pub fn registry(&self) -> &crate::Registry {
+        &self.registry
     }
 
-    let task = Task {
-        // One envelope is one task: a retry must not mint a second identity, or the audit trail
-        // shows two actions where the source sent one message.
-        task_id: TaskId(envelope.envelope_id.clone()),
-        correlation_id: envelope.envelope_id.clone(),
-        intent: request.intent,
-        args: request.args,
-        mutating,
-        actor: envelope.actor.as_ref().map(|id| Actor {
-            id: id.clone(),
-            source: envelope.source.clone(),
-        }),
-    };
-    let context = Dispatching::new(memory, &envelope.envelope_id, deadline_ms, bundle.degraded);
-    let outcome = agent.handle(task, &context).await?;
+    /// Handles one envelope end to end.
+    ///
+    /// Order matters: dedupe first so a redelivery costs nothing, then classify, then load context,
+    /// then decide whether a mutating task may proceed on what was loaded, and only then invoke the
+    /// agent. Checking safety after invoking would mean the side effect had already happened.
+    ///
+    /// The returned deliveries are what the agent asked to send; what the adapter received is that
+    /// text with every filter applied.
+    pub async fn dispatch(&self, envelope: Envelope) -> crate::Result<Dispatched> {
+        let memory: &dyn ContextStore = self.store.as_ref();
 
-    let deliveries = deliveries(&envelope, outcome.egress);
-    courier.deliver(deliveries.clone()).await?;
+        if self.seen.contains(&envelope.envelope_id) {
+            tracing::info!(
+                envelope_id = %envelope.envelope_id,
+                attempt = envelope.attempt,
+                "already handled; nothing re-run"
+            );
+            return Ok(Dispatched {
+                deliveries: Vec::new(),
+                records_written: 0,
+                duplicate: true,
+            });
+        }
 
-    // Delivery is idempotent, so a record that fails to submit can be retried by replaying the
-    // whole envelope without the reply going out twice.
-    let mut drafts = outcome.records;
-    drafts.extend(context.into_drafts());
-    let mut records_written = 0;
-    for draft in &drafts {
-        memory
-            .submit(draft)
-            .await
-            .map_err(|error| unavailable(&error))?;
-        records_written += 1;
+        let request = classify(&envelope);
+        let agent = self.registry.resolve(&request.intent)?;
+        let mutating = agent
+            .capabilities()
+            .iter()
+            .find(|c| c.intent == request.intent)
+            .is_some_and(|c| c.mutating);
+
+        let deadline_ms = deadline_ms(&envelope);
+        let bundle = load(memory, &request.entities, deadline_ms).await?;
+
+        if mutating && bundle.degraded {
+            // Before the agent runs, not after: a refusal that arrives once the side effect has
+            // happened is not a refusal.
+            tracing::warn!(
+                envelope_id = %envelope.envelope_id,
+                intent = %request.intent,
+                omitted = ?bundle.omitted,
+                "refusing a mutating task on partial context"
+            );
+            return Err(crate::Error::RefusedDegraded);
+        }
+
+        let task = Task {
+            // One envelope is one task: a retry must not mint a second identity, or the audit trail
+            // shows two actions where the source sent one message.
+            task_id: TaskId(envelope.envelope_id.clone()),
+            correlation_id: envelope.envelope_id.clone(),
+            intent: request.intent,
+            args: request.args,
+            mutating,
+            actor: envelope.actor.as_ref().map(|id| Actor {
+                id: id.clone(),
+                source: envelope.source.clone(),
+            }),
+        };
+        let context = Dispatching::new(memory, &envelope.envelope_id, deadline_ms, bundle.degraded);
+        let outcome = agent.handle(task, &context).await?;
+
+        let deliveries = deliveries(&envelope, outcome.egress);
+        self.courier.deliver(deliveries.clone()).await?;
+
+        // Delivery is idempotent, so a record that fails to submit can be retried by replaying the
+        // whole envelope without the reply going out twice.
+        let mut drafts = outcome.records;
+        drafts.extend(context.into_drafts());
+        let mut records_written = 0;
+        for draft in &drafts {
+            memory
+                .submit(draft)
+                .await
+                .map_err(|error| to_agent(&error))?;
+            records_written += 1;
+        }
+
+        self.seen.remember(envelope.envelope_id);
+        Ok(Dispatched {
+            deliveries,
+            records_written,
+            duplicate: false,
+        })
     }
-
-    seen.remember(envelope.envelope_id);
-    Ok(Dispatched {
-        deliveries,
-        records_written,
-        duplicate: false,
-    })
 }
 
 /// Loads context, treating an unreachable store as context that is merely incomplete.
 ///
 /// Degrading keeps questions answerable when memory is down; the guard above is what keeps actions
 /// from being taken on the result. Failing here instead would take both away at once.
+///
+/// A rejection is the exception, and deliberately so: the store rejects a request because the
+/// request is wrong, and a malformed request that comes back wearing a degraded flag reads as
+/// slowness and gets retried forever. It propagates instead, permanently, so it gets fixed.
 async fn load(
     memory: &dyn ContextStore,
     entities: &[(String, String)],
     deadline_ms: u64,
-) -> Bundle {
+) -> crate::Result<Bundle> {
     match memory.bundle(entities, deadline_ms).await {
-        Ok(bundle) => bundle,
+        Ok(bundle) => Ok(bundle),
+        Err(rejected @ harness_memory::Error::Rejected(_)) => Err(to_agent(&rejected).into()),
         Err(error) => {
             tracing::warn!(%error, "context unavailable; continuing degraded");
-            Bundle {
+            Ok(Bundle {
                 records: Vec::new(),
                 degraded: true,
                 omitted: vec![error.to_string()],
-            }
+            })
         }
     }
 }
@@ -310,12 +340,19 @@ fn deliveries(envelope: &Envelope, egress: Vec<harness_agent::Egress>) -> Vec<De
         .collect()
 }
 
-/// Maps a store failure onto the dispatch error.
+/// Maps a store failure onto what a caller may act on.
 ///
-/// Dispatch has no memory variant, so a failed write surfaces as the agent-side `Unavailable`:
-/// retryable, which is what a caller needs to know.
-fn unavailable(error: &harness_memory::Error) -> crate::Error {
-    harness_agent::Error::Unavailable(error.to_string()).into()
+/// Dispatch has no memory variant of its own, so the split that matters is preserved instead: a
+/// rejection is permanent and arrives as `Malformed`, and everything else is worth retrying and
+/// arrives as `Unavailable`. `harness-memory` draws the same line for agents, and a caller that
+/// retried a rejection would retry it forever.
+fn to_agent(error: &harness_memory::Error) -> harness_agent::Error {
+    match error {
+        harness_memory::Error::Rejected(detail) => harness_agent::Error::Malformed(detail.clone()),
+        harness_memory::Error::Unavailable(detail) | harness_memory::Error::Transport(detail) => {
+            harness_agent::Error::Unavailable(detail.clone())
+        }
+    }
 }
 
 /// The context one task sees.
@@ -398,7 +435,7 @@ impl MemoryHandle for Queued<'_> {
             .store
             .bundle(&entities, self.deadline_ms)
             .await
-            .map_err(|error| harness_agent::Error::Unavailable(error.to_string()))?;
+            .map_err(|error| to_agent(&error))?;
         Ok(bundle
             .records
             .into_iter()
@@ -427,40 +464,32 @@ mod tests {
 
     use harness_agent::{Egress, Status};
 
-    use super::{Seen, dispatch};
     use crate::egress::Courier;
     use crate::fixtures::{
-        FakeStore, RecordingAdapter, RecordingAgent, Suffix, draft, envelope, filters, registry,
+        FakeStore, RecordingAdapter, RecordingAgent, Suffix, dispatcher, draft, envelope, filters,
+        plain_courier,
     };
 
     #[tokio::test]
     async fn a_duplicate_envelope_is_not_re_run() {
         let agent =
             Arc::new(RecordingAgent::new("reader", &[("summarise", false)]).replying("one event"));
-        let registry = registry(std::slice::from_ref(&agent));
-        let store = FakeStore::healthy();
         let adapter = Arc::new(RecordingAdapter::working());
         let courier = Courier::new(filters(vec![]), Box::new(adapter.clone()));
-        let seen = Seen::new();
+        let dispatcher = dispatcher(
+            std::slice::from_ref(&agent),
+            Arc::new(FakeStore::healthy()),
+            courier,
+        );
 
-        let first = dispatch(
-            &registry,
-            &store,
-            &courier,
-            &seen,
-            envelope("summarise all"),
-        )
-        .await
-        .expect("first dispatch");
-        let retry = dispatch(
-            &registry,
-            &store,
-            &courier,
-            &seen,
-            envelope("summarise all"),
-        )
-        .await
-        .expect("redelivery");
+        let first = dispatcher
+            .dispatch(envelope("summarise all"))
+            .await
+            .expect("first dispatch");
+        let retry = dispatcher
+            .dispatch(envelope("summarise all"))
+            .await
+            .expect("redelivery");
 
         assert!(!first.duplicate);
         assert!(retry.duplicate);
@@ -476,17 +505,16 @@ mod tests {
         // agent would have performed has not happened.
         let agent = Arc::new(RecordingAgent::new("writer", &[("apply", true)]).replying("applied"));
         let adapter = Arc::new(RecordingAdapter::working());
-        let courier = Courier::new(filters(vec![]), Box::new(adapter.clone()));
+        let dispatcher = dispatcher(
+            std::slice::from_ref(&agent),
+            Arc::new(FakeStore::degraded()),
+            Courier::new(filters(vec![]), Box::new(adapter.clone())),
+        );
 
-        let error = dispatch(
-            &registry(std::slice::from_ref(&agent)),
-            &FakeStore::degraded(),
-            &courier,
-            &Seen::new(),
-            envelope("apply the change"),
-        )
-        .await
-        .expect_err("refused");
+        let error = dispatcher
+            .dispatch(envelope("apply the change"))
+            .await
+            .expect_err("refused");
 
         assert!(matches!(error, crate::Error::RefusedDegraded));
         assert_eq!(error.to_string(), "refused: cannot act on partial context");
@@ -499,17 +527,16 @@ mod tests {
         let agent =
             Arc::new(RecordingAgent::new("reader", &[("summarise", false)]).replying("partial"));
         let adapter = Arc::new(RecordingAdapter::working());
-        let courier = Courier::new(filters(vec![]), Box::new(adapter.clone()));
+        let dispatcher = dispatcher(
+            std::slice::from_ref(&agent),
+            Arc::new(FakeStore::degraded()),
+            Courier::new(filters(vec![]), Box::new(adapter.clone())),
+        );
 
-        let handled = dispatch(
-            &registry(std::slice::from_ref(&agent)),
-            &FakeStore::degraded(),
-            &courier,
-            &Seen::new(),
-            envelope("summarise all"),
-        )
-        .await
-        .expect("dispatched");
+        let handled = dispatcher
+            .dispatch(envelope("summarise all"))
+            .await
+            .expect("dispatched");
 
         assert_eq!(agent.calls(), 1);
         assert_eq!(handled.deliveries.len(), 1);
@@ -523,15 +550,16 @@ mod tests {
     #[tokio::test]
     async fn a_mutating_task_on_a_whole_bundle_proceeds() {
         let agent = Arc::new(RecordingAgent::new("writer", &[("apply", true)]).replying("applied"));
-        let handled = dispatch(
-            &registry(std::slice::from_ref(&agent)),
-            &FakeStore::healthy(),
-            &Courier::new(filters(vec![]), Box::new(RecordingAdapter::working())),
-            &Seen::new(),
-            envelope("apply the change"),
-        )
-        .await
-        .expect("dispatched");
+        let dispatcher = dispatcher(
+            std::slice::from_ref(&agent),
+            Arc::new(FakeStore::healthy()),
+            plain_courier(),
+        );
+
+        let handled = dispatcher
+            .dispatch(envelope("apply the change"))
+            .await
+            .expect("dispatched");
 
         assert_eq!(agent.calls(), 1);
         assert!(agent.task().expect("a task").mutating);
@@ -543,25 +571,23 @@ mod tests {
         // A question still gets an answer; the guard is what stops an action being taken on it.
         let reader =
             Arc::new(RecordingAgent::new("reader", &[("summarise", false)]).replying("all I have"));
-        dispatch(
-            &registry(std::slice::from_ref(&reader)),
-            &FakeStore::unreachable(),
-            &Courier::new(filters(vec![]), Box::new(RecordingAdapter::working())),
-            &Seen::new(),
-            envelope("summarise all"),
+        dispatcher(
+            std::slice::from_ref(&reader),
+            Arc::new(FakeStore::unreachable()),
+            plain_courier(),
         )
+        .dispatch(envelope("summarise all"))
         .await
         .expect("dispatched degraded");
         assert!(reader.saw_degraded());
 
         let writer = Arc::new(RecordingAgent::new("writer", &[("apply", true)]));
-        let error = dispatch(
-            &registry(std::slice::from_ref(&writer)),
-            &FakeStore::unreachable(),
-            &Courier::new(filters(vec![]), Box::new(RecordingAdapter::working())),
-            &Seen::new(),
-            envelope("apply the change"),
+        let error = dispatcher(
+            std::slice::from_ref(&writer),
+            Arc::new(FakeStore::unreachable()),
+            plain_courier(),
         )
+        .dispatch(envelope("apply the change"))
         .await
         .expect_err("refused");
 
@@ -570,17 +596,53 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_intent_no_agent_claims_is_unroutable() {
-        let error = dispatch(
-            &registry(&[Arc::new(RecordingAgent::new(
-                "reader",
-                &[("summarise", false)],
-            ))]),
-            &FakeStore::healthy(),
-            &Courier::new(filters(vec![]), Box::new(RecordingAdapter::working())),
-            &Seen::new(),
-            envelope("translate all"),
+    async fn a_rejected_read_is_permanent_rather_than_degraded() {
+        // A rejection means the request was wrong. Degrading it would hide a bug behind a flag that
+        // reads as slowness, and the caller would retry it forever.
+        let agent = Arc::new(RecordingAgent::new("reader", &[("summarise", false)]));
+        let error = dispatcher(
+            std::slice::from_ref(&agent),
+            Arc::new(FakeStore::rejecting_reads()),
+            plain_courier(),
         )
+        .dispatch(envelope("summarise all"))
+        .await
+        .expect_err("rejected");
+
+        assert_eq!(error.to_string(), "malformed task: unknown entity kind");
+        assert_eq!(agent.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_rejected_write_is_permanent_too() {
+        let agent = Arc::new(
+            RecordingAgent::new("reader", &[("summarise", false)])
+                .returning_record(draft("summarise")),
+        );
+        let error = dispatcher(
+            std::slice::from_ref(&agent),
+            Arc::new(FakeStore::rejecting_writes()),
+            plain_courier(),
+        )
+        .dispatch(envelope("summarise all"))
+        .await
+        .expect_err("rejected");
+
+        assert_eq!(
+            error.to_string(),
+            "malformed task: record failed validation"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_intent_no_agent_claims_is_unroutable() {
+        let agent = Arc::new(RecordingAgent::new("reader", &[("summarise", false)]));
+        let error = dispatcher(
+            std::slice::from_ref(&agent),
+            Arc::new(FakeStore::healthy()),
+            plain_courier(),
+        )
+        .dispatch(envelope("translate all"))
         .await
         .expect_err("unroutable");
 
@@ -592,20 +654,19 @@ mod tests {
         let agent =
             Arc::new(RecordingAgent::new("reader", &[("summarise", false)]).replying("two events"));
         let adapter = Arc::new(RecordingAdapter::working());
-        let courier = Courier::new(
-            filters(vec![Box::new(Suffix(" [reviewed]"))]),
-            Box::new(adapter.clone()),
+        let dispatcher = dispatcher(
+            std::slice::from_ref(&agent),
+            Arc::new(FakeStore::healthy()),
+            Courier::new(
+                filters(vec![Box::new(Suffix(" [reviewed]"))]),
+                Box::new(adapter.clone()),
+            ),
         );
 
-        let handled = dispatch(
-            &registry(&[agent]),
-            &FakeStore::healthy(),
-            &courier,
-            &Seen::new(),
-            envelope("summarise all"),
-        )
-        .await
-        .expect("dispatched");
+        let handled = dispatcher
+            .dispatch(envelope("summarise all"))
+            .await
+            .expect("dispatched");
 
         assert_eq!(adapter.texts(), vec!["two events [reviewed]"]);
         assert_eq!(
@@ -623,15 +684,13 @@ mod tests {
                 thread: Some("t-7".into()),
             }),
         );
-        let adapter = Arc::new(RecordingAdapter::working());
 
-        let handled = dispatch(
-            &registry(&[agent]),
-            &FakeStore::healthy(),
-            &Courier::new(filters(vec![]), Box::new(adapter.clone())),
-            &Seen::new(),
-            envelope("summarise all"),
+        let handled = dispatcher(
+            std::slice::from_ref(&agent),
+            Arc::new(FakeStore::healthy()),
+            plain_courier(),
         )
+        .dispatch(envelope("summarise all"))
         .await
         .expect("dispatched");
 
@@ -651,13 +710,12 @@ mod tests {
             }),
         );
 
-        let handled = dispatch(
-            &registry(&[agent]),
-            &FakeStore::healthy(),
-            &Courier::new(filters(vec![]), Box::new(RecordingAdapter::working())),
-            &Seen::new(),
-            envelope("summarise all"),
+        let handled = dispatcher(
+            std::slice::from_ref(&agent),
+            Arc::new(FakeStore::healthy()),
+            plain_courier(),
         )
+        .dispatch(envelope("summarise all"))
         .await
         .expect("dispatched");
 
@@ -671,17 +729,12 @@ mod tests {
                 .returning_record(draft("summarise"))
                 .queueing_record(draft("read")),
         );
-        let store = FakeStore::healthy();
+        let store = Arc::new(FakeStore::healthy());
 
-        let handled = dispatch(
-            &registry(&[agent]),
-            &store,
-            &Courier::new(filters(vec![]), Box::new(RecordingAdapter::working())),
-            &Seen::new(),
-            envelope("summarise all"),
-        )
-        .await
-        .expect("dispatched");
+        let handled = dispatcher(std::slice::from_ref(&agent), store.clone(), plain_courier())
+            .dispatch(envelope("summarise all"))
+            .await
+            .expect("dispatched");
 
         assert_eq!(handled.records_written, 2);
         assert_eq!(store.submitted(), vec!["summarise", "read"]);
@@ -694,37 +747,33 @@ mod tests {
                 .replying("one event")
                 .returning_record(draft("summarise")),
         );
-        let registry = registry(std::slice::from_ref(&agent));
         let adapter = Arc::new(RecordingAdapter::working());
         let courier = Courier::new(filters(vec![]), Box::new(adapter.clone()));
-        let seen = Seen::new();
-
-        let error = dispatch(
-            &registry,
-            &FakeStore::write_only_failure(),
-            &courier,
-            &seen,
-            envelope("summarise all"),
-        )
-        .await
-        .expect_err("submit fails");
-        assert_eq!(
-            error.to_string(),
-            "dependency unavailable: unavailable: store is read-only"
+        // One dispatcher, two stores: the ledgers survive the store recovering, which is the
+        // situation a retry actually happens in.
+        let failing = dispatcher(
+            std::slice::from_ref(&agent),
+            Arc::new(FakeStore::write_only_failure()),
+            courier,
         );
 
-        let handled = dispatch(
-            &registry,
-            &FakeStore::healthy(),
-            &courier,
-            &seen,
-            envelope("summarise all"),
-        )
-        .await
-        .expect("retry");
+        let error = failing
+            .dispatch(envelope("summarise all"))
+            .await
+            .expect_err("submit fails");
+        assert_eq!(
+            error.to_string(),
+            "dependency unavailable: store is read-only"
+        );
 
-        assert!(!handled.duplicate, "a failed attempt is not a handled one");
-        assert_eq!(handled.records_written, 1);
+        let retried = failing
+            .dispatch(envelope("summarise all"))
+            .await
+            .expect_err("still failing");
+        assert!(
+            matches!(retried, crate::Error::Agent(_)),
+            "a failed attempt is not a handled one, so the retry runs again"
+        );
         assert_eq!(agent.calls(), 2);
         assert_eq!(
             adapter.texts(),
@@ -737,20 +786,24 @@ mod tests {
     async fn an_agent_failure_surfaces_and_leaves_the_envelope_unhandled() {
         let agent =
             Arc::new(RecordingAgent::new("reader", &[("summarise", false)]).failing("upstream"));
-        let seen = Seen::new();
-        let error = dispatch(
-            &registry(std::slice::from_ref(&agent)),
-            &FakeStore::healthy(),
-            &Courier::new(filters(vec![]), Box::new(RecordingAdapter::working())),
-            &seen,
-            envelope("summarise all"),
-        )
-        .await
-        .expect_err("agent failed");
+        let dispatcher = dispatcher(
+            std::slice::from_ref(&agent),
+            Arc::new(FakeStore::healthy()),
+            plain_courier(),
+        );
+        let error = dispatcher
+            .dispatch(envelope("summarise all"))
+            .await
+            .expect_err("agent failed");
 
         assert!(matches!(error, crate::Error::Agent(_)));
         assert_eq!(error.to_string(), "dependency unavailable: upstream");
-        assert!(!seen.contains("cli-1"));
+
+        dispatcher
+            .dispatch(envelope("summarise all"))
+            .await
+            .expect_err("retried, not skipped");
+        assert_eq!(agent.calls(), 2);
     }
 
     #[tokio::test]
@@ -761,19 +814,24 @@ mod tests {
                 .with_status(Status::Failed)
                 .returning_record(draft("summarise")),
         );
-        let seen = Seen::new();
-        let handled = dispatch(
-            &registry(&[agent]),
-            &FakeStore::healthy(),
-            &Courier::new(filters(vec![]), Box::new(RecordingAdapter::working())),
-            &seen,
-            envelope("summarise all"),
-        )
-        .await
-        .expect("dispatched");
+        let dispatcher = dispatcher(
+            std::slice::from_ref(&agent),
+            Arc::new(FakeStore::healthy()),
+            plain_courier(),
+        );
+        let handled = dispatcher
+            .dispatch(envelope("summarise all"))
+            .await
+            .expect("dispatched");
 
         assert_eq!(handled.records_written, 1);
-        assert!(seen.contains("cli-1"));
+        assert!(
+            dispatcher
+                .dispatch(envelope("summarise all"))
+                .await
+                .expect("redelivery")
+                .duplicate
+        );
     }
 
     #[tokio::test]
@@ -794,17 +852,12 @@ mod tests {
                 "not an entity",
             ]),
         );
-        let store = FakeStore::healthy();
+        let store = Arc::new(FakeStore::healthy());
 
-        dispatch(
-            &registry(std::slice::from_ref(&agent)),
-            &store,
-            &Courier::new(filters(vec![]), Box::new(RecordingAdapter::working())),
-            &Seen::new(),
-            raw,
-        )
-        .await
-        .expect("dispatched");
+        dispatcher(std::slice::from_ref(&agent), store.clone(), plain_courier())
+            .dispatch(raw)
+            .await
+            .expect("dispatched");
 
         let task = agent.task().expect("a task");
         assert_eq!(task.intent, "digest");
@@ -824,13 +877,12 @@ mod tests {
     #[tokio::test]
     async fn a_body_with_no_stated_intent_routes_on_its_first_word() {
         let agent = Arc::new(RecordingAgent::new("reader", &[("summarise", false)]));
-        dispatch(
-            &registry(std::slice::from_ref(&agent)),
-            &FakeStore::healthy(),
-            &Courier::new(filters(vec![]), Box::new(RecordingAdapter::working())),
-            &Seen::new(),
-            envelope("  SUMMARISE order ord-1"),
+        dispatcher(
+            std::slice::from_ref(&agent),
+            Arc::new(FakeStore::healthy()),
+            plain_courier(),
         )
+        .dispatch(envelope("  SUMMARISE order ord-1"))
         .await
         .expect("dispatched");
 
@@ -839,16 +891,13 @@ mod tests {
 
     #[tokio::test]
     async fn an_empty_body_is_unroutable_rather_than_a_panic() {
-        let error = dispatch(
-            &registry(&[Arc::new(RecordingAgent::new(
-                "reader",
-                &[("summarise", false)],
-            ))]),
-            &FakeStore::healthy(),
-            &Courier::new(filters(vec![]), Box::new(RecordingAdapter::working())),
-            &Seen::new(),
-            envelope("   "),
+        let agent = Arc::new(RecordingAgent::new("reader", &[("summarise", false)]));
+        let error = dispatcher(
+            std::slice::from_ref(&agent),
+            Arc::new(FakeStore::healthy()),
+            plain_courier(),
         )
+        .dispatch(envelope("   "))
         .await
         .expect_err("nothing to route on");
 
@@ -864,13 +913,12 @@ mod tests {
         raw.extra
             .insert("deadline_ms".into(), serde_json::json!(30_000));
 
-        dispatch(
-            &registry(std::slice::from_ref(&agent)),
-            &FakeStore::healthy(),
-            &Courier::new(filters(vec![]), Box::new(RecordingAdapter::working())),
-            &Seen::new(),
-            raw,
+        dispatcher(
+            std::slice::from_ref(&agent),
+            Arc::new(FakeStore::healthy()),
+            plain_courier(),
         )
+        .dispatch(raw)
         .await
         .expect("dispatched");
 
@@ -889,19 +937,42 @@ mod tests {
         let agent = Arc::new(
             RecordingAgent::new("reader", &[("summarise", false)]).reading_history("order_ref"),
         );
-        dispatch(
-            &registry(std::slice::from_ref(&agent)),
-            &FakeStore::unreachable(),
-            &Courier::new(filters(vec![]), Box::new(RecordingAdapter::working())),
-            &Seen::new(),
-            envelope("summarise all"),
+        dispatcher(
+            std::slice::from_ref(&agent),
+            Arc::new(FakeStore::unreachable()),
+            plain_courier(),
         )
+        .dispatch(envelope("summarise all"))
         .await
         .expect("dispatched degraded");
 
         assert_eq!(
             agent.history_error().as_deref(),
-            Some("dependency unavailable: unavailable: no route to store")
+            Some("dependency unavailable: no route to store")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_store_that_rejects_a_read_reaches_the_agent_as_malformed() {
+        let agent = Arc::new(
+            RecordingAgent::new("reader", &[("digest", false)]).reading_history("order_ref"),
+        );
+        // Nothing named up front, so the store is first asked about `order_ref` by the agent
+        // itself — which is the read this store refuses.
+        let raw = envelope("digest all");
+
+        dispatcher(
+            std::slice::from_ref(&agent),
+            Arc::new(FakeStore::rejecting_reads_of("order_ref")),
+            plain_courier(),
+        )
+        .dispatch(raw)
+        .await
+        .expect("dispatched");
+
+        assert_eq!(
+            agent.history_error().as_deref(),
+            Some("malformed task: unknown entity kind")
         );
     }
 
@@ -910,31 +981,181 @@ mod tests {
         let agent = Arc::new(RecordingAgent::new("reader", &[("summarise", false)]));
         let mut raw = envelope("summarise all");
         raw.actor = None;
-        dispatch(
-            &registry(std::slice::from_ref(&agent)),
-            &FakeStore::healthy(),
-            &Courier::new(filters(vec![]), Box::new(RecordingAdapter::working())),
-            &Seen::new(),
-            raw,
+        dispatcher(
+            std::slice::from_ref(&agent),
+            Arc::new(FakeStore::healthy()),
+            plain_courier(),
         )
+        .dispatch(raw)
         .await
         .expect("dispatched");
         assert!(agent.task().expect("a task").actor.is_none());
 
         let named = Arc::new(RecordingAgent::new("other", &[("digest", false)]));
-        let mut raw = envelope("digest all");
-        raw.envelope_id = "cli-2".into();
-        dispatch(
-            &registry(std::slice::from_ref(&named)),
-            &FakeStore::healthy(),
-            &Courier::new(filters(vec![]), Box::new(RecordingAdapter::working())),
-            &Seen::new(),
-            raw,
+        dispatcher(
+            std::slice::from_ref(&named),
+            Arc::new(FakeStore::healthy()),
+            plain_courier(),
         )
+        .dispatch(envelope("digest all"))
         .await
         .expect("dispatched");
 
         let actor = named.task().expect("a task").actor.expect("an actor");
         assert_eq!((actor.id.as_str(), actor.source.as_str()), ("local", "cli"));
+    }
+
+    #[tokio::test]
+    async fn a_dispatcher_reports_the_agents_it_holds() {
+        let agent = Arc::new(RecordingAgent::new("reader", &[("summarise", false)]));
+        let dispatcher = dispatcher(
+            std::slice::from_ref(&agent),
+            Arc::new(FakeStore::healthy()),
+            plain_courier(),
+        );
+
+        assert_eq!(
+            dispatcher.registry().ids(),
+            vec![harness_agent::AgentId("reader".into())]
+        );
+    }
+}
+
+/// The concrete memory client, over a real socket.
+///
+/// Everything above substitutes the store, which is what makes the ordering rules testable. These
+/// tests do the opposite and use [`harness_memory::Client`] itself, because the delegation and the
+/// guard's reading of a real `Bundle` are the one place this crate meets the transport.
+#[cfg(test)]
+mod transport {
+    use std::sync::Arc;
+
+    use serde_json::json;
+
+    use crate::fixtures::{
+        RecordingAgent, client, dispatcher, draft, envelope_about, plain_courier, refused, served,
+        store_stub,
+    };
+
+    #[tokio::test]
+    async fn a_bundle_from_a_real_client_reaches_the_agent() {
+        let (base_url, seen) = store_stub(vec![served(
+            &json!({"records": [{"id": "one"}], "degraded": false, "omitted": []}),
+        )])
+        .await;
+        let agent = Arc::new(
+            RecordingAgent::new("reader", &[("summarise", false)]).reading_history("order_ref"),
+        );
+
+        let handled = dispatcher(
+            std::slice::from_ref(&agent),
+            Arc::new(client(&base_url)),
+            plain_courier(),
+        )
+        .dispatch(envelope_about("summarise all", "order_ref", "ord-1"))
+        .await
+        .expect("dispatched");
+
+        assert!(!handled.duplicate);
+        assert!(!agent.saw_degraded(), "a whole bundle is not degraded");
+        let asked = seen.lock().expect("lock")[0].clone();
+        assert!(
+            asked.starts_with("GET /bundle?kind=order_ref&id=ord-1"),
+            "{asked:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_degraded_bundle_stays_degraded_and_the_guard_still_refuses() {
+        // The whole point of the guard, exercised against the real client rather than a fake: the
+        // store says its answer is partial, and a mutating agent never runs.
+        let (base_url, _) = store_stub(vec![served(
+            &json!({"records": [], "degraded": true, "omitted": ["a source was down"]}),
+        )])
+        .await;
+        let agent = Arc::new(RecordingAgent::new("writer", &[("apply", true)]));
+
+        let error = dispatcher(
+            std::slice::from_ref(&agent),
+            Arc::new(client(&base_url)),
+            plain_courier(),
+        )
+        .dispatch(envelope_about("apply the change", "order_ref", "ord-1"))
+        .await
+        .expect_err("refused");
+
+        assert!(matches!(error, crate::Error::RefusedDegraded));
+        assert_eq!(agent.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_store_that_is_not_there_degrades_a_question() {
+        // The client folds an unreachable store into a degraded bundle rather than an error, so a
+        // read-only task still gets an answer. Nothing is listening on this port.
+        let (base_url, _) = store_stub(vec![]).await;
+        let agent =
+            Arc::new(RecordingAgent::new("reader", &[("summarise", false)]).replying("all I have"));
+
+        dispatcher(
+            std::slice::from_ref(&agent),
+            Arc::new(client(&base_url)),
+            plain_courier(),
+        )
+        .dispatch(envelope_about("summarise all", "order_ref", "ord-1"))
+        .await
+        .expect("dispatched degraded");
+
+        assert_eq!(agent.calls(), 1);
+        assert!(agent.saw_degraded());
+    }
+
+    #[tokio::test]
+    async fn a_rejected_read_from_a_real_client_is_permanent() {
+        let (base_url, _) = store_stub(vec![refused(400)]).await;
+        let agent = Arc::new(RecordingAgent::new("reader", &[("summarise", false)]));
+
+        let error = dispatcher(
+            std::slice::from_ref(&agent),
+            Arc::new(client(&base_url)),
+            plain_courier(),
+        )
+        .dispatch(envelope_about("summarise all", "order_ref", "ord-1"))
+        .await
+        .expect_err("rejected");
+
+        let permanent = matches!(
+            error,
+            crate::Error::Agent(harness_agent::Error::Malformed(_))
+        );
+        assert!(permanent, "{error}");
+        assert_eq!(agent.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_record_reaches_a_real_store() {
+        let (base_url, seen) = store_stub(vec![
+            served(&json!({"records": [], "degraded": false, "omitted": []})),
+            refused(200),
+        ])
+        .await;
+        let agent = Arc::new(
+            RecordingAgent::new("reader", &[("summarise", false)])
+                .returning_record(draft("summarise")),
+        );
+
+        let handled = dispatcher(
+            std::slice::from_ref(&agent),
+            Arc::new(client(&base_url)),
+            plain_courier(),
+        )
+        .dispatch(envelope_about("summarise all", "order_ref", "ord-1"))
+        .await
+        .expect("dispatched");
+
+        assert_eq!(handled.records_written, 1);
+        let posted = seen.lock().expect("lock")[1].clone();
+        assert!(posted.starts_with("POST /records"), "{posted:?}");
+        // The draft itself has to reach the store, not just a request shaped like one.
+        assert!(posted.contains("\"action\":\"summarise\""), "{posted:?}");
     }
 }
