@@ -14,11 +14,17 @@ pub trait MemoryHandle: Send + Sync {
     ///
     /// Returns structure, never sealed content: an agent receives what happened, not the private
     /// detail of what was recorded.
+    ///
+    /// `deadline_ms` is how long the agent is willing to wait, usually a slice of
+    /// [`Context::remaining_ms`]. An implementation may lower it — the dispatcher will not let a
+    /// read outlive the task it belongs to — but never raise it, so asking for more than the task
+    /// has does not buy any.
     async fn history(
         &self,
         kind: &str,
         id: &str,
         limit: u32,
+        deadline_ms: u64,
     ) -> crate::Result<Vec<BTreeMap<String, serde_json::Value>>>;
 
     /// Queues a record for writing. The dispatcher stamps and submits it.

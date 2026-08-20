@@ -147,6 +147,7 @@ impl MemoryHandle for StubMemory {
         _kind: &str,
         _id: &str,
         _limit: u32,
+        _deadline_ms: u64,
     ) -> harness_agent::Result<Vec<BTreeMap<String, serde_json::Value>>> {
         Ok(Vec::new())
     }

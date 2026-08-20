@@ -3,8 +3,13 @@
 //! This mode exists because of how development actually goes. Standing up a socket, an adapter and
 //! a memory service to find out why an agent answered oddly is a poor trade, so `once` runs the
 //! real [`Dispatcher`] against a store that answers from nothing and reports what happened: the
-//! intent the envelope resolved to, whether the context bundle was degraded, whether a mutating
-//! task was refused, what would have been delivered, and what would have been written.
+//! intent the envelope resolved to, how the agent reported the task, whether the context bundle was
+//! degraded, whether a mutating task was refused, what would have been delivered, and what would
+//! have been written.
+//!
+//! Everything reported comes off the dispatch itself. Nothing here re-derives what the dispatcher
+//! already decided — a second reading of the same envelope would be a second implementation of
+//! routing, and the copy is what drifts.
 //!
 //! Nothing leaves the process. Deliveries are reported rather than sent and records are captured
 //! rather than submitted, which is what makes it safe to point at an envelope from production.
@@ -13,7 +18,7 @@ use std::fmt::Write as _;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use harness_agent::ActionDraft;
+use harness_agent::{ActionDraft, Status};
 use harness_dispatch::egress::{Adapter, Courier};
 use harness_dispatch::{Dispatcher, Registry};
 use harness_envelope::{Delivery, Envelope};
@@ -30,6 +35,8 @@ pub struct Report {
     pub agent: String,
     /// Whether the matched capability declares that it changes state.
     pub mutating: bool,
+    /// How the agent reported the task, or `None` when no agent ran.
+    pub status: Option<Status>,
     /// Whether the context bundle was incomplete.
     pub degraded: bool,
     /// Why the bundle was incomplete, when it was.
@@ -49,6 +56,13 @@ impl Report {
         let mut out = String::new();
         field(&mut out, "intent", &self.intent);
         field(&mut out, "agent", &self.agent);
+        field(
+            &mut out,
+            "status",
+            &self
+                .status
+                .map_or_else(|| "not reported — nothing ran".to_string(), status),
+        );
         field(&mut out, "mutating", yes_no(self.mutating));
         field(
             &mut out,
@@ -113,7 +127,6 @@ impl Report {
 /// always looked degraded would refuse every mutating intent, which is the one path worth
 /// exercising; turning it on is how that refusal gets checked.
 pub async fn once(registry: Registry, envelope: Envelope, degraded: bool) -> Result<Report> {
-    let intent = resolved_intent(&envelope).await;
     let store = Arc::new(DryRun::new(degraded));
     let dispatcher = Dispatcher::new(
         registry,
@@ -121,41 +134,51 @@ pub async fn once(registry: Registry, envelope: Envelope, degraded: bool) -> Res
         Courier::new(Vec::new(), Box::new(Discard)),
     );
 
-    // Read off the registry rather than from the outcome: for a refusal the agent never runs, and
-    // "which agent, and does it mutate" is exactly what makes the refusal understandable.
-    let (agent, mutating) = match dispatcher.registry().resolve(&intent) {
-        Ok(agent) => (
-            agent.id().0.clone(),
-            agent
-                .capabilities()
-                .iter()
-                .find(|capability| capability.intent == intent)
-                .is_some_and(|capability| capability.mutating),
-        ),
-        Err(_) => (String::new(), false),
-    };
-
     match dispatcher.dispatch(envelope).await {
-        Ok(handled) => Ok(Report {
-            intent,
-            agent,
-            mutating,
-            degraded: store.degraded,
-            omitted: store.omitted(),
-            entities: store.requested(),
-            deliveries: handled.deliveries,
-            records: store.written(),
-        }),
+        Ok(handled) => {
+            let (agent, mutating) = matched(&dispatcher, &handled.intent).unwrap_or_default();
+            Ok(Report {
+                intent: handled.intent,
+                agent,
+                mutating,
+                status: handled.status,
+                degraded: handled.degraded,
+                omitted: store.omitted(),
+                entities: store.requested(),
+                deliveries: handled.deliveries,
+                records: store.written(),
+            })
+        }
         Err(harness_dispatch::Error::Unroutable(intent)) => Err(Error::Unroutable(intent)),
-        Err(harness_dispatch::Error::RefusedDegraded) => Err(Error::Refused(format!(
-            "refused `{intent}`: agent `{agent}` declares it mutating and the context bundle was \
-             degraded — {}",
-            store.omitted().join("; ")
-        ))),
+        // Both halves of the reason come from the refusal itself. Naming the agent as well is worth
+        // the lookup: in this mode the reader is usually the person changing that agent.
+        Err(harness_dispatch::Error::RefusedDegraded { intent, omitted }) => {
+            let (agent, _) = matched(&dispatcher, &intent).unwrap_or_default();
+            Err(Error::Refused(format!(
+                "refused `{intent}`: agent `{agent}` declares it mutating and the context bundle \
+                 was degraded — {}",
+                omitted.join("; ")
+            )))
+        }
         // Ambiguity cannot arrive here — `Registry::register` refuses a second claimant, so routing
         // has nothing arbitrary left to do — which leaves the agent's own failure.
         Err(other) => Err(Error::Failed(other.to_string())),
     }
+}
+
+/// The agent claiming `intent`, and whether that claim mutates.
+///
+/// The dispatcher reports which intent it resolved, not which agent it picked, and both callers
+/// below have an intent that routed — so this is a lookup of something already decided rather than
+/// a second attempt at deciding it. `None` cannot arrive from either.
+fn matched(dispatcher: &Dispatcher, intent: &str) -> Option<(String, bool)> {
+    let agent = dispatcher.registry().resolve(intent).ok()?;
+    let mutating = agent
+        .capabilities()
+        .iter()
+        .find(|capability| capability.intent == intent)
+        .is_some_and(|capability| capability.mutating);
+    Some((agent.id().0.clone(), mutating))
 }
 
 /// Reads stdin as an envelope.
@@ -235,24 +258,6 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
     (if month <= 2 { year + 1 } else { year }, month, day)
 }
 
-/// The intent the dispatcher would classify an envelope as.
-///
-/// Asked of a dispatcher with no agents, whose only possible answer is `Unroutable` naming the
-/// intent. Roundabout, but the alternative is a second copy of the classification rules living in
-/// this crate, and a copy drifts — which is the class of bug this crate exists to catch. Nothing is
-/// loaded, invoked or delivered on the way: routing is resolved before any of that happens.
-async fn resolved_intent(envelope: &Envelope) -> String {
-    let probe = Dispatcher::new(
-        Registry::new(),
-        Arc::new(DryRun::new(false)),
-        Courier::new(Vec::new(), Box::new(Discard)),
-    );
-    match probe.dispatch(envelope.clone()).await {
-        Err(harness_dispatch::Error::Unroutable(intent)) => intent,
-        _ => String::new(),
-    }
-}
-
 /// A store that answers from nothing and keeps what it was asked to write.
 ///
 /// This is what makes a dry run safe to point at a real envelope: reads return an empty bundle and
@@ -312,7 +317,12 @@ impl harness_dispatch::ContextStore for DryRun {
         })
     }
 
-    async fn submit(&self, draft: &ActionDraft) -> harness_memory::Result<()> {
+    async fn submit(
+        &self,
+        draft: &ActionDraft,
+        _correlation_id: &str,
+        _deadline_ms: u64,
+    ) -> harness_memory::Result<()> {
         guard(&self.written).push(draft.clone());
         Ok(())
     }
@@ -373,9 +383,10 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, UNIX_EPOCH};
 
+    use harness_agent::Status;
     use harness_dispatch::Registry;
 
-    use super::{once, read_envelope, rfc3339, synthesised};
+    use super::{Report, once, read_envelope, rfc3339, synthesised};
     use crate::fixtures::{Configured, envelope};
     use crate::{Error, exit, registry};
 
@@ -397,6 +408,7 @@ mod tests {
 
         assert_eq!(report.intent, "echo");
         assert_eq!(report.agent, "echo");
+        assert_eq!(report.status, Some(Status::Succeeded));
         assert!(!report.mutating);
         assert!(!report.degraded);
         assert_eq!(report.deliveries.len(), 1);
@@ -411,6 +423,7 @@ mod tests {
         for expected in [
             "intent     echo",
             "agent      echo",
+            "status     succeeded",
             "mutating   no",
             "deliveries 1",
             "→ stdout: hello",
@@ -453,10 +466,40 @@ mod tests {
         .expect_err("refused");
 
         assert_eq!(error.code(), exit::REFUSED);
+        // Named by the refusal itself: which intent, which agent, and what was missing.
         let why = error.to_string();
-        for expected in ["deploy", "deployer", "mutating", "degraded"] {
+        for expected in [
+            "deploy",
+            "deployer",
+            "mutating",
+            "degraded",
+            "dry run asked to report the store unreachable",
+        ] {
             assert!(why.contains(expected), "missing `{expected}` in: {why}");
         }
+    }
+
+    #[test]
+    fn a_report_with_no_outcome_says_so_rather_than_inventing_one() {
+        // Reachable only through a dispatcher that has seen the envelope before, which a dry run
+        // never has — so the wording is asserted here rather than left to be discovered in the wild.
+        let report = Report {
+            intent: "echo".to_string(),
+            agent: "echo".to_string(),
+            mutating: false,
+            status: None,
+            degraded: false,
+            omitted: Vec::new(),
+            entities: Vec::new(),
+            deliveries: Vec::new(),
+            records: Vec::new(),
+        };
+
+        let rendered = report.render();
+        assert!(
+            rendered.contains("status     not reported — nothing ran"),
+            "{rendered}"
+        );
     }
 
     #[tokio::test]

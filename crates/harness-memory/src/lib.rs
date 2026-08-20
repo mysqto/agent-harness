@@ -18,7 +18,10 @@
 //! - `GET /bundle?kind=<kind>&id=<id>` → `{"records": [...], "degraded": bool, "omitted": [...]}`.
 //!   One request per entity; missing fields default. Served over the sidecar socket when there is
 //!   one, otherwise over `base_url`.
-//! - `POST /records` with `{"agent": "...", "record": <draft>}` → any `2xx`. The direct path only.
+//! - `POST /records` with `{"agent": "...", "correlation_id": "...", "record": <draft>}` → any
+//!   `2xx`. The direct path only. `correlation_id` ties the record to the interaction that caused
+//!   it and is omitted when the caller has no interaction to name; it is a field of its own rather
+//!   than an attribute of the record, so it cannot collide with an attribute of the same name.
 //! - The sidecar takes the same record body as one JSON line on its unix socket and answers with
 //!   one line, `{"status": "...", "detail": "..."}`, where status is `accepted`, `spooled`,
 //!   `rejected`, `spool_full` or `error`.
@@ -40,12 +43,6 @@ use harness_agent::{ActionDraft, MemoryHandle};
 use hyper::Method;
 use serde::{Deserialize, Serialize};
 
-/// How long one exchange may take when the caller supplied no deadline of its own.
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Attribute a record carries its interaction id under.
-const CORRELATION_ATTR: &str = "correlation_id";
-
 /// Where the memory service lives, and who we are to it.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -60,22 +57,20 @@ pub struct Config {
     pub agent: String,
 }
 
-/// A handle bound to one task.
+/// A client for the memory service.
+///
+/// Every call carries its own deadline. Nothing here holds one of its own, because a ceiling only
+/// this module can see is one the caller cannot reason about when a request is slow.
 #[derive(Debug)]
 pub struct Client {
     config: Config,
-    /// Ceiling for a call that carries no deadline of its own, i.e. [`Client::submit`].
-    timeout: Duration,
 }
 
 impl Client {
     /// Builds a client.
     #[must_use]
     pub fn new(config: Config) -> Self {
-        Self {
-            config,
-            timeout: DEFAULT_TIMEOUT,
-        }
+        Self { config }
     }
 
     /// Composes context for a request, degrading rather than failing when the store is slow.
@@ -111,32 +106,38 @@ impl Client {
         Ok(bundle)
     }
 
-    /// Submits a record.
+    /// Submits a record, attributed to this client's agent and to one interaction.
+    ///
+    /// `correlation_id` is what later ties this record to the interaction that caused it; an empty
+    /// string means there is none to name and leaves the field off the wire. It travels beside the
+    /// record rather than inside its attributes, so an attribute an agent genuinely calls
+    /// `correlation_id` keeps its own meaning.
     ///
     /// Goes through the sidecar whenever one is configured, and only then falls back to `base_url`.
     /// The sidecar takes a record as a framed line rather than as HTTP, because it owns the spool
     /// and its ack distinguishes more outcomes than a status code does.
-    pub async fn submit(&self, draft: &ActionDraft) -> Result<()> {
+    pub async fn submit(
+        &self,
+        draft: &ActionDraft,
+        correlation_id: &str,
+        deadline_ms: u64,
+    ) -> Result<()> {
         let payload = serde_json::to_vec(&Submission {
             agent: &self.config.agent,
+            correlation_id,
             record: draft,
         })
         .map_err(|err| Error::Transport(format!("encode record: {err}")))?;
+        let budget = Duration::from_millis(deadline_ms);
 
         if let Some(socket) = &self.config.sidecar_socket {
-            return sidecar::submit(socket, &payload, self.timeout).await;
+            return sidecar::submit(socket, &payload, budget).await;
         }
         let target = http::Target::Tcp(http::Endpoint::parse(&self.config.base_url)?);
-        http::request(
-            &target,
-            Method::POST,
-            "/records",
-            Some(payload),
-            self.timeout,
-        )
-        .await?
-        .ok_body()
-        .map(|_| ())
+        http::request(&target, Method::POST, "/records", Some(payload), budget)
+            .await?
+            .ok_body()
+            .map(|_| ())
     }
 
     /// Picks the transport for a read. The sidecar wins whenever it is configured, since going
@@ -146,12 +147,6 @@ impl Client {
             Some(socket) => Ok(http::Target::Unix(socket.clone())),
             None => http::Endpoint::parse(&self.config.base_url).map(http::Target::Tcp),
         }
-    }
-
-    /// Shortens the no-deadline ceiling so tests can reach the timeout path in milliseconds.
-    #[cfg(test)]
-    fn set_timeout(&mut self, timeout: Duration) {
-        self.timeout = timeout;
     }
 }
 
@@ -193,6 +188,9 @@ fn encode(raw: &str) -> String {
 struct Submission<'a> {
     /// Who is claiming the action.
     agent: &'a str,
+    /// The interaction this record belongs to. Omitted when the caller named none.
+    #[serde(skip_serializing_if = "str::is_empty")]
+    correlation_id: &'a str,
     /// What the agent drafted.
     record: &'a ActionDraft,
 }
@@ -259,15 +257,21 @@ pub enum Error {
 pub struct Handle {
     client: Client,
     correlation_id: String,
+    write_deadline_ms: u64,
 }
 
 impl Handle {
     /// Binds a client to one interaction.
+    ///
+    /// `write_deadline_ms` bounds a record submitted through [`MemoryHandle::record`], which is the
+    /// one call that carries no deadline of its own: an agent queues a record and does not wait on
+    /// it, so the budget has to be set by whoever wired the handle up.
     #[must_use]
-    pub fn new(client: Client, correlation_id: impl Into<String>) -> Self {
+    pub fn new(client: Client, correlation_id: impl Into<String>, write_deadline_ms: u64) -> Self {
         Self {
             client,
             correlation_id: correlation_id.into(),
+            write_deadline_ms,
         }
     }
 }
@@ -309,8 +313,8 @@ impl MemoryHandle for Handle {
         kind: &str,
         id: &str,
         limit: u32,
+        deadline_ms: u64,
     ) -> harness_agent::Result<Vec<BTreeMap<String, serde_json::Value>>> {
-        let deadline_ms = u64::try_from(self.client.timeout.as_millis()).unwrap_or(u64::MAX);
         let entities = [(kind.to_owned(), id.to_owned())];
         let bundle = self
             .client
@@ -321,14 +325,12 @@ impl MemoryHandle for Handle {
         Ok(bundle.records.into_iter().take(keep).map(project).collect())
     }
 
-    async fn record(&self, mut draft: ActionDraft) -> harness_agent::Result<()> {
-        // `submit` has no correlation slot, so the id travels as an attribute — without it a record
-        // cannot be stitched back to the interaction that caused it. An agent's own value wins,
-        // since overwriting it would lose information rather than add any.
-        draft
-            .attrs
-            .entry(CORRELATION_ATTR.to_owned())
-            .or_insert_with(|| serde_json::Value::String(self.correlation_id.clone()));
-        self.client.submit(&draft).await.map_err(to_agent)
+    async fn record(&self, draft: ActionDraft) -> harness_agent::Result<()> {
+        // The interaction id goes in the submission's own slot, so the draft the agent wrote
+        // reaches the store exactly as the agent wrote it.
+        self.client
+            .submit(&draft, &self.correlation_id, self.write_deadline_ms)
+            .await
+            .map_err(to_agent)
     }
 }

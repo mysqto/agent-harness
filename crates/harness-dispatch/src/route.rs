@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
-use harness_agent::{ActionDraft, Actor, Context, MemoryHandle, Task, TaskId};
+use harness_agent::{ActionDraft, Actor, Context, MemoryHandle, Status, Task, TaskId};
 use harness_envelope::{Delivery, Envelope};
 use harness_memory::Bundle;
 
@@ -16,12 +16,24 @@ const DEFAULT_DEADLINE_MS: u64 = 5_000;
 /// What a dispatch produced.
 #[derive(Debug)]
 pub struct Dispatched {
+    /// The intent the envelope was classified as, whether or not an agent then ran.
+    pub intent: String,
     /// Messages to deliver.
     pub deliveries: Vec<harness_envelope::Delivery>,
     /// Records that were submitted.
     pub records_written: usize,
     /// `true` when the envelope had been seen before and nothing was re-run.
     pub duplicate: bool,
+    /// `true` when the context the agent was given was known to be incomplete.
+    ///
+    /// `false` for a duplicate, where nothing was loaded to be incomplete about.
+    pub degraded: bool,
+    /// How the agent reported the task, or `None` when no agent ran.
+    ///
+    /// `None` is exactly the duplicate case. A status is what an agent said about work it did, so
+    /// naming one for a dispatch that ran nothing would be inventing it — and the earlier verdict
+    /// is not ours to repeat either, since the ledger remembers only that the envelope finished.
+    pub status: Option<Status>,
 }
 
 /// The memory operations dispatch depends on.
@@ -39,8 +51,16 @@ pub trait ContextStore: Send + Sync {
         deadline_ms: u64,
     ) -> harness_memory::Result<Bundle>;
 
-    /// Writes one record.
-    async fn submit(&self, draft: &ActionDraft) -> harness_memory::Result<()>;
+    /// Writes one record, tied to the interaction that produced it.
+    ///
+    /// `correlation_id` is passed rather than held by the store because one store serves every
+    /// task: a value bound at construction would belong to whichever task was wired up first.
+    async fn submit(
+        &self,
+        draft: &ActionDraft,
+        correlation_id: &str,
+        deadline_ms: u64,
+    ) -> harness_memory::Result<()>;
 }
 
 // Pure delegation. Covered by the `transport` tests below against a stub store rather than a fake
@@ -55,8 +75,13 @@ impl ContextStore for harness_memory::Client {
         harness_memory::Client::bundle(self, entities, deadline_ms).await
     }
 
-    async fn submit(&self, draft: &ActionDraft) -> harness_memory::Result<()> {
-        harness_memory::Client::submit(self, draft).await
+    async fn submit(
+        &self,
+        draft: &ActionDraft,
+        correlation_id: &str,
+        deadline_ms: u64,
+    ) -> harness_memory::Result<()> {
+        harness_memory::Client::submit(self, draft, correlation_id, deadline_ms).await
     }
 }
 
@@ -126,66 +151,81 @@ impl Dispatcher {
 
     /// Handles one envelope end to end.
     ///
-    /// Order matters: dedupe first so a redelivery costs nothing, then classify, then load context,
-    /// then decide whether a mutating task may proceed on what was loaded, and only then invoke the
-    /// agent. Checking safety after invoking would mean the side effect had already happened.
+    /// Order matters: classify, dedupe, load context, decide whether a mutating task may proceed on
+    /// what was loaded, and only then invoke the agent. Checking safety after invoking would mean
+    /// the side effect had already happened. Classification comes first only because it is pure —
+    /// deduplication still precedes everything that costs anything or changes anything, and it is
+    /// what lets a redelivery be reported as the intent it carried rather than as an unnamed one.
     ///
     /// The returned deliveries are what the agent asked to send; what the adapter received is that
     /// text with every filter applied.
     pub async fn dispatch(&self, envelope: Envelope) -> crate::Result<Dispatched> {
         let memory: &dyn ContextStore = self.store.as_ref();
+        let Request {
+            intent,
+            args,
+            entities,
+        } = classify(&envelope);
 
         if self.seen.contains(&envelope.envelope_id) {
             tracing::info!(
                 envelope_id = %envelope.envelope_id,
                 attempt = envelope.attempt,
+                %intent,
                 "already handled; nothing re-run"
             );
             return Ok(Dispatched {
+                intent,
                 deliveries: Vec::new(),
                 records_written: 0,
                 duplicate: true,
+                degraded: false,
+                status: None,
             });
         }
 
-        let request = classify(&envelope);
-        let agent = self.registry.resolve(&request.intent)?;
+        let agent = self.registry.resolve(&intent)?;
         let mutating = agent
             .capabilities()
             .iter()
-            .find(|c| c.intent == request.intent)
+            .find(|c| c.intent == intent)
             .is_some_and(|c| c.mutating);
 
         let deadline_ms = deadline_ms(&envelope);
-        let bundle = load(memory, &request.entities, deadline_ms).await?;
+        let bundle = load(memory, &entities, deadline_ms).await?;
 
         if mutating && bundle.degraded {
             // Before the agent runs, not after: a refusal that arrives once the side effect has
             // happened is not a refusal.
             tracing::warn!(
                 envelope_id = %envelope.envelope_id,
-                intent = %request.intent,
+                %intent,
                 omitted = ?bundle.omitted,
                 "refusing a mutating task on partial context"
             );
-            return Err(crate::Error::RefusedDegraded);
+            return Err(crate::Error::RefusedDegraded {
+                intent,
+                omitted: bundle.omitted,
+            });
         }
+        let degraded = bundle.degraded;
 
         let task = Task {
             // One envelope is one task: a retry must not mint a second identity, or the audit trail
             // shows two actions where the source sent one message.
             task_id: TaskId(envelope.envelope_id.clone()),
             correlation_id: envelope.envelope_id.clone(),
-            intent: request.intent,
-            args: request.args,
+            intent: intent.clone(),
+            args,
             mutating,
             actor: envelope.actor.as_ref().map(|id| Actor {
                 id: id.clone(),
                 source: envelope.source.clone(),
             }),
         };
-        let context = Dispatching::new(memory, &envelope.envelope_id, deadline_ms, bundle.degraded);
+        let context = Dispatching::new(memory, &envelope.envelope_id, deadline_ms, degraded);
         let outcome = agent.handle(task, &context).await?;
+        let status = outcome.status;
 
         let deliveries = deliveries(&envelope, outcome.egress);
         self.courier.deliver(deliveries.clone()).await?;
@@ -196,8 +236,10 @@ impl Dispatcher {
         drafts.extend(context.into_drafts());
         let mut records_written = 0;
         for draft in &drafts {
+            // The envelope id is the interaction, so every record written for this task can be
+            // found from the message that caused it.
             memory
-                .submit(draft)
+                .submit(draft, &envelope.envelope_id, deadline_ms)
                 .await
                 .map_err(|error| to_agent(&error))?;
             records_written += 1;
@@ -205,9 +247,12 @@ impl Dispatcher {
 
         self.seen.remember(envelope.envelope_id);
         Ok(Dispatched {
+            intent,
             deliveries,
             records_written,
             duplicate: false,
+            degraded,
+            status: Some(status),
         })
     }
 }
@@ -250,6 +295,12 @@ struct Request {
 ///
 /// An adapter that understands its source states the intent in `extra`; anything else falls back to
 /// the first word of the body, which is what makes a plain-text source usable with no schema at all.
+///
+/// Private, and staying that way. What a caller wants from it is the resolved intent, and
+/// [`Dispatched::intent`] reports that from the dispatch that actually happened. Exposing this
+/// instead would publish the normalisation — the injected `text` argument, the dropped malformed
+/// entities — as API, and offer a second way to ask what an envelope means that can disagree with
+/// the first.
 fn classify(envelope: &Envelope) -> Request {
     let intent = envelope
         .extra
@@ -429,11 +480,15 @@ impl MemoryHandle for Queued<'_> {
         kind: &str,
         id: &str,
         limit: u32,
+        deadline_ms: u64,
     ) -> harness_agent::Result<Vec<BTreeMap<String, serde_json::Value>>> {
+        // The task's budget is the ceiling. An agent may want to spend less of it on one read, but
+        // a read outliving the task would deliver an answer nobody is waiting for any more.
+        let budget = deadline_ms.min(self.deadline_ms);
         let entities = [(kind.to_owned(), id.to_owned())];
         let bundle = self
             .store
-            .bundle(&entities, self.deadline_ms)
+            .bundle(&entities, budget)
             .await
             .map_err(|error| to_agent(&error))?;
         Ok(bundle
@@ -492,7 +547,19 @@ mod tests {
             .expect("redelivery");
 
         assert!(!first.duplicate);
+        assert_eq!(first.intent, "summarise");
+        assert_eq!(first.status, Some(Status::Succeeded));
+        assert!(!first.degraded);
+
         assert!(retry.duplicate);
+        assert_eq!(
+            retry.intent, "summarise",
+            "a redelivery still reports what it was"
+        );
+        assert_eq!(
+            retry.status, None,
+            "nothing ran, so there is no status to report"
+        );
         assert!(retry.deliveries.is_empty());
         assert_eq!(retry.records_written, 0);
         assert_eq!(agent.calls(), 1, "a redelivery must not re-run the agent");
@@ -516,8 +583,11 @@ mod tests {
             .await
             .expect_err("refused");
 
-        assert!(matches!(error, crate::Error::RefusedDegraded));
-        assert_eq!(error.to_string(), "refused: cannot act on partial context");
+        assert_eq!(
+            error.to_string(),
+            "refused `apply`: cannot act on partial context; omitted: not stated",
+            "a store can report a partial bundle without saying what it left out"
+        );
         assert_eq!(agent.calls(), 0, "the agent must never have been invoked");
         assert!(adapter.texts().is_empty());
     }
@@ -539,6 +609,10 @@ mod tests {
             .expect("dispatched");
 
         assert_eq!(agent.calls(), 1);
+        assert!(
+            handled.degraded,
+            "the caller is told what the agent was told"
+        );
         assert_eq!(handled.deliveries.len(), 1);
         assert_eq!(adapter.texts(), vec!["partial"]);
         assert!(
@@ -591,7 +665,19 @@ mod tests {
         .await
         .expect_err("refused");
 
-        assert!(matches!(error, crate::Error::RefusedDegraded));
+        // What an operator has to act on, so the refusal names both halves of it: which intent was
+        // refused, and what was missing when it was.
+        let named = matches!(
+            &error,
+            crate::Error::RefusedDegraded { intent, omitted }
+                if intent == "apply" && omitted == &vec!["unavailable: no route to store".to_string()]
+        );
+        assert!(named, "{error}");
+        assert_eq!(
+            error.to_string(),
+            "refused `apply`: cannot act on partial context; \
+             omitted: unavailable: no route to store"
+        );
         assert_eq!(writer.calls(), 0);
     }
 
@@ -741,6 +827,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_record_is_submitted_under_the_interaction_that_caused_it() {
+        // The interaction id travels beside the record rather than inside it, so an attribute an
+        // agent happens to call `correlation_id` keeps the value the agent gave it.
+        let mut own = draft("summarise");
+        own.attrs.insert(
+            "correlation_id".to_string(),
+            serde_json::json!("the agent's own"),
+        );
+        let agent =
+            Arc::new(RecordingAgent::new("reader", &[("summarise", false)]).returning_record(own));
+        let store = Arc::new(FakeStore::healthy());
+
+        dispatcher(std::slice::from_ref(&agent), store.clone(), plain_courier())
+            .dispatch(envelope("summarise all"))
+            .await
+            .expect("dispatched");
+
+        let (written, correlation) = store
+            .submissions()
+            .into_iter()
+            .next()
+            .expect("one record submitted");
+        assert_eq!(correlation, "cli-1", "the envelope is the interaction");
+        assert_eq!(
+            written.attrs["correlation_id"],
+            serde_json::json!("the agent's own")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_read_an_agent_asks_for_cannot_outlive_the_task() {
+        // An agent may spend less of the budget on a read than it has; asking for more buys none,
+        // because an answer arriving after the task was abandoned is an answer nobody reads.
+        let greedy = Arc::new(
+            RecordingAgent::new("reader", &[("summarise", false)])
+                .reading_history_within("order_ref", 600_000),
+        );
+        let store = Arc::new(FakeStore::healthy());
+        let mut raw = envelope("summarise all");
+        raw.extra
+            .insert("deadline_ms".into(), serde_json::json!(30_000));
+
+        dispatcher(
+            std::slice::from_ref(&greedy),
+            store.clone(),
+            plain_courier(),
+        )
+        .dispatch(raw)
+        .await
+        .expect("dispatched");
+
+        assert_eq!(
+            store.read_deadlines(),
+            vec![30_000, 30_000],
+            "the dispatcher's own read, then the agent's, capped at the task's budget"
+        );
+
+        let modest = Arc::new(
+            RecordingAgent::new("reader", &[("summarise", false)])
+                .reading_history_within("order_ref", 500),
+        );
+        let patient = Arc::new(FakeStore::healthy());
+        dispatcher(
+            std::slice::from_ref(&modest),
+            patient.clone(),
+            plain_courier(),
+        )
+        .dispatch(envelope("summarise all"))
+        .await
+        .expect("dispatched");
+
+        assert_eq!(
+            patient.read_deadlines(),
+            vec![5_000, 500],
+            "a smaller request is honoured as asked"
+        );
+    }
+
+    #[tokio::test]
     async fn an_envelope_whose_records_failed_to_write_is_retried_in_full() {
         let agent = Arc::new(
             RecordingAgent::new("reader", &[("summarise", false)])
@@ -825,6 +990,11 @@ mod tests {
             .expect("dispatched");
 
         assert_eq!(handled.records_written, 1);
+        assert_eq!(
+            handled.status,
+            Some(Status::Failed),
+            "the attempt is reported as it went, not as an error"
+        );
         assert!(
             dispatcher
                 .dispatch(envelope("summarise all"))
@@ -1084,7 +1254,12 @@ mod transport {
         .await
         .expect_err("refused");
 
-        assert!(matches!(error, crate::Error::RefusedDegraded));
+        let refusal = matches!(
+            &error,
+            crate::Error::RefusedDegraded { intent, omitted }
+                if intent == "apply" && omitted == &vec!["a source was down".to_string()]
+        );
+        assert!(refusal, "{error}");
         assert_eq!(agent.calls(), 0);
     }
 

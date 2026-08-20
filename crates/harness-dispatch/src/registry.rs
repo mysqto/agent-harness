@@ -10,6 +10,16 @@ pub struct Registry {
     agents: Vec<Arc<dyn Agent>>,
 }
 
+// Hand written: `Arc<dyn Agent>` cannot be derived through, and without `Debug` a caller cannot
+// `expect_err` on a registry it failed to build. The identities are the only part worth printing.
+impl std::fmt::Debug for Registry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Registry")
+            .field("agents", &self.ids())
+            .finish()
+    }
+}
+
 impl Registry {
     /// An empty registry.
     #[must_use]
@@ -138,6 +148,23 @@ mod tests {
             registry.resolve("summarise"),
             Err(Error::Unroutable(_))
         ));
+    }
+
+    #[test]
+    fn a_registry_names_the_agents_it_holds_when_printed() {
+        // The point of the impl: a failure involving a registry can say which agents were in it.
+        let mut registry = Registry::new();
+        registry
+            .register(Arc::new(RecordingAgent::new(
+                "reader",
+                &[("summarise", false)],
+            )))
+            .expect("register");
+
+        assert_eq!(
+            format!("{registry:?}"),
+            "Registry { agents: [AgentId(\"reader\")] }"
+        );
     }
 
     #[test]
