@@ -67,4 +67,6 @@ Work along the path, in this order — it is roughly cheapest-to-check first:
    registration order.
 4. Was it a duplicate? A repeated `envelope_id` is dropped by design. If real messages are vanishing,
    suspect an adapter deriving ids too coarsely.
-5. Was it refused? A mutating task on degraded context is refused before the agent runs.
+5. Was it refused? A mutating task on degraded context is refused before the agent runs. The refusal
+   names the intent and what the context was missing, so it says which source was unreachable rather
+   than only that one was.

@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, UnixListener};
 
-use crate::{Client, Config, Error, Handle};
+use crate::{Bundle, Client, Config, Error, Handle};
 
 /// Requests a stub has seen, head and body together.
 type Seen = Arc<Mutex<Vec<String>>>;
@@ -267,8 +267,16 @@ async fn a_bundle_keeps_the_stores_own_degraded_verdict() {
         .await
         .expect("bundle");
 
-    assert!(bundle.degraded);
-    assert_eq!(bundle.omitted, vec!["cold storage: unreachable".to_owned()]);
+    // Whole-value: a verdict that arrived with an extra record, or with the reason dropped, is a
+    // different answer from the one the store gave.
+    assert_eq!(
+        bundle,
+        Bundle {
+            records: Vec::new(),
+            degraded: true,
+            omitted: vec!["cold storage: unreachable".to_owned()],
+        }
+    );
 }
 
 #[tokio::test]
@@ -414,11 +422,18 @@ async fn submitting_with_no_socket_posts_to_base_url() {
     let (base_url, seen) = tcp_stub(vec![Reply::status(202)]).await;
     let client = Client::new(config(&base_url, None));
 
-    client.submit(&draft()).await.expect("submitted");
+    client
+        .submit(&draft(), "corr-1", 2_000)
+        .await
+        .expect("submitted");
 
     let request = only(&seen);
     assert!(request.starts_with("POST /records "), "{request}");
     assert!(request.contains("\"agent\":\"summariser\""), "{request}");
+    assert!(
+        request.contains("\"correlation_id\":\"corr-1\""),
+        "{request}"
+    );
     assert!(request.contains("\"action\":\"summarise\""), "{request}");
 }
 
@@ -427,7 +442,10 @@ async fn a_prefix_in_base_url_is_kept() {
     let (base_url, seen) = tcp_stub(vec![Reply::status(202)]).await;
     let client = Client::new(config(&format!("{base_url}/v1"), None));
 
-    client.submit(&draft()).await.expect("submitted");
+    client
+        .submit(&draft(), "corr-1", 2_000)
+        .await
+        .expect("submitted");
 
     assert!(only(&seen).starts_with("POST /v1/records "));
 }
@@ -444,7 +462,10 @@ async fn a_client_error_is_permanent_and_a_server_error_is_not() {
         let (base_url, _seen) = tcp_stub(vec![Reply::status(status)]).await;
         let client = Client::new(config(&base_url, None));
 
-        let err = client.submit(&draft()).await.expect_err("failed");
+        let err = client
+            .submit(&draft(), "corr-1", 2_000)
+            .await
+            .expect_err("failed");
 
         if permanent {
             assert!(matches!(err, Error::Rejected(_)), "{status}: {err:?}");
@@ -457,10 +478,12 @@ async fn a_client_error_is_permanent_and_a_server_error_is_not() {
 #[tokio::test]
 async fn a_stalled_store_is_unavailable_rather_than_rejected() {
     let (base_url, _seen) = tcp_stub(vec![Reply::stalled()]).await;
-    let mut client = Client::new(config(&base_url, None));
-    client.set_timeout(Duration::from_millis(40));
+    let client = Client::new(config(&base_url, None));
 
-    let err = client.submit(&draft()).await.expect_err("timed out");
+    let err = client
+        .submit(&draft(), "corr-1", 40)
+        .await
+        .expect_err("timed out");
 
     assert!(matches!(err, Error::Unavailable(_)), "{err:?}");
 }
@@ -471,7 +494,10 @@ async fn submitting_prefers_the_sidecar_over_base_url() {
     // Nothing is listening on base_url, so a success proves the socket was used.
     let client = Client::new(config(&dead_url().await, Some(socket)));
 
-    client.submit(&draft()).await.expect("submitted");
+    client
+        .submit(&draft(), "corr-1", 2_000)
+        .await
+        .expect("submitted");
 
     let line: Value = serde_json::from_str(&only(&seen)).expect("one json line");
     assert_eq!(line["agent"], json!("summariser"));
@@ -497,7 +523,7 @@ async fn every_ack_status_maps_to_its_outcome() {
         let (_dir, socket, _seen) = unix_line_stub(vec![Ack::Line(ack)]);
         let client = Client::new(config("http://memory.invalid", Some(socket)));
 
-        let outcome = client.submit(&draft()).await;
+        let outcome = client.submit(&draft(), "corr-1", 2_000).await;
 
         match (expected, outcome) {
             (Ok(()), got) => got.unwrap_or_else(|err| panic!("{ack} should succeed: {err:?}")),
@@ -513,7 +539,10 @@ async fn an_unusable_ack_is_reported_rather_than_panicking() {
         let (_dir, socket, _seen) = unix_line_stub(vec![ack]);
         let client = Client::new(config("http://memory.invalid", Some(socket)));
 
-        let err = client.submit(&draft()).await.expect_err("no usable ack");
+        let err = client
+            .submit(&draft(), "corr-1", 2_000)
+            .await
+            .expect_err("no usable ack");
 
         assert!(matches!(err, Error::Transport(_)), "{err:?}");
     }
@@ -524,7 +553,10 @@ async fn a_missing_sidecar_is_a_transport_failure() {
     let (_dir, socket) = socket_path();
     let client = Client::new(config("http://memory.invalid", Some(socket)));
 
-    let err = client.submit(&draft()).await.expect_err("no sidecar");
+    let err = client
+        .submit(&draft(), "corr-1", 2_000)
+        .await
+        .expect_err("no sidecar");
 
     assert!(matches!(err, Error::Transport(_)), "{err:?}");
 }
@@ -532,10 +564,12 @@ async fn a_missing_sidecar_is_a_transport_failure() {
 #[tokio::test]
 async fn a_silent_sidecar_is_unavailable() {
     let (_dir, socket, _seen) = unix_line_stub(vec![Ack::Silence]);
-    let mut client = Client::new(config("http://memory.invalid", Some(socket)));
-    client.set_timeout(Duration::from_millis(40));
+    let client = Client::new(config("http://memory.invalid", Some(socket)));
 
-    let err = client.submit(&draft()).await.expect_err("no ack");
+    let err = client
+        .submit(&draft(), "corr-1", 40)
+        .await
+        .expect_err("no ack");
 
     assert!(matches!(err, Error::Unavailable(_)), "{err:?}");
 }
@@ -550,9 +584,12 @@ async fn history_projects_records_and_applies_the_limit() {
         ],
     });
     let (base_url, seen) = tcp_stub(vec![Reply::ok(&body)]).await;
-    let handle = Handle::new(Client::new(config(&base_url, None)), "corr-1");
+    let handle = Handle::new(Client::new(config(&base_url, None)), "corr-1", 2_000);
 
-    let history = handle.history("ticket", "t-7", 2).await.expect("history");
+    let history = handle
+        .history("ticket", "t-7", 2, 2_000)
+        .await
+        .expect("history");
 
     assert_eq!(
         history.len(),
@@ -566,9 +603,12 @@ async fn history_projects_records_and_applies_the_limit() {
 #[tokio::test]
 async fn history_keeps_a_record_that_is_not_an_object() {
     let (base_url, _seen) = tcp_stub(vec![Reply::ok(&json!({"records": ["bare"]}))]).await;
-    let handle = Handle::new(Client::new(config(&base_url, None)), "corr-1");
+    let handle = Handle::new(Client::new(config(&base_url, None)), "corr-1", 2_000);
 
-    let history = handle.history("ticket", "t-7", 10).await.expect("history");
+    let history = handle
+        .history("ticket", "t-7", 10, 2_000)
+        .await
+        .expect("history");
 
     assert_eq!(
         history[0]["value"],
@@ -581,9 +621,12 @@ async fn history_keeps_a_record_that_is_not_an_object() {
 async fn history_still_returns_the_records_a_degraded_bundle_did_hold() {
     let body = json!({"records": [{"action": "summarise"}], "degraded": true});
     let (base_url, _seen) = tcp_stub(vec![Reply::ok(&body)]).await;
-    let handle = Handle::new(Client::new(config(&base_url, None)), "corr-1");
+    let handle = Handle::new(Client::new(config(&base_url, None)), "corr-1", 2_000);
 
-    let history = handle.history("ticket", "t-7", 10).await.expect("history");
+    let history = handle
+        .history("ticket", "t-7", 10, 2_000)
+        .await
+        .expect("history");
 
     assert_eq!(history.len(), 1);
 }
@@ -591,10 +634,10 @@ async fn history_still_returns_the_records_a_degraded_bundle_did_hold() {
 #[tokio::test]
 async fn history_reports_a_rejection_as_malformed() {
     let (base_url, _seen) = tcp_stub(vec![Reply::status(422)]).await;
-    let handle = Handle::new(Client::new(config(&base_url, None)), "corr-1");
+    let handle = Handle::new(Client::new(config(&base_url, None)), "corr-1", 2_000);
 
     let err = handle
-        .history("ticket", "t-7", 10)
+        .history("ticket", "t-7", 10, 2_000)
         .await
         .expect_err("rejected");
 
@@ -603,7 +646,11 @@ async fn history_reports_a_rejection_as_malformed() {
 
 #[tokio::test]
 async fn recording_surfaces_a_transport_failure_as_retryable() {
-    let handle = Handle::new(Client::new(config(&dead_url().await, None)), "corr-1");
+    let handle = Handle::new(
+        Client::new(config(&dead_url().await, None)),
+        "corr-1",
+        2_000,
+    );
 
     let err = handle.record(draft()).await.expect_err("nothing listening");
 
@@ -620,6 +667,7 @@ async fn recording_reports_a_rejection_as_malformed() {
     let handle = Handle::new(
         Client::new(config("http://memory.invalid", Some(socket))),
         "corr-1",
+        2_000,
     );
 
     let err = handle.record(draft()).await.expect_err("rejected");
@@ -628,25 +676,34 @@ async fn recording_reports_a_rejection_as_malformed() {
 }
 
 #[tokio::test]
-async fn recording_stamps_the_interaction_id() {
+async fn recording_names_the_interaction_beside_the_record() {
     let (_dir, socket, seen) = unix_line_stub(vec![Ack::Line("{\"status\":\"spooled\"}")]);
     let handle = Handle::new(
         Client::new(config("http://memory.invalid", Some(socket))),
         "corr-1",
+        2_000,
     );
 
     handle.record(draft()).await.expect("spooled is a success");
 
     let line: Value = serde_json::from_str(&only(&seen)).expect("json");
-    assert_eq!(line["record"]["attrs"]["correlation_id"], json!("corr-1"));
+    assert_eq!(line["correlation_id"], json!("corr-1"));
+    assert_eq!(
+        line["record"]["attrs"].get("correlation_id"),
+        None,
+        "the link must not occupy an attribute key"
+    );
 }
 
 #[tokio::test]
-async fn an_agents_own_interaction_id_is_not_overwritten() {
+async fn an_attribute_genuinely_called_correlation_id_is_left_alone() {
+    // Two different things that happened to share a name. Stamping the interaction into `attrs`
+    // made one of them unrepresentable; now both arrive.
     let (_dir, socket, seen) = unix_line_stub(vec![Ack::Line("{\"status\":\"accepted\"}")]);
     let handle = Handle::new(
         Client::new(config("http://memory.invalid", Some(socket))),
         "corr-1",
+        2_000,
     );
     let mut draft = draft();
     draft
@@ -660,4 +717,18 @@ async fn an_agents_own_interaction_id_is_not_overwritten() {
         line["record"]["attrs"]["correlation_id"],
         json!("corr-agent")
     );
+    assert_eq!(line["correlation_id"], json!("corr-1"));
+}
+
+#[tokio::test]
+async fn a_submission_with_no_interaction_leaves_the_field_off_the_wire() {
+    // An empty id is "nothing to link", not a link to nothing; a store must be able to tell.
+    let (_dir, socket, seen) = unix_line_stub(vec![Ack::Line("{\"status\":\"accepted\"}")]);
+    let client = Client::new(config("http://memory.invalid", Some(socket)));
+
+    client.submit(&draft(), "", 2_000).await.expect("submitted");
+
+    let line: Value = serde_json::from_str(&only(&seen)).expect("json");
+    assert_eq!(line.get("correlation_id"), None);
+    assert_eq!(line["agent"], json!("summariser"));
 }

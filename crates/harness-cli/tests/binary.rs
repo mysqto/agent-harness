@@ -37,6 +37,7 @@ fn one_line_of_text_is_dispatched_and_reported() {
     for expected in [
         "intent     echo",
         "agent      echo",
+        "status     succeeded",
         "mutating   no",
         "context    complete",
         "deliveries 1",

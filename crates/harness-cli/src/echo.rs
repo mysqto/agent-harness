@@ -157,7 +157,7 @@ mod tests {
         assert!(ctx.remaining_ms() > 0);
         assert!(
             ctx.memory()
-                .history("order_ref", "ord-91h2", 5)
+                .history("order_ref", "ord-91h2", 5, ctx.remaining_ms())
                 .await
                 .expect("history")
                 .is_empty()

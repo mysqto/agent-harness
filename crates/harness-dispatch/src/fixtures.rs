@@ -192,7 +192,8 @@ pub struct FakeStore {
     write_rejection: Option<String>,
     records: Vec<serde_json::Value>,
     requested: Mutex<Vec<(String, String)>>,
-    submitted: Mutex<Vec<String>>,
+    read_deadlines: Mutex<Vec<u64>>,
+    submitted: Mutex<Vec<(ActionDraft, String)>>,
 }
 
 impl FakeStore {
@@ -206,6 +207,7 @@ impl FakeStore {
             write_rejection: None,
             records: Vec::new(),
             requested: Mutex::new(Vec::new()),
+            read_deadlines: Mutex::new(Vec::new()),
             submitted: Mutex::new(Vec::new()),
         }
     }
@@ -274,8 +276,21 @@ impl FakeStore {
         guard(&self.requested).clone()
     }
 
+    /// The deadline every read was given, in order.
+    pub fn read_deadlines(&self) -> Vec<u64> {
+        guard(&self.read_deadlines).clone()
+    }
+
     /// The action of every record written, in order.
     pub fn submitted(&self) -> Vec<String> {
+        guard(&self.submitted)
+            .iter()
+            .map(|(draft, _)| draft.action.clone())
+            .collect()
+    }
+
+    /// Every record written, with the interaction id it was submitted under.
+    pub fn submissions(&self) -> Vec<(ActionDraft, String)> {
         guard(&self.submitted).clone()
     }
 }
@@ -285,9 +300,10 @@ impl ContextStore for FakeStore {
     async fn bundle(
         &self,
         entities: &[(String, String)],
-        _deadline_ms: u64,
+        deadline_ms: u64,
     ) -> harness_memory::Result<Bundle> {
         guard(&self.requested).extend_from_slice(entities);
+        guard(&self.read_deadlines).push(deadline_ms);
         let rejected = self
             .rejected_kind
             .as_ref()
@@ -305,14 +321,19 @@ impl ContextStore for FakeStore {
         })
     }
 
-    async fn submit(&self, draft: &ActionDraft) -> harness_memory::Result<()> {
+    async fn submit(
+        &self,
+        draft: &ActionDraft,
+        correlation_id: &str,
+        _deadline_ms: u64,
+    ) -> harness_memory::Result<()> {
         if let Some(why) = &self.write_rejection {
             return Err(harness_memory::Error::Rejected(why.clone()));
         }
         if let Some(why) = &self.write_error {
             return Err(harness_memory::Error::Unavailable(why.clone()));
         }
-        guard(&self.submitted).push(draft.action.clone());
+        guard(&self.submitted).push((draft.clone(), correlation_id.to_owned()));
         Ok(())
     }
 }
@@ -326,6 +347,7 @@ pub struct RecordingAgent {
     records: Vec<ActionDraft>,
     queued: Vec<ActionDraft>,
     history_kind: Option<String>,
+    history_deadline_ms: Option<u64>,
     fail: Option<String>,
     calls: AtomicUsize,
     degraded: AtomicBool,
@@ -353,6 +375,7 @@ impl RecordingAgent {
             records: Vec::new(),
             queued: Vec::new(),
             history_kind: None,
+            history_deadline_ms: None,
             fail: None,
             calls: AtomicUsize::new(0),
             degraded: AtomicBool::new(false),
@@ -400,10 +423,16 @@ impl RecordingAgent {
         self
     }
 
-    /// Reads history for one entity of `kind` before answering.
+    /// Reads history for one entity of `kind` before answering, within whatever time it has left.
     pub fn reading_history(mut self, kind: &str) -> Self {
         self.history_kind = Some(kind.into());
         self
+    }
+
+    /// Reads history asking for `deadline_ms`, whether or not the task has that much left.
+    pub fn reading_history_within(mut self, kind: &str, deadline_ms: u64) -> Self {
+        self.history_deadline_ms = Some(deadline_ms);
+        self.reading_history(kind)
     }
 
     /// Reports the task as attempted with this status.
@@ -472,7 +501,10 @@ impl Agent for RecordingAgent {
         self.degraded.store(ctx.is_degraded(), Ordering::Relaxed);
 
         if let Some(kind) = &self.history_kind {
-            match ctx.memory().history(kind, "ord-1", 10).await {
+            let deadline_ms = self
+                .history_deadline_ms
+                .unwrap_or_else(|| ctx.remaining_ms());
+            match ctx.memory().history(kind, "ord-1", 10, deadline_ms).await {
                 Ok(rows) => {
                     *guard(&self.history) = rows
                         .iter()

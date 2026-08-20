@@ -251,9 +251,8 @@ mod tests {
 
     #[test]
     fn an_unknown_agent_name_is_a_usage_error() {
-        let error = registry(&["nosuch".to_string()])
-            .err()
-            .expect("an unknown agent must not register");
+        let error =
+            registry(&["nosuch".to_string()]).expect_err("an unknown agent must not register");
         assert!(matches!(error, Error::Usage(ref why) if why.contains("nosuch")));
         assert_eq!(error.code(), exit::USAGE);
     }
@@ -350,8 +349,7 @@ mod tests {
     fn the_same_agent_twice_is_a_usage_error() {
         // Two claims on one intent is ambiguous by design; here it is the argument list's fault.
         let error = registry(&["echo".to_string(), "echo".to_string()])
-            .err()
-            .expect("one intent claimed twice must not register");
+            .expect_err("one intent claimed twice must not register");
         assert_eq!(error.code(), exit::USAGE);
     }
 }
