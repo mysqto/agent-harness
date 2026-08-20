@@ -38,13 +38,9 @@ recomputed counters rather than incremented ones.
 
 ## 6. Tests and docs are part of the change
 
-- Line coverage ≥ 85%, enforced in CI.
-
-  **Known temporary state:** the coverage step is advisory in this repository, because every crate
-  body is still `todo!()` and unimplemented lines cannot be covered. The concrete code is tested and
-  the figure is reported on each run (76.88% at the time of writing). **Make it blocking — remove
-  `continue-on-error` from `.github/workflows/ci.yml` — as part of the first change that implements a
-  crate.** Leaving it advisory past that point is how a gate quietly stops being one.
+- Line coverage ≥ 85%, enforced in CI, and **blocking** since `harness-dispatch` landed (97.85% at
+  the time of writing). The `todo!()` bodies still to come drag the figure down without excusing it:
+  a crate that cannot reach the gate is a crate whose tests have not been written yet.
 - `cargo clippy --all-targets -- -D warnings` clean.
 - Every public item documented. Comments explain *why*, briefly — no restating the code.
 
