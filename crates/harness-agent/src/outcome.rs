@@ -72,3 +72,57 @@ impl Outcome {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{ActionDraft, Egress, Outcome, Status};
+
+    #[test]
+    fn ok_is_empty_and_successful() {
+        let outcome = Outcome::ok();
+        assert_eq!(outcome.status, Status::Succeeded);
+        assert!(outcome.egress.is_empty());
+        assert!(outcome.records.is_empty());
+    }
+
+    #[test]
+    fn outcome_survives_a_json_round_trip() {
+        // The dispatcher may hand an outcome across a process boundary, so the wire form has to be
+        // lossless for every field an agent can set.
+        let outcome = Outcome {
+            status: Status::Partial,
+            egress: vec![Egress {
+                target: "stdout".into(),
+                text: "two of three done".into(),
+                thread: Some("t-1".into()),
+            }],
+            records: vec![ActionDraft {
+                action: "summarise".into(),
+                outcome: Status::Partial,
+                attrs: [("count".to_string(), serde_json::json!(2))]
+                    .into_iter()
+                    .collect(),
+                entities: vec![("order_ref".into(), "ord-91h2".into())],
+                summary: "summarised two".into(),
+            }],
+        };
+        let text = serde_json::to_string(&outcome).expect("serialise");
+        assert_eq!(
+            serde_json::from_str::<Outcome>(&text).expect("parse"),
+            outcome
+        );
+    }
+
+    #[test]
+    fn status_serialises_in_snake_case() {
+        // Adapters in other languages match on these strings, so the casing is part of the contract.
+        assert_eq!(
+            serde_json::to_string(&Status::Succeeded).unwrap(),
+            "\"succeeded\""
+        );
+        assert_eq!(
+            serde_json::to_string(&Status::Declined).unwrap(),
+            "\"declined\""
+        );
+    }
+}

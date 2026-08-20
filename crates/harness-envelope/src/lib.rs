@@ -60,3 +60,70 @@ pub enum Error {
     #[error("source unavailable: {0}")]
     Unavailable(String),
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{Delivery, Envelope};
+
+    fn envelope() -> Envelope {
+        Envelope {
+            envelope_id: "cli-4a2f".into(),
+            source: "cli".into(),
+            received_at: "2026-08-19T14:30:12Z".into(),
+            attempt: 1,
+            reply_to: Some("stdout".into()),
+            actor: Some("local".into()),
+            body: "summarise order ord-91h2".into(),
+            extra: [("tty".to_string(), serde_json::json!(true))]
+                .into_iter()
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn envelope_survives_a_json_round_trip() {
+        // Adapters are written in other languages against this exact shape, so a field lost here is
+        // a field lost at the boundary.
+        let text = serde_json::to_string(&envelope()).expect("serialise");
+        assert_eq!(
+            serde_json::from_str::<Envelope>(&text).expect("parse"),
+            envelope()
+        );
+    }
+
+    #[test]
+    fn envelope_parses_the_shape_the_shell_adapter_emits() {
+        // Kept byte-for-byte in step with adapters/cli. If this fails, that adapter is broken.
+        let raw = r#"{"envelope_id":"cli-123","source":"cli","received_at":"2026-08-19T14:30:12Z",
+            "attempt":1,"reply_to":"stdout","actor":"local","body":"hello","extra":{}}"#;
+        let parsed: Envelope = serde_json::from_str(raw).expect("parse");
+        assert_eq!(parsed.envelope_id, "cli-123");
+        assert_eq!(parsed.attempt, 1);
+    }
+
+    #[test]
+    fn a_retry_is_visible_in_the_envelope() {
+        let mut e = envelope();
+        e.attempt = 3;
+        assert_eq!(
+            serde_json::from_str::<Envelope>(&serde_json::to_string(&e).unwrap())
+                .unwrap()
+                .attempt,
+            3
+        );
+    }
+
+    #[test]
+    fn delivery_round_trips_with_and_without_a_thread() {
+        for thread in [None, Some("t-9".to_string())] {
+            let d = Delivery {
+                envelope_id: "cli-4a2f".into(),
+                target: "stdout".into(),
+                text: "done".into(),
+                thread,
+            };
+            let text = serde_json::to_string(&d).expect("serialise");
+            assert_eq!(serde_json::from_str::<Delivery>(&text).expect("parse"), d);
+        }
+    }
+}

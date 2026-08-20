@@ -37,3 +37,14 @@ impl Registry {
         self.agents.iter().map(|a| a.id().clone()).collect()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::Registry;
+
+    #[test]
+    fn a_new_registry_holds_nothing() {
+        assert!(Registry::new().ids().is_empty());
+        assert!(Registry::default().ids().is_empty());
+    }
+}

@@ -52,3 +52,56 @@ pub struct Task {
     /// Who caused it, when known. Absent for scheduled or system-originated work.
     pub actor: Option<Actor>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{Actor, Capability, Task, TaskId};
+
+    fn task() -> Task {
+        Task {
+            task_id: TaskId("t-1".into()),
+            correlation_id: "env-1".into(),
+            intent: "summarise".into(),
+            args: [("id".to_string(), serde_json::json!("ord-91h2"))]
+                .into_iter()
+                .collect(),
+            mutating: false,
+            actor: Some(Actor {
+                id: "u-1".into(),
+                source: "cli".into(),
+            }),
+        }
+    }
+
+    #[test]
+    fn task_survives_a_json_round_trip() {
+        let text = serde_json::to_string(&task()).expect("serialise");
+        assert_eq!(serde_json::from_str::<Task>(&text).expect("parse"), task());
+    }
+
+    #[test]
+    fn a_task_with_no_actor_is_valid() {
+        // Scheduled and system-originated work has no actor; the field is optional on purpose.
+        let mut t = task();
+        t.actor = None;
+        let text = serde_json::to_string(&t).expect("serialise");
+        assert_eq!(
+            serde_json::from_str::<Task>(&text).expect("parse").actor,
+            None
+        );
+    }
+
+    #[test]
+    fn capability_declares_whether_it_mutates() {
+        let cap = Capability {
+            intent: "refund".into(),
+            mutating: true,
+        };
+        let text = serde_json::to_string(&cap).expect("serialise");
+        assert!(
+            serde_json::from_str::<Capability>(&text)
+                .expect("parse")
+                .mutating
+        );
+    }
+}
