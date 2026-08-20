@@ -29,11 +29,7 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
-      # Advisory while the crate bodies are still todo!(): unimplemented lines cannot be covered,
-      # so a blocking gate here would only teach people to ignore a red build. The concrete code
-      # (types, constructors, wire round-trips) is genuinely tested and the number is reported on
-      # every run. Flip this to blocking — delete continue-on-error — with the first crate whose
-      # todo!()s are gone; AGENTS.md tracks it.
-      - name: Coverage (advisory until the first crate is implemented)
-        continue-on-error: true
+      # Blocking from here on. The first crate is implemented, so unimplemented lines are no longer
+      # the reason a figure is low — thin tests are.
+      - name: Coverage
         run: cargo llvm-cov --workspace --fail-under-lines 85 --summary-only
