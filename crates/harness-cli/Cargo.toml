@@ -14,9 +14,17 @@ workspace = true
 thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tokio.workspace = true
 tracing.workspace = true
+async-trait.workspace = true
 harness-agent = { path = "../harness-agent" }
 harness-dispatch = { path = "../harness-dispatch" }
 harness-envelope = { path = "../harness-envelope" }
 harness-memory = { path = "../harness-memory" }
+# Argument parsing only: no colour or suggestion machinery, which is most of clap's dependency tree.
+clap = { version = "4.5", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
+# The config file the installer writes. Parsing only — nothing here ever writes TOML back.
+toml = { version = "0.9", default-features = false, features = ["std", "parse", "serde"] }
+tokio = { workspace = true, features = ["net", "io-util", "signal", "sync"] }
+
+[dev-dependencies]
+tempfile.workspace = true
