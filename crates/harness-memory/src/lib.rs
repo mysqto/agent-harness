@@ -15,9 +15,14 @@
 //! Since the point is that any store can implement this, the wire side is stated rather than left
 //! to be read out of the code:
 //!
-//! - `GET /bundle?kind=<kind>&id=<id>` → `{"records": [...], "degraded": bool, "omitted": [...]}`.
-//!   One request per entity; missing fields default. Served over the sidecar socket when there is
-//!   one, otherwise over `base_url`.
+//! - `GET /bundle?entity=<kind>:<id>` → `{"records": [...], "degraded": bool, "omitted": [...]}`.
+//!   One request per entity; missing fields default. Served over the sidecar's *read* socket when
+//!   one is configured, otherwise over `base_url`. The store refuses a parameter it does not
+//!   declare, so the spelling here is a requirement rather than a preference.
+//! - The sidecar serves reads on a second socket, `<agent>.read.sock` beside the record socket, and
+//!   it is `GET` only: it signs the request as its caller and forwards it, so this process needs no
+//!   key material to read either. A read is never queued — unreachable comes back `503` — because
+//!   a caller cannot tell stale data from fresh, and a write laundered through it is refused `405`.
 //! - `POST /records` with a complete record as the body → any `2xx`. The direct path only. A
 //!   record is not a draft: an agent describes what it did, and this client adds the identity, the
 //!   timing and the attribution the store requires. [`record`] holds the shape and the reason for
@@ -40,6 +45,7 @@ mod sidecar;
 mod tests;
 
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use harness_agent::{ActionDraft, MemoryHandle};
@@ -51,11 +57,14 @@ use serde::Deserialize;
 pub struct Config {
     /// Base URL of the service.
     pub base_url: String,
-    /// Path to the local sidecar socket, when one is present.
+    /// Path to the local sidecar's *record* socket, when one is present.
     ///
-    /// Preferred over a direct connection: the sidecar holds the signing key and seals on our
-    /// behalf, so this process needs no key material of its own.
-    pub sidecar_socket: Option<std::path::PathBuf>,
+    /// Preferred over a direct connection: the sidecar holds the signing key, seals records and
+    /// signs reads on our behalf, so this process needs no key material of its own.
+    ///
+    /// One path, both sockets. The read socket is derived from this one by [`read_socket`], by the
+    /// same rule the sidecar derives it, so a deployment has nothing second to get wrong.
+    pub sidecar_socket: Option<PathBuf>,
     /// Identity records are attributed to.
     pub agent: String,
 }
@@ -152,12 +161,54 @@ impl Client {
 
     /// Picks the transport for a read. The sidecar wins whenever it is configured, since going
     /// direct would mean this process needed key material of its own.
+    ///
+    /// The read socket, not the record socket. The two speak different protocols on purpose — the
+    /// record socket frames one JSON line and the read socket speaks HTTP/1.1 — so a read sent at
+    /// the record socket would sit there waiting for a newline that HTTP never sends.
     fn target(&self) -> Result<http::Target> {
         match &self.config.sidecar_socket {
-            Some(socket) => Ok(http::Target::Unix(socket.clone())),
+            Some(socket) => Ok(http::Target::Unix(read_socket(socket))),
             None => http::Endpoint::parse(&self.config.base_url).map(http::Target::Tcp),
         }
     }
+}
+
+/// Extension a sidecar's record socket carries.
+const SOCKET_EXT: &str = "sock";
+
+/// What a sidecar names a caller's read socket, in place of [`SOCKET_EXT`].
+const READ_SUFFIX: &str = ".read.sock";
+
+/// The read socket beside a record socket: the same stem, with `.read.sock` for its extension.
+///
+/// Derived rather than configured, and derived by the sidecar's own rule so the two cannot drift.
+/// A second setting would be a second thing to point at the wrong socket — and pointing reads at
+/// one identity while records go to another is exactly the failure a caller could not see.
+///
+/// A path that does not end in `.sock` is appended to rather than rewritten: appending is the one
+/// rule that cannot collide with the record socket's own path.
+///
+/// ```
+/// use std::path::Path;
+///
+/// assert_eq!(
+///     harness_memory::read_socket(Path::new("/run/sockets/agent.sock")),
+///     Path::new("/run/sockets/agent.read.sock")
+/// );
+/// ```
+#[must_use]
+pub fn read_socket(record_socket: &Path) -> PathBuf {
+    let stem = if record_socket
+        .extension()
+        .is_some_and(|ext| ext == SOCKET_EXT)
+    {
+        record_socket.file_stem()
+    } else {
+        record_socket.file_name()
+    };
+    let mut name = stem.unwrap_or_default().to_os_string();
+    name.push(READ_SUFFIX);
+    record_socket.with_file_name(name)
 }
 
 /// Fetches one entity's slice of context.
@@ -167,7 +218,11 @@ async fn fetch(
     id: &str,
     budget: Duration,
 ) -> Result<WireBundle> {
-    let route = format!("/bundle?kind={}&id={}", encode(kind), encode(id));
+    // `kind:id` in one parameter, which is the store's grammar rather than a choice: it declares
+    // `entity`, `actor` and `deadline_ms` and refuses anything else, so `kind` and `id` as separate
+    // parameters are a `400`. Each half is encoded and the separator is not, so an id carrying a
+    // `:` cannot move where the split falls.
+    let route = format!("/bundle?entity={}:{}", encode(kind), encode(id));
     let body = http::request(target, Method::GET, &route, None, budget)
         .await?
         .ok_body()?;
@@ -210,7 +265,12 @@ struct WireBundle {
 /// Context returned by the store.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct Bundle {
-    /// Records judged relevant, newest first.
+    /// Records judged relevant, newest first, exactly as the store put them on the wire.
+    ///
+    /// Opaque on purpose, and worth knowing what a store actually sends: the reference
+    /// implementation answers with record *identifiers*, not record bodies, and nothing here
+    /// fetches the bodies they name. An agent reading history therefore gets identifiers to ask
+    /// about again, which is a smaller answer than the type suggests.
     pub records: Vec<serde_json::Value>,
     /// `true` when a source was unavailable, so the caller knows this is partial.
     pub degraded: bool,

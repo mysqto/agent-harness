@@ -1,4 +1,4 @@
-//! A submission driven through the real memory service, end to end.
+//! A submission and a read back, driven through the real memory service, end to end.
 //!
 //! Ignored, and it has to be: it runs the store's own binaries, which come from a sibling checkout
 //! that CI does not have. Run it deliberately.
@@ -21,6 +21,11 @@
 //! outright pass every test in this crate. So the assertion here is not an ack — a stub can produce
 //! an ack. It is a file in the store's tree: the record was parsed, validated against the
 //! deployment's entity kinds and attribute schema, unsealed, and written.
+//!
+//! The read half is here for the same reason and against the same stub problem. A read is only
+//! answered because the sidecar signed it, and the properties the store built deliberately are only
+//! observable against the real thing: the identical read sent straight at the service is `401`, and
+//! a write pushed down the read socket is refused rather than laundered.
 
 use std::fs;
 use std::io::ErrorKind;
@@ -30,9 +35,11 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use harness_agent::{ActionDraft, Status};
-use harness_memory::{Client, Config};
+use harness_memory::{Client, Config, Error, read_socket};
 use serde_json::json;
 use tempfile::TempDir;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::UnixStream;
 
 /// Identity the socket, the keyring and the record all have to agree on.
 const AGENT: &str = "harness";
@@ -181,6 +188,15 @@ impl Lab {
         })
     }
 
+    /// A client with no sidecar, so it reaches the service on its own and holds no key.
+    fn keyless_client(&self) -> Client {
+        Client::new(Config {
+            base_url: format!("http://{}", self.listen),
+            sidecar_socket: None,
+            agent: AGENT.to_owned(),
+        })
+    }
+
     /// Both processes' output, for a failure that has to be diagnosed from one message.
     fn logs(&self) -> String {
         format!(
@@ -294,17 +310,47 @@ fn draft() -> ActionDraft {
         action: "deploy".into(),
         outcome: Status::Succeeded,
         attrs: [("service".to_owned(), json!("api"))].into_iter().collect(),
-        entities: vec![("deploy".to_owned(), "api/staging#1146".to_owned())],
+        entities: vec![entity()],
         summary: "probe".into(),
     }
 }
 
-/// Submits one record through [`Client`] and asserts the store wrote it.
+/// The entity the record is filed under and read back by.
+///
+/// One spelling for both halves: a write and a read that named the entity separately could disagree
+/// and the read would look like a broken transport rather than a typo. The `#` and the `/` are the
+/// point of choosing this id — an entity id that needs encoding is where a query builder breaks.
+fn entity() -> (String, String) {
+    ("deploy".to_owned(), "api/staging#1146".to_owned())
+}
+
+/// One raw HTTP exchange over a unix socket, returning the whole answer as text.
+///
+/// For the one probe [`Client`] cannot express: it sends `GET` on the read path and nothing else,
+/// so the write that has to be refused there has to be written by hand.
+async fn raw(socket: &Path, request: &str) -> String {
+    let mut stream = UnixStream::connect(socket)
+        .await
+        .unwrap_or_else(|e| panic!("connect {}: {e}", socket.display()));
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("write request");
+    let mut answer = Vec::new();
+    stream.read_to_end(&mut answer).await.expect("read answer");
+    String::from_utf8_lossy(&answer).to_string()
+}
+
+/// Submits one record through [`Client`], asserts the store wrote it, then reads it back.
+///
+/// One test for both directions on purpose: the read is only interesting because the record it
+/// finds is one this client wrote, and a read asserted against a record some other test wrote would
+/// pass on a store that never took the write.
 ///
 /// See the module documentation for how to run this and why it is ignored.
 #[tokio::test]
 #[ignore = "drives the store's binaries from a sibling checkout; see the module docs"]
-async fn a_submitted_record_lands_in_the_stores_tree() {
+async fn a_submitted_record_lands_in_the_stores_tree_and_reads_back() {
     let Some(bin) = binaries() else {
         eprintln!(
             "skipped: no yaam-server/yaam-agent found. Build them with \
@@ -353,5 +399,73 @@ async fn a_submitted_record_lands_in_the_stores_tree() {
     assert!(
         !stored.contains("attrs:\n  correlation_id"),
         "the interaction must not occupy an attribute key:\n{stored}"
+    );
+
+    // The store files a record at `<record_id>.md`, so the tree names what a read has to return.
+    let record_id = written[0]
+        .file_stem()
+        .expect("a record file has a stem")
+        .to_string_lossy()
+        .to_string();
+
+    // The other direction. The read socket is derived, not configured, so the first thing worth
+    // knowing is that this client and the sidecar agree on where it is.
+    let reads = read_socket(&lab.socket);
+    assert!(
+        reads.exists(),
+        "the sidecar serves no {}; the two derivations have drifted",
+        reads.display()
+    );
+
+    let bundle = lab
+        .client()
+        .bundle(&[entity()], 10_000)
+        .await
+        .unwrap_or_else(|err| panic!("bundle: {err}\n{}", lab.logs()));
+    println!("read back {bundle:?}");
+    assert!(
+        !bundle.degraded && bundle.omitted.is_empty(),
+        "a store that answered in full must not be reported as partial: {bundle:?}"
+    );
+    // What comes back is the record's *identifier*, not its body — see `Bundle::records`. Asserting
+    // on the id the tree gave us is the strongest claim available, and it is a real one: the index
+    // and the tree agree, and only a signed read gets this far at all.
+    assert!(
+        bundle
+            .records
+            .iter()
+            .any(|record| record.as_str() == Some(record_id.as_str())),
+        "the bundle does not name the record that was written ({record_id}): {bundle:?}"
+    );
+
+    // The sidecar is demonstrably what makes the read work. Byte for byte the same request, straight
+    // at the service, has no caller to decide about and is refused.
+    let direct = lab
+        .keyless_client()
+        .bundle(&[entity()], 10_000)
+        .await
+        .expect_err("an unsigned read must not be answered");
+    println!("direct read: {direct}");
+    assert!(
+        matches!(&direct, Error::Rejected(detail) if detail.starts_with("401")),
+        "an unsigned read is permanently refused, not retryable: {direct:?}"
+    );
+
+    // A write down the read path is refused rather than laundered: records must go through the
+    // record socket to be sealed and spooled, and the read socket cannot do either.
+    let refused = raw(
+        &reads,
+        "POST /records HTTP/1.1\r\nhost: localhost\r\ncontent-length: 2\r\n\
+         content-type: application/json\r\nconnection: close\r\n\r\n{}",
+    )
+    .await;
+    println!("write on the read socket: {refused}");
+    assert!(
+        refused.starts_with("HTTP/1.1 405 "),
+        "a write on the read socket must be refused: {refused}"
+    );
+    assert!(
+        refused.to_lowercase().contains("allow: get"),
+        "a 405 has to say what is allowed: {refused}"
     );
 }

@@ -1230,7 +1230,7 @@ mod transport {
         assert!(!agent.saw_degraded(), "a whole bundle is not degraded");
         let asked = seen.lock().expect("lock")[0].clone();
         assert!(
-            asked.starts_with("GET /bundle?kind=order_ref&id=ord-1"),
+            asked.starts_with("GET /bundle?entity=order_ref:ord-1"),
             "{asked:?}"
         );
     }
