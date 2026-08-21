@@ -158,9 +158,13 @@ fn socket_path() -> (tempfile::TempDir, PathBuf) {
 }
 
 /// The same HTTP stub, but on a unix socket — where a sidecar would be.
+///
+/// Binds the *read* socket and returns the *record* socket, which is what a [`Config`] names. So
+/// every read test below only reaches this stub if the client derived one path from the other, and
+/// a client that went on addressing the record socket finds nothing listening.
 fn unix_http_stub(replies: Vec<Reply>) -> (tempfile::TempDir, PathBuf, Seen) {
     let (dir, path) = socket_path();
-    let listener = UnixListener::bind(&path).expect("bind");
+    let listener = UnixListener::bind(crate::read_socket(&path)).expect("bind");
     let seen: Seen = Arc::default();
     let recorded = Arc::clone(&seen);
     tokio::spawn(async move {
@@ -247,11 +251,11 @@ async fn a_bundle_gathers_every_entity() {
     assert!(bundle.omitted.is_empty());
     let seen = seen.lock().expect("lock");
     assert!(
-        seen[0].starts_with("GET /bundle?kind=order_ref&id=ord-91h2 "),
+        seen[0].starts_with("GET /bundle?entity=order_ref:ord-91h2 "),
         "{seen:?}"
     );
     assert!(
-        seen[1].starts_with("GET /bundle?kind=ticket&id=t-7 "),
+        seen[1].starts_with("GET /bundle?entity=ticket:t-7 "),
         "{seen:?}"
     );
 }
@@ -377,7 +381,7 @@ async fn an_entity_id_cannot_smuggle_a_query_parameter() {
         .await
         .expect("bundle");
 
-    assert!(only(&seen).starts_with("GET /bundle?kind=order_ref&id=a%20b%26kind%3Dother "));
+    assert!(only(&seen).starts_with("GET /bundle?entity=order_ref:a%20b%26kind%3Dother "));
 }
 
 #[tokio::test]
@@ -392,7 +396,95 @@ async fn a_bundle_prefers_the_sidecar_socket_when_one_is_configured() {
         .expect("bundle");
 
     assert_eq!(bundle.records.len(), 1);
-    assert!(only(&seen).starts_with("GET /bundle?kind=ticket&id=t-7 "));
+    assert!(only(&seen).starts_with("GET /bundle?entity=ticket:t-7 "));
+}
+
+#[tokio::test]
+async fn a_read_goes_to_the_read_socket_and_never_the_record_socket() {
+    // The record socket frames one JSON line and the read socket speaks HTTP, so getting this
+    // wrong does not fail cleanly: the request goes out and the record socket waits for a newline.
+    // Both are bound here, and only the read one may be touched.
+    let (_dir, record, reads) = unix_http_stub(vec![Reply::ok(&one_record("t-7"))]);
+    let listener = UnixListener::bind(&record).expect("bind the record socket too");
+    let touched: Seen = Arc::default();
+    let recorded = Arc::clone(&touched);
+    tokio::spawn(async move {
+        while listener.accept().await.is_ok() {
+            recorded.lock().expect("lock").push("connected".to_owned());
+        }
+    });
+    let client = Client::new(config(&dead_url().await, Some(record)));
+
+    client
+        .bundle(&[("ticket".to_owned(), "t-7".to_owned())], 2_000)
+        .await
+        .expect("bundle");
+
+    assert!(only(&reads).starts_with("GET /bundle?entity=ticket:t-7 "));
+    assert!(
+        touched.lock().expect("lock").is_empty(),
+        "a read reached the record socket"
+    );
+}
+
+#[tokio::test]
+async fn a_write_refused_on_the_read_path_says_so() {
+    // The sidecar answers `405` with `Allow: GET` when a write takes the read socket. Nothing here
+    // sends one, so a `405` on a read means a route this client got wrong — worth its own words,
+    // because the record is not the problem and "rejected" alone points at the record.
+    let (_dir, socket, _seen) = unix_http_stub(vec![Reply::status(405)]);
+    let client = Client::new(config(&dead_url().await, Some(socket)));
+
+    let err = client
+        .bundle(&[("ticket".to_owned(), "t-7".to_owned())], 2_000)
+        .await
+        .expect_err("rejected");
+
+    assert!(
+        matches!(&err, Error::Rejected(detail) if detail.contains("record socket")),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_unreachable_store_behind_the_sidecar_degrades_rather_than_fails() {
+    // Reads are never queued, so the sidecar answers `503` rather than holding the request. That is
+    // transient, which means the bundle comes back marked instead of failing.
+    let (_dir, socket, _seen) = unix_http_stub(vec![Reply::status(503)]);
+    let client = Client::new(config(&dead_url().await, Some(socket)));
+
+    let bundle = client
+        .bundle(&[("ticket".to_owned(), "t-7".to_owned())], 2_000)
+        .await
+        .expect("degraded, not failed");
+
+    assert!(bundle.degraded);
+    assert_eq!(bundle.omitted.len(), 1);
+    assert!(bundle.omitted[0].contains("unavailable"), "{bundle:?}");
+}
+
+#[test]
+fn a_read_socket_is_named_after_its_record_socket() {
+    // The sidecar derives this path by exactly this rule. Two spellings of one rule agree until one
+    // is edited, and the failure would be a read sent at a socket that answers a different protocol.
+    for (record, reads) in [
+        ("/run/sockets/writer.sock", "/run/sockets/writer.read.sock"),
+        ("writer.sock", "writer.read.sock"),
+        // Not the expected extension, so nothing is stripped: appending is the one rule that
+        // cannot collide with the record socket's own path.
+        (
+            "/run/sockets/writer.socket",
+            "/run/sockets/writer.socket.read.sock",
+        ),
+        ("/run/sockets/writer", "/run/sockets/writer.read.sock"),
+        ("/run/sockets/a.b.sock", "/run/sockets/a.b.read.sock"),
+    ] {
+        assert_eq!(
+            crate::read_socket(std::path::Path::new(record)),
+            PathBuf::from(reads),
+            "{record}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -597,7 +689,7 @@ async fn history_projects_records_and_applies_the_limit() {
         "the limit is applied here, not on the wire"
     );
     assert_eq!(history[0]["at"], json!(3));
-    assert!(only(&seen).starts_with("GET /bundle?kind=ticket&id=t-7 "));
+    assert!(only(&seen).starts_with("GET /bundle?entity=ticket:t-7 "));
 }
 
 #[tokio::test]

@@ -22,6 +22,15 @@ use crate::{Error, Result};
 /// How much of a failing response body is quoted back in an error.
 const REASON_CHARS: usize = 200;
 
+/// What a `405` actually means, said rather than left as a generic rejection.
+///
+/// The method was refused, so nothing about the request's contents can be corrected — and the one
+/// way this client provokes it is a write sent down the read path, which the sidecar refuses with
+/// `Allow: GET`. A caller told only "rejected" would go looking at the record instead.
+const METHOD_REFUSAL: &str = "the method was refused. The sidecar's read socket serves GET only, \
+                              and a record goes to its record socket, which is what seals and \
+                              spools it — so this is a routing bug, not a bad record";
+
 /// Where to send a request.
 #[derive(Debug, Clone)]
 pub(crate) enum Target {
@@ -95,6 +104,8 @@ impl Response {
         // record that would have landed on the next attempt.
         if self.status == StatusCode::TOO_MANY_REQUESTS || self.status.is_server_error() {
             Err(Error::Unavailable(reason))
+        } else if self.status == StatusCode::METHOD_NOT_ALLOWED {
+            Err(Error::Rejected(format!("{reason}: {METHOD_REFUSAL}")))
         } else if self.status.is_client_error() {
             Err(Error::Rejected(reason))
         } else {
@@ -213,7 +224,7 @@ mod tests {
     use hyper::StatusCode;
     use hyper::body::Bytes;
 
-    use super::{Endpoint, REASON_CHARS, Response, quote};
+    use super::{Endpoint, METHOD_REFUSAL, REASON_CHARS, Response, quote};
     use crate::Error;
 
     fn status(code: u16) -> Error {
@@ -269,6 +280,18 @@ mod tests {
         assert!(matches!(status(503), Error::Unavailable(_)));
         // Nothing here follows redirects, so a 3xx is a protocol surprise rather than a verdict.
         assert!(matches!(status(302), Error::Transport(_)));
+    }
+
+    #[test]
+    fn a_405_says_a_write_took_the_read_path() {
+        // Still permanent, but "rejected: 405 why" alone sends the reader to the record's contents,
+        // which are not the problem.
+        let refusal = status(405);
+        assert!(
+            matches!(&refusal, Error::Rejected(detail)
+                if detail.starts_with("405 why") && detail.contains(METHOD_REFUSAL)),
+            "{refusal:?}"
+        );
     }
 
     #[test]
