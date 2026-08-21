@@ -501,7 +501,7 @@ async fn submitting_prefers_the_sidecar_over_base_url() {
 
     let line: Value = serde_json::from_str(&only(&seen)).expect("one json line");
     assert_eq!(line["agent"], json!("summariser"));
-    assert_eq!(line["record"]["action"], json!("summarise"));
+    assert_eq!(line["action"], json!("summarise"));
 }
 
 #[tokio::test]
@@ -676,7 +676,7 @@ async fn recording_reports_a_rejection_as_malformed() {
 }
 
 #[tokio::test]
-async fn recording_names_the_interaction_beside_the_record() {
+async fn recording_names_the_interaction_inside_the_record() {
     let (_dir, socket, seen) = unix_line_stub(vec![Ack::Line("{\"status\":\"spooled\"}")]);
     let handle = Handle::new(
         Client::new(config("http://memory.invalid", Some(socket))),
@@ -689,7 +689,7 @@ async fn recording_names_the_interaction_beside_the_record() {
     let line: Value = serde_json::from_str(&only(&seen)).expect("json");
     assert_eq!(line["correlation_id"], json!("corr-1"));
     assert_eq!(
-        line["record"]["attrs"].get("correlation_id"),
+        line["attrs"].get("correlation_id"),
         None,
         "the link must not occupy an attribute key"
     );
@@ -713,11 +713,30 @@ async fn an_attribute_genuinely_called_correlation_id_is_left_alone() {
     handle.record(draft).await.expect("submitted");
 
     let line: Value = serde_json::from_str(&only(&seen)).expect("json");
-    assert_eq!(
-        line["record"]["attrs"]["correlation_id"],
-        json!("corr-agent")
-    );
+    assert_eq!(line["attrs"]["correlation_id"], json!("corr-agent"));
     assert_eq!(line["correlation_id"], json!("corr-1"));
+}
+
+#[tokio::test]
+async fn what_reaches_the_sidecar_is_a_record_and_not_a_draft() {
+    // The defect this replaced: a draft wrapped in `{"agent", "correlation_id", "record"}`, which
+    // the store refused on the first unknown field. The line on the socket has to *be* the record.
+    let (_dir, socket, seen) = unix_line_stub(vec![Ack::Line("{\"status\":\"accepted\"}")]);
+    let client = Client::new(config("http://memory.invalid", Some(socket)));
+
+    client.submit(&draft(), "corr-1", 2_000).await.expect("ack");
+
+    let line: Value = serde_json::from_str(&only(&seen)).expect("json");
+    assert_eq!(line.get("record"), None, "nothing is nested: {line}");
+    assert_eq!(line["agent"], json!("summariser"));
+    assert_eq!(line["outcome"], json!("success"), "not `succeeded`");
+    assert_eq!(
+        line["entities"][0]["kind"],
+        json!("order_ref"),
+        "a tuple would be a two-element array"
+    );
+    assert!(line["record_id"].is_string(), "{line}");
+    assert!(line["received_at"].is_string(), "{line}");
 }
 
 #[tokio::test]
