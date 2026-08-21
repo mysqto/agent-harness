@@ -18,10 +18,12 @@
 //! - `GET /bundle?kind=<kind>&id=<id>` → `{"records": [...], "degraded": bool, "omitted": [...]}`.
 //!   One request per entity; missing fields default. Served over the sidecar socket when there is
 //!   one, otherwise over `base_url`.
-//! - `POST /records` with `{"agent": "...", "correlation_id": "...", "record": <draft>}` → any
-//!   `2xx`. The direct path only. `correlation_id` ties the record to the interaction that caused
-//!   it and is omitted when the caller has no interaction to name; it is a field of its own rather
-//!   than an attribute of the record, so it cannot collide with an attribute of the same name.
+//! - `POST /records` with a complete record as the body → any `2xx`. The direct path only. A
+//!   record is not a draft: an agent describes what it did, and this client adds the identity, the
+//!   timing and the attribution the store requires. [`record`] holds the shape and the reason for
+//!   every value it fills in. `correlation_id` ties the record to the interaction that caused it,
+//!   is a field of the record rather than one of its attributes — so it cannot collide with an
+//!   attribute of the same name — and is left off the wire when the caller has none to name.
 //! - The sidecar takes the same record body as one JSON line on its unix socket and answers with
 //!   one line, `{"status": "...", "detail": "..."}`, where status is `accepted`, `spooled`,
 //!   `rejected`, `spool_full` or `error`.
@@ -32,6 +34,7 @@
 #![forbid(unsafe_code)]
 
 mod http;
+mod record;
 mod sidecar;
 #[cfg(test)]
 mod tests;
@@ -41,7 +44,7 @@ use std::time::{Duration, Instant};
 
 use harness_agent::{ActionDraft, MemoryHandle};
 use hyper::Method;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 /// Where the memory service lives, and who we are to it.
 #[derive(Debug, Clone)]
@@ -106,12 +109,22 @@ impl Client {
         Ok(bundle)
     }
 
-    /// Submits a record, attributed to this client's agent and to one interaction.
+    /// Stamps a draft into a complete record and submits it.
+    ///
+    /// A draft is deliberately not a record: it carries what the agent did and nothing about who
+    /// did it or when, so this is where the identifier, the timestamps, the attribution and the
+    /// store's classification defaults are added. [`record`] states each one and why it is safe.
     ///
     /// `correlation_id` is what later ties this record to the interaction that caused it; an empty
-    /// string means there is none to name and leaves the field off the wire. It travels beside the
-    /// record rather than inside its attributes, so an attribute an agent genuinely calls
+    /// string means there is none to name and leaves the field off the wire. It is a field of the
+    /// record rather than one of its attributes, so an attribute an agent genuinely calls
     /// `correlation_id` keeps its own meaning.
+    ///
+    /// The record is stamped once, before either transport is chosen, and that is what keeps the
+    /// store's idempotency working: the identifier *is* the idempotency key, so every redelivery a
+    /// transport performs replays bytes that already carry it and lands as one record. What this
+    /// cannot cover is a caller that calls `submit` again — that is a second submission, and
+    /// whoever retries at that level owns deciding whether the first one landed.
     ///
     /// Goes through the sidecar whenever one is configured, and only then falls back to `base_url`.
     /// The sidecar takes a record as a framed line rather than as HTTP, because it owns the spool
@@ -122,12 +135,9 @@ impl Client {
         correlation_id: &str,
         deadline_ms: u64,
     ) -> Result<()> {
-        let payload = serde_json::to_vec(&Submission {
-            agent: &self.config.agent,
-            correlation_id,
-            record: draft,
-        })
-        .map_err(|err| Error::Transport(format!("encode record: {err}")))?;
+        let stamped = record::Record::stamp(&self.config.agent, draft, correlation_id);
+        let payload = serde_json::to_vec(&stamped)
+            .map_err(|err| Error::Transport(format!("encode record: {err}")))?;
         let budget = Duration::from_millis(deadline_ms);
 
         if let Some(socket) = &self.config.sidecar_socket {
@@ -181,18 +191,6 @@ fn encode(raw: &str) -> String {
         }
     }
     out
-}
-
-/// A record on its way out, with the attribution the store requires.
-#[derive(Debug, Serialize)]
-struct Submission<'a> {
-    /// Who is claiming the action.
-    agent: &'a str,
-    /// The interaction this record belongs to. Omitted when the caller named none.
-    #[serde(skip_serializing_if = "str::is_empty")]
-    correlation_id: &'a str,
-    /// What the agent drafted.
-    record: &'a ActionDraft,
 }
 
 /// One store response. Mirrors [`Bundle`], but is the wire shape and tolerates missing fields.
@@ -326,8 +324,8 @@ impl MemoryHandle for Handle {
     }
 
     async fn record(&self, draft: ActionDraft) -> harness_agent::Result<()> {
-        // The interaction id goes in the submission's own slot, so the draft the agent wrote
-        // reaches the store exactly as the agent wrote it.
+        // The interaction id goes in the record's own field, so the draft the agent wrote reaches
+        // the store exactly as the agent wrote it.
         self.client
             .submit(&draft, &self.correlation_id, self.write_deadline_ms)
             .await
