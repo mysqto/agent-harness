@@ -1,0 +1,23 @@
+[package]
+name = "harness-sandbox"
+description = "One declared confinement policy: workspace ACLs, sandbox artefacts, per-agent signing keys."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+clap = { version = "4.5", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
+hmac = "0.13"
+sha2 = { version = "0.11", default-features = false }
+getrandom = "0.3"
+
+[dev-dependencies]
+tempfile.workspace = true
