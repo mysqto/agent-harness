@@ -95,6 +95,19 @@ impl Client {
     /// [`Error::Rejected`] is the one failure that still propagates, because degrading on it would
     /// hide a malformed request behind a flag that reads as slowness.
     pub async fn bundle(&self, entities: &[(String, String)], deadline_ms: u64) -> Result<Bundle> {
+        self.bundle_capped(entities, deadline_ms, None).await
+    }
+
+    /// As [`Client::bundle`], returning at most `limit` records.
+    ///
+    /// The cap goes to the store rather than being applied to the answer. Trimming here would leave
+    /// the store reading and serialising its own cap to hand back five, which is what this replaced.
+    pub async fn bundle_capped(
+        &self,
+        entities: &[(String, String)],
+        deadline_ms: u64,
+        limit: Option<u32>,
+    ) -> Result<Bundle> {
         let target = self.target()?;
         let deadline = Instant::now() + Duration::from_millis(deadline_ms);
         let mut bundle = Bundle::default();
@@ -109,7 +122,7 @@ impl Client {
                 }
                 break;
             }
-            match fetch(&target, kind, id, left).await {
+            match fetch(&target, kind, id, left, limit).await {
                 Ok(part) => bundle.absorb(part),
                 Err(rejected @ Error::Rejected(_)) => return Err(rejected),
                 Err(err) => bundle.omit(kind, id, &err.to_string()),
@@ -217,12 +230,17 @@ async fn fetch(
     kind: &str,
     id: &str,
     budget: Duration,
+    limit: Option<u32>,
 ) -> Result<WireBundle> {
     // `kind:id` in one parameter, which is the store's grammar rather than a choice: it declares
-    // `entity`, `actor` and `deadline_ms` and refuses anything else, so `kind` and `id` as separate
-    // parameters are a `400`. Each half is encoded and the separator is not, so an id carrying a
-    // `:` cannot move where the split falls.
-    let route = format!("/bundle?entity={}:{}", encode(kind), encode(id));
+    // `entity`, `actor`, `deadline_ms` and `limit`, and refuses anything else, so `kind` and `id` as
+    // separate parameters are a `400`. Each half is encoded and the separator is not, so an id
+    // carrying a `:` cannot move where the split falls.
+    let mut route = format!("/bundle?entity={}:{}", encode(kind), encode(id));
+    if let Some(limit) = limit {
+        use std::fmt::Write as _;
+        let _ = write!(route, "&limit={limit}");
+    }
     let body = http::request(target, Method::GET, &route, None, budget)
         .await?
         .ok_body()?;
@@ -268,9 +286,9 @@ pub struct Bundle {
     /// Records judged relevant, newest first, exactly as the store put them on the wire.
     ///
     /// Opaque on purpose, and worth knowing what a store actually sends: the reference
-    /// implementation answers with record *identifiers*, not record bodies, and nothing here
-    /// fetches the bodies they name. An agent reading history therefore gets identifiers to ask
-    /// about again, which is a smaller answer than the type suggests.
+    /// implementation answers with each record's *structure* -- its frontmatter fields -- and never
+    /// its prose. An agent reading history gets what a record is about without the body, so a cap
+    /// on how many records come back is worth setting rather than trimming afterwards.
     pub records: Vec<serde_json::Value>,
     /// `true` when a source was unavailable, so the caller knows this is partial.
     pub degraded: bool,
@@ -374,13 +392,14 @@ impl MemoryHandle for Handle {
         deadline_ms: u64,
     ) -> harness_agent::Result<Vec<BTreeMap<String, serde_json::Value>>> {
         let entities = [(kind.to_owned(), id.to_owned())];
+        // The cap is the store's to apply. Asking for the default and keeping the first few made the
+        // store serialise up to its own cap of structures so this could discard the difference.
         let bundle = self
             .client
-            .bundle(&entities, deadline_ms)
+            .bundle_capped(&entities, deadline_ms, Some(limit))
             .await
             .map_err(to_agent)?;
-        let keep = usize::try_from(limit).unwrap_or(usize::MAX);
-        Ok(bundle.records.into_iter().take(keep).map(project).collect())
+        Ok(bundle.records.into_iter().map(project).collect())
     }
 
     async fn record(&self, draft: ActionDraft) -> harness_agent::Result<()> {

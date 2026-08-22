@@ -232,6 +232,54 @@ fn only(seen: &Seen) -> String {
 }
 
 #[tokio::test]
+async fn a_capped_bundle_asks_the_store_for_the_cap() {
+    // The cap has to be in the request. Applied to the answer instead, the store would still read
+    // and serialise its own cap so the caller could discard the difference.
+    let (base_url, seen) = tcp_stub(vec![Reply::ok(&json!({
+        "records": [one_record("01M0")],
+        "degraded": false,
+        "omitted": [],
+        "token_estimate": 7,
+    }))])
+    .await;
+    let client = Client::new(config(&base_url, None));
+    let entities = vec![("ticket".to_owned(), "t-7".to_owned())];
+
+    let bundle = client
+        .bundle_capped(&entities, 2_000, Some(3))
+        .await
+        .expect("bundle");
+
+    assert_eq!(bundle.records.len(), 1);
+    assert!(
+        only(&seen).starts_with("GET /bundle?entity=ticket:t-7&limit=3 "),
+        "{}",
+        only(&seen)
+    );
+}
+
+#[tokio::test]
+async fn an_uncapped_bundle_names_no_limit_at_all() {
+    // Absent rather than a large number, so the store applies its own cap and the two are not two
+    // different opinions about what the cap is.
+    let (base_url, seen) = tcp_stub(vec![Reply::ok(&json!({
+        "records": [],
+        "degraded": false,
+        "omitted": [],
+        "token_estimate": 0,
+    }))])
+    .await;
+    let client = Client::new(config(&base_url, None));
+
+    let _ = client
+        .bundle(&[("ticket".to_owned(), "t-7".to_owned())], 2_000)
+        .await
+        .expect("bundle");
+
+    assert!(!only(&seen).contains("limit="), "{}", only(&seen));
+}
+
+#[tokio::test]
 async fn a_bundle_gathers_every_entity() {
     let (base_url, seen) = tcp_stub(vec![
         Reply::ok(&one_record("ord-91h2")),
@@ -667,12 +715,13 @@ async fn a_silent_sidecar_is_unavailable() {
 }
 
 #[tokio::test]
-async fn history_projects_records_and_applies_the_limit() {
+async fn history_projects_records_and_asks_the_store_for_the_limit() {
+    // The limit used to be applied here, after the store had already read and serialised its own
+    // cap. It goes on the wire now, so what comes back is what was asked for.
     let body = json!({
         "records": [
             {"action": "summarise", "at": 3},
             {"action": "summarise", "at": 2},
-            {"action": "summarise", "at": 1},
         ],
     });
     let (base_url, seen) = tcp_stub(vec![Reply::ok(&body)]).await;
@@ -683,13 +732,17 @@ async fn history_projects_records_and_applies_the_limit() {
         .await
         .expect("history");
 
+    assert_eq!(history.len(), 2, "every record the store returned is kept");
     assert_eq!(
-        history.len(),
-        2,
-        "the limit is applied here, not on the wire"
+        history[0]["at"],
+        json!(3),
+        "newest first, as the store sent"
     );
-    assert_eq!(history[0]["at"], json!(3));
-    assert!(only(&seen).starts_with("GET /bundle?entity=ticket:t-7 "));
+    assert!(
+        only(&seen).starts_with("GET /bundle?entity=ticket:t-7&limit=2 "),
+        "{}",
+        only(&seen)
+    );
 }
 
 #[tokio::test]
