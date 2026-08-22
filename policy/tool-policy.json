@@ -1,0 +1,128 @@
+{
+  "version": 1,
+  "workspace_roots": ["${workspace}", "/tmp"],
+  "command_wrappers": [
+    "sudo", "doas", "env", "nohup", "nice", "time", "timeout",
+    "command", "exec", "builtin", "setsid", "stdbuf", "xargs"
+  ],
+  "writing_programs": [
+    "rm", "rmdir", "mv", "dd", "shred", "truncate", "chmod", "chown", "chgrp",
+    "mkdir", "touch", "tee"
+  ],
+  "copy_programs": ["cp", "install", "rsync", "ln"],
+  "secret_paths": [
+    {
+      "id": "private-keys",
+      "reason": "private key material",
+      "patterns": [
+        "~/.ssh/**",
+        "**/id_rsa*", "**/id_ecdsa*", "**/id_ed25519*",
+        "**/*.pem", "**/*.key", "**/*.p12", "**/*.pfx", "**/*.jks"
+      ]
+    },
+    {
+      "id": "environment-files",
+      "reason": "environment file — carries tokens by convention",
+      "patterns": ["**/.env", "**/.env.*", "**/*.envrc"]
+    },
+    {
+      "id": "credential-stores",
+      "reason": "credential store",
+      "patterns": [
+        "~/.aws/credentials",
+        "/etc/shadow", "/etc/gshadow", "/etc/sudoers", "/etc/sudoers.d/**",
+        "/etc/ssh/ssh_host_*",
+        "~/.gnupg/**",
+        "~/.netrc",
+        "~/.docker/config.json",
+        "~/.kube/config",
+        "~/.config/gh/hosts.yml",
+        "~/.local/share/keyrings/**",
+        "**/*.kdbx"
+      ]
+    },
+    {
+      "id": "orchestrator-config",
+      "reason": "orchestrator config — holds signing keys and service tokens",
+      "patterns": ["**/harness.json", "**/.secrets/**", "**/secrets/**"]
+    }
+  ],
+  "protected_paths": [
+    {
+      "id": "shell-startup",
+      "reason": "shell startup file — a write here runs on the next login",
+      "patterns": [
+        "~/.bashrc", "~/.bash_profile", "~/.bash_login", "~/.bash_logout",
+        "~/.profile", "~/.zshrc", "~/.zshenv", "~/.zprofile",
+        "~/.config/fish/**", "~/.inputrc"
+      ]
+    },
+    {
+      "id": "scheduled-execution",
+      "reason": "scheduled or supervised execution unit",
+      "patterns": [
+        "/etc/systemd/**", "~/.config/systemd/**", "/lib/systemd/**",
+        "/etc/cron*/**", "/etc/crontab", "/var/spool/cron/**", "~/.crontab",
+        "/etc/init.d/**", "~/Library/LaunchAgents/**"
+      ]
+    },
+    {
+      "id": "system-configuration",
+      "reason": "system configuration",
+      "patterns": ["/etc/**", "/boot/**", "/usr/**", "/dev/**", "/sys/**", "/proc/**"]
+    },
+    {
+      "id": "guard-configuration",
+      "reason": "the guard's own policy or hook wiring",
+      "patterns": ["**/tool-policy.json", "**/.claude/settings*.json", "**/hooks/**"]
+    },
+    {
+      "id": "version-control-internals",
+      "reason": "repository internals — a write here rewrites history or runs on commit",
+      "patterns": ["**/.git/hooks/**", "**/.git/config"]
+    }
+  ],
+  "commands": [
+    {
+      "id": "credential-change",
+      "reason": "changes a credential on the host",
+      "programs": ["passwd", "chpasswd", "usermod", "useradd", "userdel", "visudo"],
+      "args": []
+    },
+    {
+      "id": "filesystem-format",
+      "reason": "formats or partitions a filesystem",
+      "programs": ["mkfs", "mkfs.*", "mkswap", "fdisk", "parted", "wipefs", "sgdisk"],
+      "args": []
+    },
+    {
+      "id": "raw-device-write",
+      "reason": "raw device read or write",
+      "programs": ["dd"],
+      "args": ["*=/dev/*"]
+    },
+    {
+      "id": "host-power-state",
+      "reason": "changes the host's power state",
+      "programs": ["shutdown", "reboot", "halt", "poweroff"],
+      "args": []
+    },
+    {
+      "id": "unscreened-egress",
+      "reason": "opens a socket the egress screen never sees",
+      "programs": ["nc", "ncat", "netcat", "socat", "telnet", "ssh", "scp", "sftp"],
+      "args": []
+    },
+    {
+      "id": "history-rewrite",
+      "reason": "discards work that has no other copy",
+      "programs": ["git"],
+      "args": ["push", "--force"]
+    }
+  ],
+  "network": {
+    "reason": "egress to a host outside the allowlist",
+    "allow_hosts": ["127.0.0.1", "localhost", "::1", "0.0.0.0"],
+    "programs": ["curl", "wget", "http", "https", "httpie", "aria2c"]
+  }
+}
