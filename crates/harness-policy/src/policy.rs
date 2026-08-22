@@ -96,7 +96,7 @@ pub struct Network {
 ///
 /// Embedded at compile time so the guard has a working policy with nothing installed, and so the
 /// declared document is parsed by the test suite rather than only in production.
-const BASELINE: &str = include_str!("../../../policy/tool-policy.json");
+const BASELINE: &str = include_str!("../../../spec/tool-policy.json");
 
 impl Policy {
     /// The policy shipped with this repository.

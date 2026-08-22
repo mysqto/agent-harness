@@ -6,7 +6,7 @@ the tool policy in one, and nothing else: no rules live here.
 ## The split
 
 ```
-policy/tool-policy.json      the rules — one file, harness-agnostic, the only source of truth
+spec/tool-policy.json      the rules — one file, harness-agnostic, the only source of truth
 crates/harness-policy        the guard that enforces them, and one generator per harness
 harnesses/<name>/            install glue for one harness: where its config goes, how to wire it
 ```

@@ -38,7 +38,7 @@ recomputed counters rather than incremented ones.
 
 ## 6. A rule is written once, enforced twice
 
-`policy/tool-policy.json` is the only place a tool rule is declared. A harness's own allow/deny
+`spec/tool-policy.json` is the only place a tool rule is declared. A harness's own allow/deny
 config is generated from it; the guard evaluates the same file at the tool-call boundary. Neither
 layer may assume the other ran, and a generator may omit a rule its harness cannot express but must
 never emit an allow the policy does not grant.

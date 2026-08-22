@@ -1,6 +1,6 @@
 # Claude Code
 
-Wires `policy/tool-policy.json` into a settings file: the deny list is layer 1, the `PreToolUse` hook
+Wires `spec/tool-policy.json` into a settings file: the deny list is layer 1, the `PreToolUse` hook
 is layer 2.
 
 ## Install

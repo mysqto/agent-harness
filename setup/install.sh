@@ -59,7 +59,7 @@ policy="$RUNTIME/tool-policy.json"
 if [ -f "$policy" ]; then
   echo "→ keeping existing $policy"
 else
-  install -m 0644 policy/tool-policy.json "$policy"
+  install -m 0644 spec/tool-policy.json "$policy"
   echo "→ installed $policy"
 fi
 

@@ -29,7 +29,7 @@ trap 'rm -rf "$work"' EXIT
 
 echo "→ installing into a scratch project"
 HARNESS_PROJECT_DIR="$work" harnesses/claude-code/install.sh \
-  --guard "$guard" --policy "$PWD/policy/tool-policy.json" >/dev/null
+  --guard "$guard" --policy "$PWD/spec/tool-policy.json" >/dev/null
 settings="$work/.claude/settings.json"
 [ -f "$settings" ] || fail "no settings file was written"
 
@@ -56,7 +56,7 @@ PY
 
 echo "→ a second run keeps a settings file it did not write"
 HARNESS_PROJECT_DIR="$work" harnesses/claude-code/install.sh \
-  --guard "$guard" --policy "$PWD/policy/tool-policy.json" >/dev/null
+  --guard "$guard" --policy "$PWD/spec/tool-policy.json" >/dev/null
 [ -f "$work/.claude/settings.harness-policy.json" ] || fail "an existing settings file was overwritten"
 
 echo "→ the wired hook refuses and permits"

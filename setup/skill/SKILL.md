@@ -1,13 +1,13 @@
 ---
 name: harness-setup
-description: Set up, configure, or add an adapter to an agent-harness deployment. Use when someone wants to install the harness, connect a new message source, register an agent, wire the tool policy into a harness, or diagnose why messages are not arriving or why a tool call was refused.
+description: Set up, configure, confine, or add an adapter to an agent-harness deployment. Use when someone wants to install the harness, connect a new message source, register an agent, wire the tool policy into a harness, provision per-agent workspaces and signing keys, rotate a key, generate the sandbox artefacts, or diagnose why messages are not arriving or why a tool call was refused.
 ---
 
 # Setting up agent-harness
 
 ## Deciding what is being asked
 
-Three requests look similar and need different work:
+Four requests look similar and need different work:
 
 | Request | What it means |
 |---|---|
@@ -16,6 +16,7 @@ Three requests look similar and need different work:
 | "add an agent" | Implement the `Agent` trait and register it |
 | "lock down the tools" | Wire the tool policy into a harness — `--harness`, below |
 | "why was that refused?" | Ask the guard directly; it answers without a model in the loop |
+| "confine it" | Provision workspaces, keys and sandbox artefacts — `setup/provision.sh` |
 
 ## Installing
 
@@ -36,7 +37,7 @@ to see whether the contract is satisfied.
 
 ## Wiring the tool policy
 
-Two layers, one set of rules in `policy/tool-policy.json`:
+Two layers, one set of rules in `spec/tool-policy.json`:
 
 1. the harness's own allow/deny config, **generated** from that file, and
 2. `harness-guard`, a pre-tool-use hook that exits 2 to block.
@@ -63,6 +64,50 @@ emit the neutral tool-call shape needs neither: point its hook at `harness-guard
 the policy — not the generated config, which is output and will be regenerated. Re-run the harness
 installer afterwards so layer 1 matches. Note what the hook enforces that a settings file cannot:
 writes are confined to the workspace, and egress goes only to allowlisted hosts.
+## Confining a deployment
+
+Installing binaries and confining them are separate steps on purpose: the second touches key
+material and permissions, so it is run where the deployment lives rather than on a laptop.
+
+```sh
+setup/provision.sh --agent research --agent triage
+setup/provision.sh --audit             # permissions still at least as tight as the policy
+setup/provision.sh --rotate research   # new key; the old one stays valid for 24h
+```
+
+Provisioning creates, per agent, a private workspace at `0700`, a segregated
+`memory/private/<agent>/` at `0700`, and one signing key at `0600` — and it never replaces a key an
+agent is already signing with, because that would invalidate everything in flight. Re-running it is
+safe and reports only what changed.
+
+### One sandbox, two artefacts
+
+`provision` writes both a systemd unit and a container profile from **one** declared policy
+(`sandbox/policy.json`). That is not tidiness: a lab that exercises a hand-written container
+profile proves the lab's sandbox, not the deployed one. The tool refuses to write the pair unless it
+can read both back and find them agreeing on every hardening property, `check` re-runs that against
+the files on disk, and a test in `crates/harness-sandbox` asserts it for every property in the
+policy.
+
+To open one egress destination without editing the shared policy:
+
+```sh
+setup/provision.sh --agent research --allow 10.0.0.0/8
+```
+
+Everything unlisted is denied — in the unit via `IPAddressDeny=any`, in the container via the
+network the profile names. The two mechanisms differ; the policy they carry does not.
+
+### Two things worth not confusing
+
+1. **A signature proves origin, not permission.** Verifying a request tells you which agent sent it.
+   Whether that agent may do what it asked is the role check, with its own inputs. Key possession is
+   not authorisation, and nothing here lets a caller pass one where the other is expected.
+2. **`private/` has no operator override.** It exists so a reader holding the operator role but not
+   the identity cannot open those records. If an operator genuinely needs them, that is a change of
+   identity, and it should be as visible as one.
+
+Key rotation has its own runbook: `knowledge/runbooks/memory-key-rotation.md`.
 
 ## Connecting a new source
 

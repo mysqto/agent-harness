@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Wires the tool policy into a Claude Code settings file: deny rules (layer 1) and the PreToolUse
-# hook (layer 2), both generated from policy/tool-policy.json.
+# hook (layer 2), both generated from spec/tool-policy.json.
 #
 # Idempotent, and it never overwrites a settings file it did not write: an existing one gets the
 # generated config beside it and a printed merge instead.

@@ -32,7 +32,7 @@ through `Context`, which is what makes an agent testable with no infrastructure 
 them. That indirection is the only reason an egress filter can be relied on: an agent that could
 post directly could bypass it.
 
-**One tool policy, two enforcement points.** `policy/tool-policy.json` says which reads, writes,
+**One tool policy, two enforcement points.** `spec/tool-policy.json` says which reads, writes,
 commands and hosts are refused. A harness's own allow/deny config is generated from it, and
 `harness-guard` enforces the same file as a pre-tool-use hook — a process that exits non-zero, with
 no model in the loop and no assumption that the generated config was ever installed.
@@ -53,7 +53,7 @@ crates/
   harness-memory     client for the memory service; bundles in, records out
   harness-cli        run a dispatcher, or run a single agent for development
   harness-policy     the tool policy, the guard that enforces it, one generator per harness
-policy/              tool-policy.json — the rules, harness-agnostic, the only source of truth
+  harness-sandbox    confinement: workspace permissions, sandbox artefacts, per-agent keys
 adapters/            one directory per source. Portable, independently deployable.
 harnesses/           glue for adopting the policy in one harness. No rules live here.
 setup/               install script and a setup skill
@@ -69,6 +69,19 @@ harness run --agent echo
 echo '{"tool":"read","intents":[{"kind":"read","value":"~/.ssh/id_rsa"}]}' | harness-guard check
 echo $?   # 2 — blocked by the private-keys rule
 ```
+
+Confinement is a separate, deliberate step, because it touches key material and permissions:
+
+```sh
+setup/provision.sh --agent research --agent triage
+```
+
+## One sandbox, described once
+
+A deployment runs a systemd unit and a lab runs a container. Written separately they drift, and then
+what the lab exercises is the lab's own sandbox. So both are generated from one declared policy, and
+a test reads each artefact *back* and fails if they stop agreeing on any hardening property. Details
+in `crates/harness-sandbox`.
 
 ## License
 

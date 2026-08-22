@@ -1,7 +1,7 @@
 //! One declared tool policy, one guard that enforces it, one generator per harness.
 //!
 //! This is layers 1 and 2 of the plan's layered defence, built so they cannot drift apart: the
-//! policy in `policy/tool-policy.json` is the only place a rule is written, a harness's own
+//! policy in `spec/tool-policy.json` is the only place a rule is written, a harness's own
 //! allow/deny config is *generated* from it (layer 1), and the [`Guard`] evaluates the same document
 //! at the tool-call boundary (layer 2).
 //!
