@@ -20,6 +20,7 @@ tracing.workspace = true
 harness-agent = { path = "../harness-agent" }
 harness-envelope = { path = "../harness-envelope" }
 harness-memory = { path = "../harness-memory" }
+harness-screen = { path = "../harness-screen" }
 
 [dev-dependencies]
 # A stub store on a real socket, for the tests that exercise the concrete memory client.

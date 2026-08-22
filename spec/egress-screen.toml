@@ -1,0 +1,92 @@
+# The egress screen's pattern set.
+#
+# Data, not code: the shapes a credential takes change on someone else's schedule, so the list has
+# to be editable without a rebuild. `harness-screen` compiles this file in as its shipped default
+# and reads a replacement from disk when a deployment names one, which is what keeps the screen on
+# by default and still overridable.
+#
+# Every rule is a *shape*, not a regular expression. A shape cannot backtrack, so an outbound
+# message cannot be made expensive to screen by whatever put text in it — and a match names the rule
+# it came from, which is what makes the account of a redaction readable.
+
+version = "egress-v1"
+
+# `{rule}` is substituted with the id of the rule that matched, so a reader of a masked message can
+# tell a leaked key from a leaked address without seeing either.
+placeholder = "[redacted:{rule}]"
+
+# ── Prefixed shapes: an issuer-assigned prefix, then a run of token characters ──
+#
+# `min` is what keeps these off ordinary prose: a prefix on its own, or followed by a short word, is
+# someone writing *about* a token rather than pasting one.
+
+[[rule]]
+id = "chat-token"
+kind = "prefixed"
+prefixes = ["xoxb-", "xoxp-", "xoxa-", "xoxs-", "xoxr-", "xapp-"]
+body = "token"
+min = 8
+max = 256
+
+[[rule]]
+id = "model-key"
+kind = "prefixed"
+prefixes = ["sk-ant-"]
+body = "token"
+min = 16
+max = 256
+
+[[rule]]
+id = "code-host-token"
+kind = "prefixed"
+prefixes = ["ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_"]
+body = "token"
+min = 16
+max = 256
+
+# Fixed-width by construction, so `min` and `max` meet: `min` is the width the issuer uses, and
+# `max` stops a longer run of capitals — a shouty word, in other words — from being swallowed whole.
+[[rule]]
+id = "cloud-key-id"
+kind = "prefixed"
+prefixes = ["AKIA", "ASIA"]
+body = "upper"
+min = 16
+max = 16
+
+# ── A delimited block: everything between two markers ──
+#
+# Screening only the `-----BEGIN` line would announce that a key went out while letting the key
+# itself go with it. The whole block is the secret, so the whole block is the match, and a block
+# with no end marker is masked to the end of the message rather than let through.
+[[rule]]
+id = "key-block"
+kind = "block"
+start = "-----BEGIN"
+end = "-----END"
+
+# ── Shapes with no prefix to anchor on ──
+
+# An address is not a credential, but it is the field most often interpolated into an outbound
+# message by accident, and the plan puts it in this layer deliberately.
+[[rule]]
+id = "address"
+kind = "infix"
+infix = "@"
+left = "local"
+left_min = 1
+right = "host"
+right_min = 4
+# A host with no dot is a local name, not a routable address; trailing punctuation belongs to the
+# sentence rather than to the address.
+right_must_contain = "."
+right_trim = ".-"
+
+# Long digit runs, grouped or not. Bounded on both sides: shorter is a year or a quantity, longer is
+# an identifier of some other kind, and masking either would train readers to ignore the screen.
+[[rule]]
+id = "long-digit-run"
+kind = "grouped"
+min = 13
+max = 19
+separators = " -"

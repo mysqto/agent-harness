@@ -8,7 +8,7 @@ use harness_agent::{ActionDraft, Actor, Context, MemoryHandle, Status, Task, Tas
 use harness_envelope::{Delivery, Envelope};
 use harness_memory::Bundle;
 
-use crate::egress::Courier;
+use crate::egress::{Courier, Masking};
 
 /// Deadline handed to an agent when the source does not name one.
 const DEFAULT_DEADLINE_MS: u64 = 5_000;
@@ -18,8 +18,15 @@ const DEFAULT_DEADLINE_MS: u64 = 5_000;
 pub struct Dispatched {
     /// The intent the envelope was classified as, whether or not an agent then ran.
     pub intent: String,
-    /// Messages to deliver.
+    /// Messages to deliver, as the agent asked for them.
     pub deliveries: Vec<harness_envelope::Delivery>,
+    /// What the egress screen took out of those messages on the way out.
+    ///
+    /// Reported rather than only logged. [`Dispatched::deliveries`] is what the agent asked to send
+    /// and the adapter received the screened text, so without this the caller has no way to tell the
+    /// two apart — and "the reply went out" would silently mean "the reply went out with a hole in
+    /// it". Empty is the ordinary case.
+    pub masked: Vec<Masking>,
     /// Records that were submitted.
     pub records_written: usize,
     /// `true` when the envelope had been seen before and nothing was re-run.
@@ -177,6 +184,7 @@ impl Dispatcher {
             return Ok(Dispatched {
                 intent,
                 deliveries: Vec::new(),
+                masked: Vec::new(),
                 records_written: 0,
                 duplicate: true,
                 degraded: false,
@@ -228,7 +236,7 @@ impl Dispatcher {
         let status = outcome.status;
 
         let deliveries = deliveries(&envelope, outcome.egress);
-        self.courier.deliver(deliveries.clone()).await?;
+        let posted = self.courier.deliver(deliveries.clone()).await?;
 
         // Delivery is idempotent, so a record that fails to submit can be retried by replaying the
         // whole envelope without the reply going out twice.
@@ -249,6 +257,7 @@ impl Dispatcher {
         Ok(Dispatched {
             intent,
             deliveries,
+            masked: posted.masked,
             records_written,
             duplicate: false,
             degraded,
@@ -521,8 +530,8 @@ mod tests {
 
     use crate::egress::Courier;
     use crate::fixtures::{
-        FakeStore, RecordingAdapter, RecordingAgent, Suffix, dispatcher, draft, envelope, filters,
-        plain_courier,
+        FakeStore, RecordingAdapter, RecordingAgent, Render, Suffix, dispatcher, draft, envelope,
+        filters, plain_courier,
     };
 
     #[tokio::test]
@@ -759,6 +768,59 @@ mod tests {
             handled.deliveries[0].text, "two events",
             "the reported delivery is what the agent asked for; the filter is what went out"
         );
+    }
+
+    #[tokio::test]
+    async fn a_secret_rendered_into_a_reply_is_masked_and_reported() {
+        // End to end through the dispatcher: the screen is a property of the only path out, so an
+        // agent cannot post around it, and the caller is told what the screen took.
+        let agent = Arc::new(
+            RecordingAgent::new("reader", &[("summarise", false)])
+                .replying("rotate {{token}} today"),
+        );
+        let adapter = Arc::new(RecordingAdapter::working());
+        let dispatcher = dispatcher(
+            std::slice::from_ref(&agent),
+            Arc::new(FakeStore::healthy()),
+            Courier::new(
+                filters(vec![Box::new(Render {
+                    placeholder: "{{token}}",
+                    value: "xoxb-000000000000-abcdefghijkl",
+                })]),
+                Box::new(adapter.clone()),
+            ),
+        );
+
+        let handled = dispatcher
+            .dispatch(envelope("summarise all"))
+            .await
+            .expect("dispatched");
+
+        assert_eq!(adapter.texts(), vec!["rotate [redacted:chat-token] today"]);
+        assert_eq!(handled.masked.len(), 1);
+        assert_eq!(handled.masked[0].rule, "chat-token");
+        assert_eq!(handled.masked[0].envelope_id, "cli-1");
+        assert!(
+            handled.deliveries[0].text.contains("{{token}}"),
+            "nothing the agent asked to send carried the token, which is why the screen has to run \
+             on the rendered bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reply_with_nothing_to_mask_reports_nothing() {
+        let agent =
+            Arc::new(RecordingAgent::new("reader", &[("summarise", false)]).replying("two events"));
+        let handled = dispatcher(
+            std::slice::from_ref(&agent),
+            Arc::new(FakeStore::healthy()),
+            plain_courier(),
+        )
+        .dispatch(envelope("summarise all"))
+        .await
+        .expect("dispatched");
+
+        assert!(handled.masked.is_empty());
     }
 
     #[tokio::test]

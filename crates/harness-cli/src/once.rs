@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use harness_agent::{ActionDraft, Status};
-use harness_dispatch::egress::{Adapter, Courier};
+use harness_dispatch::egress::{Adapter, Courier, Masking};
 use harness_dispatch::{Dispatcher, Registry};
 use harness_envelope::{Delivery, Envelope};
 use harness_memory::Bundle;
@@ -43,8 +43,15 @@ pub struct Report {
     pub omitted: Vec<String>,
     /// Entities the dispatcher asked for context on.
     pub entities: Vec<(String, String)>,
-    /// What would have been delivered, and where.
+    /// What would have been delivered, and where — as the agent asked for it.
     pub deliveries: Vec<Delivery>,
+    /// What the egress screen would have taken out of those messages.
+    ///
+    /// Worth reporting in a dry run above all others: this is where a template that interpolates a
+    /// secret is found, before the same envelope is handled by a process that really posts. The
+    /// delivery text reported above is what the agent asked to send, unscreened — nothing here
+    /// leaves the process, and seeing both halves is the point of running this.
+    pub masked: Vec<Masking>,
     /// What would have been written to memory.
     pub records: Vec<ActionDraft>,
 }
@@ -99,6 +106,25 @@ impl Report {
             );
         }
 
+        field(
+            &mut out,
+            "screen",
+            &if self.masked.is_empty() {
+                "nothing masked".to_string()
+            } else {
+                format!("{} masked", self.masked.len())
+            },
+        );
+        for masking in &self.masked {
+            indented(
+                &mut out,
+                &format!(
+                    "! {} matched `{}` at byte {} ({} bytes) on the way to {}",
+                    masking.policy, masking.rule, masking.at, masking.len, masking.target
+                ),
+            );
+        }
+
         field(&mut out, "records", &count(self.records.len()));
         for record in &self.records {
             let entities = record
@@ -146,6 +172,7 @@ pub async fn once(registry: Registry, envelope: Envelope, degraded: bool) -> Res
                 omitted: store.omitted(),
                 entities: store.requested(),
                 deliveries: handled.deliveries,
+                masked: handled.masked,
                 records: store.written(),
             })
         }
@@ -492,6 +519,7 @@ mod tests {
             omitted: Vec::new(),
             entities: Vec::new(),
             deliveries: Vec::new(),
+            masked: Vec::new(),
             records: Vec::new(),
         };
 
@@ -499,6 +527,45 @@ mod tests {
         assert!(
             rendered.contains("status     not reported — nothing ran"),
             "{rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dry_run_reports_what_the_screen_would_have_taken() {
+        // The echo agent replies with the body, so this is the shortest whole path from an input
+        // that carries a credential to the account of it being masked.
+        let token = format!("xoxb-{}-{}", "0".repeat(12), "abcdefghijkl");
+        let report = once(echo(), envelope(&format!("echo rotate {token}")), false)
+            .await
+            .expect("dispatch");
+
+        assert_eq!(report.masked.len(), 1);
+        assert_eq!(report.masked[0].rule, "chat-token");
+        assert_eq!(report.masked[0].policy, "egress-v1");
+
+        let rendered = report.render();
+        assert!(rendered.contains("screen     1 masked"), "{rendered}");
+        assert!(
+            rendered.contains("! egress-v1 matched `chat-token` at byte 7"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains(&format!("{token} ")),
+            "the account must not quote what it masked"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dry_run_with_nothing_to_mask_says_so() {
+        let report = once(echo(), envelope("echo hello"), false)
+            .await
+            .expect("dispatch");
+
+        assert!(report.masked.is_empty());
+        assert!(
+            report.render().contains("screen     nothing masked"),
+            "{}",
+            report.render()
         );
     }
 

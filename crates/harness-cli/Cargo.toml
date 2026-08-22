@@ -20,6 +20,7 @@ harness-agent = { path = "../harness-agent" }
 harness-dispatch = { path = "../harness-dispatch" }
 harness-envelope = { path = "../harness-envelope" }
 harness-memory = { path = "../harness-memory" }
+harness-screen = { path = "../harness-screen" }
 # Argument parsing only: no colour or suggestion machinery, which is most of clap's dependency tree.
 clap = { version = "4.5", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
 # The config file the installer writes. Parsing only — nothing here ever writes TOML back.

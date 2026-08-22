@@ -11,11 +11,18 @@ use serde::Deserialize;
 
 use crate::{Error, Result};
 
-/// Where the harness listens, and where memory lives.
+/// Where the harness listens, where memory lives, and what may leave.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct Config {
     /// Unix socket adapters write envelopes to.
     pub ingress_socket: PathBuf,
+    /// An egress screen policy to enforce instead of the shipped one.
+    ///
+    /// Optional because the shipped pattern set is the default, not a fallback: leaving this unset
+    /// screens against the policy this build carries. Setting it replaces that set entirely, which
+    /// is how a deployment adds the credential shapes only it issues.
+    #[serde(default)]
+    pub egress_policy: Option<PathBuf>,
     /// How to reach the memory service.
     pub memory: Memory,
 }
@@ -66,6 +73,20 @@ impl Config {
             std::env::var_os("HARNESS_RUNTIME"),
             std::env::var_os("HOME"),
         )
+    }
+
+    /// The egress screen this config asks for.
+    ///
+    /// A named policy that cannot be read is a startup failure rather than a quiet fall back to the
+    /// shipped set. Falling back would mean an operator who tightened the policy, and typed the path
+    /// wrongly, gets the pattern set they were replacing and no indication of it.
+    pub fn screen(&self) -> Result<harness_screen::Screen> {
+        match &self.egress_policy {
+            None => Ok(harness_screen::Screen::shipped()),
+            Some(path) => harness_screen::Policy::load(path)
+                .map(harness_screen::Screen::new)
+                .map_err(|err| Error::Config(err.to_string())),
+        }
     }
 
     /// The memory client configuration this describes.
@@ -165,6 +186,54 @@ agent = "harness"
         );
         assert_eq!(client.base_url, "http://127.0.0.1:8080");
         assert_eq!(client.agent, "harness");
+    }
+
+    #[test]
+    fn a_config_naming_no_policy_screens_with_the_shipped_set() {
+        let screen = Config::parse(INSTALLED)
+            .expect("parse")
+            .screen()
+            .expect("screen");
+        assert_eq!(screen.policy().version(), "egress-v1");
+    }
+
+    #[test]
+    fn a_named_policy_replaces_the_shipped_set() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("egress.toml");
+        std::fs::write(&path, "version = \"site-v4\"\nplaceholder = \"[x]\"\n").expect("write");
+        // Ahead of `[memory]`: a key after a table header belongs to that table.
+        let text = INSTALLED.replace(
+            "[memory]",
+            &format!("egress_policy = \"{}\"\n\n[memory]", path.display()),
+        );
+
+        let config = Config::parse(&text).expect("parse");
+        assert_eq!(config.egress_policy, Some(path));
+        assert_eq!(
+            config.screen().expect("screen").policy().version(),
+            "site-v4"
+        );
+    }
+
+    #[test]
+    fn a_named_policy_that_cannot_be_read_stops_the_process() {
+        // Fail closed. Falling back to the shipped set would hand an operator who mistyped the path
+        // the pattern set they were trying to replace, with nothing to tell them.
+        let text = INSTALLED.replace(
+            "[memory]",
+            "egress_policy = \"/nonexistent/egress.toml\"\n\n[memory]",
+        );
+        let error = Config::parse(&text)
+            .expect("parse")
+            .screen()
+            .expect_err("no such policy");
+
+        assert_eq!(error.code(), exit::CONFIG);
+        assert!(
+            error.to_string().contains("/nonexistent/egress.toml"),
+            "{error}"
+        );
     }
 
     #[test]
