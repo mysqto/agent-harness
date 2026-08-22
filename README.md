@@ -32,6 +32,11 @@ through `Context`, which is what makes an agent testable with no infrastructure 
 them. That indirection is the only reason an egress filter can be relied on: an agent that could
 post directly could bypass it.
 
+**One tool policy, two enforcement points.** `policy/tool-policy.json` says which reads, writes,
+commands and hosts are refused. A harness's own allow/deny config is generated from it, and
+`harness-guard` enforces the same file as a pre-tool-use hook — a process that exits non-zero, with
+no model in the loop and no assumption that the generated config was ever installed.
+
 ## Why an agent does not post its own replies
 
 It is the difference between a rule and a habit. If every agent can reach the channel, "redact
@@ -47,15 +52,22 @@ crates/
   harness-dispatch   normalise, route, guard, deliver
   harness-memory     client for the memory service; bundles in, records out
   harness-cli        run a dispatcher, or run a single agent for development
+  harness-policy     the tool policy, the guard that enforces it, one generator per harness
+policy/              tool-policy.json — the rules, harness-agnostic, the only source of truth
 adapters/            one directory per source. Portable, independently deployable.
+harnesses/           glue for adopting the policy in one harness. No rules live here.
 setup/               install script and a setup skill
 ```
 
 ## Quick start
 
 ```sh
-setup/install.sh --adapter cli
+setup/install.sh --adapter cli --harness claude-code
 harness run --agent echo
+
+# the guard, without a model in the loop
+echo '{"tool":"read","intents":[{"kind":"read","value":"~/.ssh/id_rsa"}]}' | harness-guard check
+echo $?   # 2 — blocked by the private-keys rule
 ```
 
 ## License

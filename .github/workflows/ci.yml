@@ -29,6 +29,8 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+      # The installers and the generated harness config: shell that cargo cannot see.
+      - run: bash ci/glue.sh
       # Blocking from here on. The first crate is implemented, so unimplemented lines are no longer
       # the reason a figure is low — thin tests are.
       - name: Coverage

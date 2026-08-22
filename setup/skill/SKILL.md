@@ -1,6 +1,6 @@
 ---
 name: harness-setup
-description: Set up, configure, or add an adapter to an agent-harness deployment. Use when someone wants to install the harness, connect a new message source, register an agent, or diagnose why messages are not arriving.
+description: Set up, configure, or add an adapter to an agent-harness deployment. Use when someone wants to install the harness, connect a new message source, register an agent, wire the tool policy into a harness, or diagnose why messages are not arriving or why a tool call was refused.
 ---
 
 # Setting up agent-harness
@@ -14,11 +14,13 @@ Three requests look similar and need different work:
 | "install the harness" | Build binaries, write a config — `setup/install.sh` |
 | "connect X" | Add an adapter for source X — usually a new directory under `adapters/` |
 | "add an agent" | Implement the `Agent` trait and register it |
+| "lock down the tools" | Wire the tool policy into a harness — `--harness`, below |
+| "why was that refused?" | Ask the guard directly; it answers without a model in the loop |
 
 ## Installing
 
 ```sh
-setup/install.sh --adapter cli
+setup/install.sh --adapter cli --harness claude-code
 ```
 
 Re-runnable. It will not overwrite an existing config, so a second run after editing config is safe.
@@ -31,6 +33,36 @@ echo 'summarise order ord-91h2' | harness-adapter-cli
 
 With no ingress socket the adapter prints the envelope it *would* have sent. That is the fastest way
 to see whether the contract is satisfied.
+
+## Wiring the tool policy
+
+Two layers, one set of rules in `policy/tool-policy.json`:
+
+1. the harness's own allow/deny config, **generated** from that file, and
+2. `harness-guard`, a pre-tool-use hook that exits 2 to block.
+
+`setup/install.sh --harness claude-code` installs the guard, copies the policy somewhere editable,
+and runs `harnesses/claude-code/install.sh` to write both. It will not overwrite an existing settings
+file — it writes the generated config beside it and prints the merge.
+
+Prove it refuses something before believing it:
+
+```sh
+echo '{"tool":"read","intents":[{"kind":"read","value":"~/.ssh/id_rsa"}]}' | harness-guard check
+echo $?    # 2
+```
+
+Exit 0 allowed, 2 blocked. There is no code for "could not decide" — a bad payload or an unloadable
+policy is a block.
+
+**Adopting another harness** is a translator (`crates/harness-policy/src/harness/<name>.rs`) plus an
+installer (`harnesses/<name>/install.sh`); `harnesses/README.md` has the contract. A harness that can
+emit the neutral tool-call shape needs neither: point its hook at `harness-guard check` as it is.
+
+**When the guard blocks something it should not**, ask it and read the rule name it reports, then edit
+the policy — not the generated config, which is output and will be regenerated. Re-run the harness
+installer afterwards so layer 1 matches. Note what the hook enforces that a settings file cannot:
+writes are confined to the workspace, and egress goes only to allowlisted hosts.
 
 ## Connecting a new source
 
@@ -70,3 +102,6 @@ Work along the path, in this order — it is roughly cheapest-to-check first:
 5. Was it refused? A mutating task on degraded context is refused before the agent runs. The refusal
    names the intent and what the context was missing, so it says which source was unreachable rather
    than only that one was.
+
+A tool call refused inside the harness is a different failure with a different answer: that is the
+guard, it names the policy rule it applied, and `harness-guard check` reproduces it on demand.

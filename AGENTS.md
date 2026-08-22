@@ -36,7 +36,17 @@ delivers *recoverability*. Every partial failure needs a defined winner and a sw
 Every write path is keyed and safe to replay: unique record ids, compound keys on fan-out targets,
 recomputed counters rather than incremented ones.
 
-## 6. Tests and docs are part of the change
+## 6. A rule is written once, enforced twice
+
+`policy/tool-policy.json` is the only place a tool rule is declared. A harness's own allow/deny
+config is generated from it; the guard evaluates the same file at the tool-call boundary. Neither
+layer may assume the other ran, and a generator may omit a rule its harness cannot express but must
+never emit an allow the policy does not grant.
+
+Fail closed: an unparseable payload, an unloadable policy and a rule violation are the same answer.
+There is no exit code meaning "could not decide".
+
+## 7. Tests and docs are part of the change
 
 - Line coverage ≥ 85%, enforced in CI, and **blocking** since `harness-dispatch` landed (97.85% at
   the time of writing). The `todo!()` bodies still to come drag the figure down without excusing it:
