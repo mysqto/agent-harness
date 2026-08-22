@@ -1,0 +1,28 @@
+[package]
+name = "harness-subject"
+description = "Canonicalise a subject identifier, then derive its keyed pseudonym."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror.workspace = true
+serde.workspace = true
+# HMAC-SHA256 only. No AEAD, no key wrap: sealing belongs to the store, and pulling its primitives
+# in here would put a second implementation of them one `use` away from the write path.
+hmac = { version = "0.13", default-features = false }
+sha2 = { version = "0.11", default-features = false }
+# The keying secret is held in an array this clears on drop. A best-effort scrub is still worth
+# more than leaving 32 bytes of it in freed memory for a core dump to pick up.
+zeroize = { version = "1", default-features = false, features = ["zeroize_derive"] }
+# Unicode NFC. Canonicalisation without it would make "é" as one code point and "é" as two into two
+# permanently unrelatable subjects, which is the failure this crate exists to prevent.
+unicode-normalization = { version = "0.1", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+serde_json.workspace = true
