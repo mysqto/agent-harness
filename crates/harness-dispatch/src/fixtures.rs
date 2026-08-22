@@ -109,6 +109,24 @@ impl Filter for Suffix {
     }
 }
 
+/// Substitutes a value into a placeholder, the way a late template step does.
+///
+/// This is the case the egress screen exists for: nothing the agent asked to send carries the value,
+/// so a check on the fields or on the template sees a clean message and the secret exists only in the
+/// bytes that go out.
+pub struct Render {
+    /// The placeholder to replace.
+    pub placeholder: &'static str,
+    /// What replaces it.
+    pub value: &'static str,
+}
+
+impl Filter for Render {
+    fn apply(&self, text: &str) -> String {
+        text.replace(self.placeholder, self.value)
+    }
+}
+
 /// Upper-cases, which does not commute with [`Suffix`].
 pub struct Upper;
 

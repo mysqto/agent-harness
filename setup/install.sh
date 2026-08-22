@@ -64,6 +64,9 @@ else
   cat > "$config" <<CONF
 # Written by setup/install.sh. Safe to edit; re-running the installer will not overwrite it.
 ingress_socket = "$RUNTIME/ingress.sock"
+# The egress screen enforces the pattern set this build ships with. Point this at your own copy to
+# replace that set; the harness refuses to start if the file named here cannot be read.
+# egress_policy = "$RUNTIME/egress-screen.toml"
 
 [memory]
 base_url = "$MEMORY_URL"

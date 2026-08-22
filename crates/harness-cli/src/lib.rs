@@ -147,7 +147,9 @@ where
     let dispatcher = Arc::new(Dispatcher::new(
         registry,
         store,
-        Courier::new(Vec::new(), Box::new(replies.clone())),
+        // Built before the listener: a policy this deployment named and cannot read is a reason
+        // not to start, not a reason to serve unscreened.
+        Courier::screened(Vec::new(), config.screen()?, Box::new(replies.clone())),
     ));
     let listener = serve::bind(socket).await?;
     tracing::info!(
