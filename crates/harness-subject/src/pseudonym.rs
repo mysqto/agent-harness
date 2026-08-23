@@ -78,7 +78,9 @@ impl SubjectKey {
         }
         let mut bytes = Vec::with_capacity(hex.len() / 2);
         let digits = hex.as_bytes();
-        for pair in digits.chunks_exact(2) {
+        let (pairs, rest) = digits.as_chunks::<2>();
+        debug_assert!(rest.is_empty(), "an even length was checked above");
+        for pair in pairs {
             let hi = hex_digit(pair[0]).ok_or(Error::KeyNotHex)?;
             let lo = hex_digit(pair[1]).ok_or(Error::KeyNotHex)?;
             bytes.push(hi << 4 | lo);
