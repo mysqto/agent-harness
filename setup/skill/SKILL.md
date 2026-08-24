@@ -46,6 +46,15 @@ Two layers, one set of rules in `spec/tool-policy.json`:
 and runs `harnesses/claude-code/install.sh` to write both. It will not overwrite an existing settings
 file — it writes the generated config beside it and prints the merge.
 
+`--harness openclaw` wires the same two layers by a different route, because that harness has no hook
+command: layer 1 is its exec gate, and layer 2 is a small plugin that spawns the guard. Its config is
+one large file holding credentials, so the installer never writes it — it installs the plugin, prints
+the fragment and the validated `openclaw config patch` that merges it, and applies that only with
+`--apply`. Two things it deliberately leaves to the operator, because the policy has no opinion on
+either: which commands may run unattended (`openclaw approvals allowlist add`), and where the memory
+sidecar's socket is. `harnesses/openclaw/README.md` also records what that harness *cannot* wire —
+the memory read path — and why, which is worth reading before assuming recall is working.
+
 Prove it refuses something before believing it:
 
 ```sh

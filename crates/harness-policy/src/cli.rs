@@ -40,7 +40,7 @@ usage: harness-guard <command> [options]
 
 options:
   --harness NAME   harness whose payload shape to read, or whose config to write
-                   (neutral, claude-code, hermes; default neutral)
+                   (neutral, claude-code, hermes, openclaw; default neutral)
   --policy FILE    policy to enforce (default: the policy built into this binary)
   --guard COMMAND  how the emitted config should invoke this guard
   -h, --help       this text

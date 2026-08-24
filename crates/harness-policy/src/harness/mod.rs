@@ -11,6 +11,7 @@
 
 pub mod claude_code;
 pub mod hermes;
+pub mod openclaw;
 
 use crate::call::ToolCall;
 use crate::error::{Error, Result};
@@ -20,7 +21,7 @@ use crate::policy::Policy;
 ///
 /// `neutral` is the harness-agnostic shape from [`crate::call`]: any harness can adopt the guard by
 /// emitting that JSON instead of contributing a translator.
-pub const KNOWN: [&str; 3] = ["neutral", "claude-code", "hermes"];
+pub const KNOWN: [&str; 4] = ["neutral", "claude-code", "hermes", "openclaw"];
 
 /// Translates a harness's tool-call payload into the neutral shape.
 pub fn translate(harness: &str, payload: &str) -> Result<ToolCall> {
@@ -28,6 +29,7 @@ pub fn translate(harness: &str, payload: &str) -> Result<ToolCall> {
         "neutral" => ToolCall::parse(payload),
         "claude-code" => claude_code::translate(payload),
         "hermes" => hermes::translate(payload),
+        "openclaw" => openclaw::translate(payload),
         other => Err(Error::UnknownHarness(other.to_string())),
     }
 }
@@ -61,6 +63,7 @@ pub fn generate(harness: &str, policy: &Policy, guard_command: &str) -> Result<S
         }),
         "claude-code" => claude_code::settings(policy, guard_command),
         "hermes" => Ok(hermes::hooks(policy, guard_command)),
+        "openclaw" => openclaw::config(policy, guard_command),
         other => Err(Error::UnknownHarness(other.to_string())),
     }
 }
