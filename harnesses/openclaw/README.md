@@ -53,9 +53,17 @@ no plugin, no error, no enforcement.
 ## Layer 2 is a plugin, not a hook command
 
 This harness has no hook-command setting. What it has is a plugin hook, `before_tool_call`, whose
-handler can return `{ block: true, blockReason }` — so `plugin/index.mjs` is thirty lines that pipe
-the call to the guard and turn a non-zero exit into that refusal. It decides nothing; adding a rule
-never means editing it.
+handler can return `{ block: true, blockReason }` — so `plugin/index.mjs` pipes the call to the guard
+and turns a non-zero exit into that refusal. It decides nothing; adding a rule never means editing it.
+
+The plugin imports nothing from the harness: `register(api)` on a plain default export, one
+`api.on("before_tool_call", …)`, and `node:child_process`. That is deliberate — a plugin that imported
+an internal module would break on an upgrade that moved it.
+
+**The hook is bounded explicitly, because nothing bounds it by default.** Most hooks here have a
+host-side default timeout; `before_tool_call` has none, so a handler that hung would wedge the tool
+call for ever. The fragment therefore sets `hooks.timeouts.before_tool_call` — the setting that
+overrides everything else — and the plugin sets its own, shorter budget.
 
 **Every failure blocks, on both sides of the boundary.** A guard that is not configured, cannot be
 started, or does not answer in time is the same answer as a guard that refused, because "we could not
@@ -130,6 +138,18 @@ All three are enforced by the guard, which sees the command line, splits it on e
 looks through `sudo` and `env`, recovers redirection targets as writes, and folds in the host's own
 `derivedPaths` for structured edit envelopes.
 
+### Code mode is refused, not screened
+
+If code mode is on, an `exec` call can carry a *program* instead of a command line — and the harness
+mirrors it into the same `command` field, so it looks translatable. It is not. `sh('cat ~/.ssh/id_rsa')`
+reads as the program `sh` with a quoted argument and would be **permitted**, while the shell line it
+builds would not be; and a program can assemble a command at runtime out of pieces no static reading
+joins up. So the guard refuses any call marked `code_mode_exec` outright and says why.
+
+That is a real restriction: with this harness wired, code mode does not work. Turn it off, or describe
+code in the policy before turning it on. Screening it as though it were a command line was the
+alternative, and it is the one that answers wrongly in the dangerous direction.
+
 `tools.exec.security` also accepts `deny` and `full`, and `tools.exec.timeoutSec` bounds how long a
 command may run. Neither is emitted: `full` would remove layer 1 entirely, and the policy declares no
 timeout — inventing one here would be a rule living in a harness directory, which is the one thing
@@ -150,9 +170,19 @@ echo '{"toolName":"exec","params":{"command":"cat ~/.ssh/id_rsa"}}' \
 Expect `exit 2` and a refusal naming the `private-keys` rule. If you get `exit 0`, the guard is
 reading a different policy than you think — pass `--policy` explicitly and try again.
 
-That checks the guard. To check the *plugin* is loaded, restart the gateway and confirm it appears in
-`openclaw plugins`; a load path pointing at nothing loads silently.
+That checks the guard. Checking the *plugin* is a separate question, and worth asking: a load path
+pointing at nothing loads silently.
+
+```sh
+openclaw plugins doctor                                     # load errors, if any
+openclaw plugins inspect harness-tool-policy --runtime --json   # imports it, lists what it registered
+```
+
+Restart the gateway first — changes to plugin code, enablement or `plugins.load.paths` do not take
+effect until it restarts. `openclaw plugins validate` is not the check to use here: it only handles
+tool plugins and errors on anything else.
 
 The plugin directory is discovered the ordinary way — a directory holding `openclaw.plugin.json` and
-an `index.mjs`, named in `plugins.load.paths`. No packaging step, and nothing imported from the
-harness itself, so the plugin cannot break on a harness upgrade that moves an internal module.
+an `index.mjs`, named in `plugins.load.paths`. No packaging step and no build. Two things the loader
+insists on, both of which the installed manifest satisfies: an `id` matching the one the entry
+exports, and a `configSchema`; a manifest missing either is skipped rather than reported loudly.

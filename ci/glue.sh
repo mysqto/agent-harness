@@ -140,6 +140,13 @@ else:
         problems.append(f"the guard is {argv!r}, not an argv the plugin can spawn")
     elif "--harness" not in argv or "openclaw" not in argv:
         problems.append(f"the guard argv does not select this harness: {argv}")
+    # This hook has no host-side default timeout, so an unbounded handler wedges the tool call.
+    plugin_budget = entry.get("config", {}).get("timeoutMs")
+    host_budget = entry.get("hooks", {}).get("timeouts", {}).get("before_tool_call")
+    if not isinstance(plugin_budget, int) or not isinstance(host_budget, int):
+        problems.append(f"the hook is unbounded: plugin={plugin_budget!r} host={host_budget!r}")
+    elif host_budget <= plugin_budget:
+        problems.append("the host would time out first, and its refusal names no rule")
 
 # The one thing this harness must NOT claim: its node deny list matches command ids, not shell text.
 rendered = json.dumps(config)
@@ -174,6 +181,8 @@ occheck '{"toolName":"exec","params":{"command":"ls && sudo rm -rf ~"}}' 2
 occheck '{"toolName":"web_fetch","params":{"url":"https://unlisted.test/x"}}' 2
 occheck '{"toolName":"apply_patch","params":{},"derivedPaths":["/etc/crontab"]}' 2
 occheck '{"toolName":"read","params":{"path":"README.md"}}' 0
+# A program is not a command line. Reading it as one permits what the shell line it builds would not.
+occheck '{"toolName":"exec","toolKind":"code_mode_exec","params":{"command":"await sh(\"ls\")"}}' 2
 
 echo "→ a second run changes nothing"
 digest="$(cat "$fragment" "$ocwork/plug/index.mjs" | cksum)"

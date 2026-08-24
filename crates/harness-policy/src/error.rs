@@ -37,6 +37,18 @@ pub enum Error {
     /// The harness named for translation is not one this build knows.
     #[error("unknown harness `{0}`")]
     UnknownHarness(String),
+    /// The call was read, and the policy has no way to describe what it would do.
+    ///
+    /// Separate from [`Error::Malformed`] because the payload was fine: it is the *policy* that
+    /// cannot reach this shape of call. Both block, and saying which one it was is the difference
+    /// between fixing an install and changing a rule.
+    #[error("cannot decide about {what}: {why}")]
+    Undecidable {
+        /// What arrived.
+        what: String,
+        /// Why no rule can reach it.
+        why: String,
+    },
 }
 
 /// Result carrying [`Error`].

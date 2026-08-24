@@ -3,7 +3,10 @@
   "name": "Harness tool policy",
   "description": "Refuses a tool call the declared tool policy denies.",
   "activation": {
-    "onStartup": true
+    "onStartup": true,
+    "onCapabilities": [
+      "hook"
+    ]
   },
   "configSchema": {
     "type": "object",
@@ -11,7 +14,9 @@
     "properties": {
       "guard": {
         "type": "array",
-        "items": { "type": "string" },
+        "items": {
+          "type": "string"
+        },
         "title": "Guard argv",
         "description": "The guard to spawn, as argv. Written by harnesses/openclaw/install.sh; an empty or missing value refuses every tool call rather than passing it."
       },

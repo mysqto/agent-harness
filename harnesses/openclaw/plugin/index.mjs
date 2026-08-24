@@ -118,13 +118,13 @@ export default {
         ? settings.timeoutMs
         : DEFAULT_TIMEOUT_MS;
 
-    // A hook timeout on the host's side would let the call through, so the budget given to the host
-    // is deliberately longer than the one this handler enforces on itself.
-    api.hooks.on(
-      "before_tool_call",
-      (event) => consult(argv, timeoutMs, event, api.logger),
-      { timeoutMs: timeoutMs * 2 },
-    );
+    // This hook has no host-side default timeout: an unbounded handler would wedge the tool call for
+    // ever. So a bound is always passed, and it is deliberately longer than the one this handler
+    // enforces on itself — that way the refusal that lands names the policy rule rather than being
+    // the host's generic "the hook failed".
+    api.on("before_tool_call", (event) => consult(argv, timeoutMs, event, api.logger), {
+      timeoutMs: timeoutMs * 2,
+    });
   },
 };
 

@@ -20,6 +20,13 @@ use crate::policy::Policy;
 /// or the settings below configure a plugin that never loads.
 pub const PLUGIN_ID: &str = "harness-tool-policy";
 
+/// How long the plugin gives the guard to answer, in milliseconds.
+///
+/// Emitted rather than left to a default because this hook has *no* host-side default timeout: an
+/// unbounded handler wedges the tool call for ever. It is not a policy rule — the policy says nothing
+/// about how fast the guard answers — which is why it is a constant here and not read from the policy.
+pub const GUARD_TIMEOUT_MS: u64 = 5_000;
+
 /// Stands in for the directory the plugin is installed to, substituted by the installer.
 ///
 /// The generator cannot know that path and must not guess one: a guessed path is a `load.paths` entry
@@ -28,6 +35,9 @@ pub const PLUGIN_DIR_PLACEHOLDER: &str = "${plugin_dir}";
 
 /// `params` fields that carry a shell command line.
 const COMMAND_FIELDS: [&str; 2] = ["command", "script"];
+
+/// `toolKind` for a call whose payload is a program rather than a command line.
+const CODE_MODE: &str = "code_mode_exec";
 
 /// `params` fields that carry a URL.
 const FETCH_FIELDS: [&str; 2] = ["url", "uri"];
@@ -47,6 +57,13 @@ const READ_TOOLS: [&str; 6] = ["read", "grep", "glob", "list", "search", "memory
 /// adds a tool still gets its command, URL and paths checked. `derivedPaths` — the host's own
 /// best-effort parse of a structured edit envelope — is folded in as writes, since it exists exactly
 /// for the tools whose payload a generic field sweep cannot read.
+///
+/// A code-mode call is **refused outright**, not translated. The harness mirrors the program into the
+/// same `command` field a shell call uses, so it looks translatable and is not: the policy is written
+/// in terms of command lines, and reading a program as one gets the answer wrong in the dangerous
+/// direction. `sh('cat ~/.ssh/id_rsa')` parses as the program `sh` with a quoted argument and is
+/// permitted, while the shell line it builds would not be. Refusing is the only honest answer left —
+/// a deployment that needs code mode has to describe code in the policy first.
 pub fn translate(payload: &str) -> Result<ToolCall> {
     let root: Value = serde_json::from_str(payload).map_err(|why| Error::Malformed {
         what: "hook payload".to_string(),
@@ -62,6 +79,16 @@ pub fn translate(payload: &str) -> Result<ToolCall> {
         .get("params")
         .and_then(Value::as_object)
         .unwrap_or(&empty);
+
+    if root.get("toolKind").and_then(Value::as_str) == Some(CODE_MODE) {
+        return Err(Error::Undecidable {
+            what: format!("a code-mode `{tool}` call"),
+            why:
+                "its payload is a program, and the policy describes command lines. Turn code mode \
+                  off, or describe code in the policy"
+                    .to_string(),
+        });
+    }
 
     let mut intents = Vec::new();
     for field in COMMAND_FIELDS {
@@ -158,8 +185,13 @@ pub fn config(policy: &Policy, guard_command: &str) -> Result<String> {
             "entries": {
                 PLUGIN_ID: {
                     "enabled": true,
+                    // The operator-visible bound, and the one that wins: a hook timeout set here
+                    // overrides what the plugin asks for. Kept at twice the plugin's own budget so
+                    // the plugin still answers first, with a refusal that names the rule.
+                    "hooks": { "timeouts": { "before_tool_call": GUARD_TIMEOUT_MS * 2 } },
                     "config": {
                         "guard": argv,
+                        "timeoutMs": GUARD_TIMEOUT_MS,
                         // Recorded so a fragment generated against an older policy is visible in the
                         // config rather than only in whoever remembers when it was installed.
                         "policyVersion": policy.version,
@@ -317,6 +349,47 @@ mod tests {
             parsed["plugins"]["load"]["paths"],
             serde_json::json!([super::PLUGIN_DIR_PLACEHOLDER]),
             "the install path is the installer's to fill in"
+        );
+    }
+
+    #[test]
+    fn a_code_mode_payload_is_refused_because_no_rule_can_read_it() {
+        // Reading a program as a command line answers wrongly in the dangerous direction: this
+        // payload parses as the program `sh` with a quoted argument and would be *permitted*, while
+        // the shell line it builds would not be. So it is refused rather than translated.
+        let error = translate(
+            r#"{"toolName":"exec","toolKind":"code_mode_exec","toolInputKind":"javascript",
+                "params":{"command":"await sh('cat ~/.ssh/id_rsa')"}}"#,
+        )
+        .expect_err("refused");
+        assert!(error.to_string().contains("code-mode"), "{error}");
+
+        // The same text without the code-mode marker really is a command line, and is read as one.
+        let call = translate(r#"{"toolName":"exec","params":{"command":"cat ~/.ssh/id_rsa"}}"#)
+            .expect("translate");
+        assert!(
+            crate::eval::Guard::from_env(baseline())
+                .check(&call)
+                .is_deny()
+        );
+    }
+
+    #[test]
+    fn the_fragment_bounds_the_hook_because_the_harness_does_not() {
+        // No host-side default exists for this hook, so an unbounded handler would wedge tool calls.
+        let parsed: serde_json::Value =
+            serde_json::from_str(&config(&baseline(), "guard").expect("config")).expect("json");
+        let entry = &parsed["plugins"]["entries"][PLUGIN_ID];
+        let plugin_budget = entry["config"]["timeoutMs"]
+            .as_u64()
+            .expect("plugin budget");
+        let host_budget = entry["hooks"]["timeouts"]["before_tool_call"]
+            .as_u64()
+            .expect("host budget");
+        assert_eq!(plugin_budget, super::GUARD_TIMEOUT_MS);
+        assert!(
+            host_budget > plugin_budget,
+            "the host would time out first, and its refusal names no rule"
         );
     }
 
