@@ -56,6 +56,11 @@ echo $?    # 2
 Exit 0 allowed, 2 blocked. There is no code for "could not decide" — a bad payload or an unloadable
 policy is a block.
 
+`--harness hermes` wires the other harness this repo ships. It has no deny list to generate, so the
+hook carries every rule, and it reads its verdict from the hook's **stdout** rather than the exit
+code — `harnesses/hermes/README.md` covers both, and the ways its own hook-consent gate can leave the
+hook installed and enforcing nothing.
+
 **Adopting another harness** is a translator (`crates/harness-policy/src/harness/<name>.rs`) plus an
 installer (`harnesses/<name>/install.sh`); `harnesses/README.md` has the contract. A harness that can
 emit the neutral tool-call shape needs neither: point its hook at `harness-guard check` as it is.

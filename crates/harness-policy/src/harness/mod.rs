@@ -10,6 +10,7 @@
 //! not grant. That asymmetry is what lets layer 1 be a convenience and layer 2 be the control.
 
 pub mod claude_code;
+pub mod hermes;
 
 use crate::call::ToolCall;
 use crate::error::{Error, Result};
@@ -19,14 +20,30 @@ use crate::policy::Policy;
 ///
 /// `neutral` is the harness-agnostic shape from [`crate::call`]: any harness can adopt the guard by
 /// emitting that JSON instead of contributing a translator.
-pub const KNOWN: [&str; 2] = ["neutral", "claude-code"];
+pub const KNOWN: [&str; 3] = ["neutral", "claude-code", "hermes"];
 
 /// Translates a harness's tool-call payload into the neutral shape.
 pub fn translate(harness: &str, payload: &str) -> Result<ToolCall> {
     match harness {
         "neutral" => ToolCall::parse(payload),
         "claude-code" => claude_code::translate(payload),
+        "hermes" => hermes::translate(payload),
         other => Err(Error::UnknownHarness(other.to_string())),
+    }
+}
+
+/// Renders a refusal in the shape `harness` reads it in, when its exit code is not what it reads.
+///
+/// `None` for a harness that blocks on the exit code, which is most of them. One does not: it parses
+/// the hook's stdout and treats empty stdout as no opinion, whatever the process exited with. That
+/// makes a silent block indistinguishable from an allow, so the refusal has to be *said*, and saying
+/// it is a translation into that harness's shape — which is why it lives here and not in the
+/// evaluator.
+#[must_use]
+pub fn verdict(harness: &str, reason: &str) -> Option<String> {
+    match harness {
+        "hermes" => Some(hermes::verdict(reason)),
+        _ => None,
     }
 }
 
@@ -43,13 +60,14 @@ pub fn generate(harness: &str, policy: &Policy, guard_command: &str) -> Result<S
             why: why.to_string(),
         }),
         "claude-code" => claude_code::settings(policy, guard_command),
+        "hermes" => Ok(hermes::hooks(policy, guard_command)),
         other => Err(Error::UnknownHarness(other.to_string())),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{KNOWN, generate, translate};
+    use super::{KNOWN, generate, translate, verdict};
     use crate::call::Intent;
     use crate::policy::Policy;
 
@@ -84,6 +102,30 @@ mod tests {
                 .to_string(),
             "unknown harness `emacs`"
         );
+    }
+
+    #[test]
+    fn a_harness_that_reads_its_verdict_from_stdout_is_given_one() {
+        // Everything else blocks on the exit code, so saying nothing on stdout is right for it and
+        // would be a silently ignored refusal for the one that parses stdout.
+        assert_eq!(verdict("neutral", "refused"), None);
+        assert_eq!(verdict("claude-code", "refused"), None);
+        assert_eq!(verdict("emacs", "refused"), None);
+        let said = verdict("hermes", "shell refused: blocked by private-keys").expect("a verdict");
+        let parsed: serde_json::Value = serde_json::from_str(&said).expect("valid json");
+        assert_eq!(parsed["decision"], "block");
+        assert_eq!(parsed["reason"], "shell refused: blocked by private-keys");
+    }
+
+    #[test]
+    fn a_declared_envelope_is_translated_for_the_harness_that_sends_one() {
+        let call = translate(
+            "hermes",
+            r#"{"hook_event_name":"pre_tool_call","tool_name":"terminal",
+                "tool_input":{"command":"ls"},"session_id":"s","cwd":"/w","extra":{}}"#,
+        )
+        .expect("translate");
+        assert_eq!(call.intents, vec![Intent::Command("ls".to_string())]);
     }
 
     #[test]

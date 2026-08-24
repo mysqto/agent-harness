@@ -40,7 +40,7 @@ usage: harness-guard <command> [options]
 
 options:
   --harness NAME   harness whose payload shape to read, or whose config to write
-                   (neutral, claude-code; default neutral)
+                   (neutral, claude-code, hermes; default neutral)
   --policy FILE    policy to enforce (default: the policy built into this binary)
   --guard COMMAND  how the emitted config should invoke this guard
   -h, --help       this text
@@ -50,19 +50,29 @@ exit codes: 0 allowed, 2 blocked — including when the guard could not decide.
 
 /// Runs one invocation. `read_stdin` is called only when the payload is needed.
 pub fn run(args: &[String], read_stdin: impl FnOnce() -> std::io::Result<String>) -> Run {
-    match dispatch(args, read_stdin) {
+    let parsed = Options::parse(args);
+    // A harness that reads its verdict from stdout has to be told about *this* kind of block too. A
+    // payload it could not parse is the most likely block of all, and one delivered only as an exit
+    // code such a harness reads as no opinion — installed, and enforcing nothing.
+    let reporting = match &parsed {
+        Ok(options) if options.command == "check" => options.harness.clone(),
+        _ => String::new(),
+    };
+    match parsed.and_then(|options| dispatch(options, read_stdin)) {
         Ok(run) => run,
         // Every failure is a block: see [`BLOCK`].
-        Err(error) => Run {
-            code: BLOCK,
-            stdout: String::new(),
-            stderr: format!("harness-guard: {error}\n"),
-        },
+        Err(error) => {
+            let reason = format!("harness-guard: {error}");
+            Run {
+                code: BLOCK,
+                stdout: harness::verdict(&reporting, &reason).unwrap_or_default(),
+                stderr: format!("{reason}\n"),
+            }
+        }
     }
 }
 
-fn dispatch(args: &[String], read_stdin: impl FnOnce() -> std::io::Result<String>) -> Result<Run> {
-    let options = Options::parse(args)?;
+fn dispatch(options: Options, read_stdin: impl FnOnce() -> std::io::Result<String>) -> Result<Run> {
     if options.help {
         return Ok(printed(USAGE));
     }
@@ -84,7 +94,7 @@ fn dispatch(args: &[String], read_stdin: impl FnOnce() -> std::io::Result<String
                 why: why.to_string(),
             })?;
             let call = harness::translate(&options.harness, &payload)?;
-            Ok(decision(&Guard::from_env(policy), &call))
+            Ok(decision(&Guard::from_env(policy), &call, &options.harness))
         }
         other => Err(crate::Error::Malformed {
             what: "command line".to_string(),
@@ -93,20 +103,24 @@ fn dispatch(args: &[String], read_stdin: impl FnOnce() -> std::io::Result<String
     }
 }
 
-fn decision(guard: &Guard, call: &crate::ToolCall) -> Run {
+fn decision(guard: &Guard, call: &crate::ToolCall, harness: &str) -> Run {
     match guard.check(call) {
         Decision::Allow => Run {
             code: ALLOW,
             stdout: String::new(),
             stderr: String::new(),
         },
-        Decision::Deny(denial) => Run {
-            code: BLOCK,
-            stdout: String::new(),
+        Decision::Deny(denial) => {
             // The tool name is for the person reading the log; the rule is for whoever has to
-            // decide whether the policy or the request was wrong.
-            stderr: format!("{} refused: {denial}\n", call.tool),
-        },
+            // decide whether the policy or the request was wrong. One text, both channels: a harness
+            // reading the verdict off stdout gets the same words as the log does.
+            let reason = format!("{} refused: {denial}", call.tool);
+            Run {
+                code: BLOCK,
+                stdout: harness::verdict(harness, &reason).unwrap_or_default(),
+                stderr: format!("{reason}\n"),
+            }
+        }
     }
 }
 
@@ -239,6 +253,102 @@ mod tests {
             outcome.stderr.contains("filesystem-format"),
             "{}",
             outcome.stderr
+        );
+    }
+
+    /// The envelope a runtime that reads its verdict from stdout actually sends.
+    fn envelope(tool: &str, input: &str) -> String {
+        format!(
+            r#"{{"hook_event_name":"pre_tool_call","tool_name":"{tool}","tool_input":{input},
+                 "session_id":"s1","cwd":"/w","extra":{{}}}}"#
+        )
+    }
+
+    /// The block directive, as that runtime parses it back off stdout.
+    fn directive(stdout: &str) -> serde_json::Value {
+        serde_json::from_str(stdout).expect("stdout is one JSON object")
+    }
+
+    #[test]
+    fn a_block_is_said_on_stdout_when_that_is_where_the_harness_reads_it() {
+        // The failure this guards against: that runtime parses stdout and treats empty stdout as no
+        // opinion, whatever the exit code was. Exit 2 and silence is an adapter that looks installed
+        // and enforces nothing.
+        let outcome = invoke(
+            &["check", "--harness", "hermes"],
+            &envelope("terminal", r#"{"command":"cat ~/.ssh/id_rsa"}"#),
+        );
+        assert_eq!(outcome.code, BLOCK);
+        let said = directive(&outcome.stdout);
+        assert_eq!(said["decision"], "block");
+        assert!(
+            said["reason"]
+                .as_str()
+                .expect("a reason")
+                .contains("private-keys"),
+            "{said}"
+        );
+        // stderr still carries it too: the log and the runtime read the same words.
+        assert!(
+            outcome.stderr.contains("private-keys"),
+            "{}",
+            outcome.stderr
+        );
+    }
+
+    #[test]
+    fn a_payload_that_harness_could_not_send_is_blocked_on_stdout_as_well() {
+        // The likeliest block of all — the wrong `--harness`, a renamed field, arguments that were
+        // not a mapping — and the one that would otherwise be delivered only as an exit code the
+        // runtime does not read.
+        for payload in [
+            r#"{"tool_name":"Bash","tool_input":{"command":"rm -rf /"}}"#,
+            r#"{"hook_event_name":"pre_tool_call","tool_name":"terminal","tool_input":null}"#,
+            "not json at all",
+        ] {
+            let outcome = invoke(&["check", "--harness", "hermes"], payload);
+            assert_eq!(outcome.code, BLOCK, "{payload}");
+            assert_eq!(directive(&outcome.stdout)["decision"], "block", "{payload}");
+        }
+    }
+
+    #[test]
+    fn a_permitted_call_leaves_that_harness_no_opinion_to_read() {
+        let outcome = invoke(
+            &["check", "--harness", "hermes"],
+            &envelope("read_file", r#"{"path":"Cargo.toml"}"#),
+        );
+        assert_eq!(outcome.code, ALLOW);
+        assert!(outcome.stdout.is_empty(), "{}", outcome.stdout);
+    }
+
+    #[test]
+    fn a_command_line_mistake_under_that_harness_is_still_only_a_log_line() {
+        // `emit` writes config to stdout, so a refusal must not be mixed into it. Only `check` is
+        // answering a runtime that reads stdout.
+        let outcome = invoke(
+            &["emit", "--harness", "hermes", "--policy", "/nonexistent"],
+            "",
+        );
+        assert_eq!(outcome.code, BLOCK);
+        assert!(outcome.stdout.is_empty(), "{}", outcome.stdout);
+    }
+
+    #[test]
+    fn emit_writes_the_hook_fragment_for_that_harness() {
+        let outcome = invoke(&["emit", "--harness", "hermes"], "");
+        assert_eq!(outcome.code, ALLOW);
+        assert!(
+            outcome.stdout.contains("pre_tool_call:"),
+            "{}",
+            outcome.stdout
+        );
+        assert!(
+            outcome
+                .stdout
+                .contains(r#"- command: "harness-guard check --harness hermes""#),
+            "{}",
+            outcome.stdout
         );
     }
 

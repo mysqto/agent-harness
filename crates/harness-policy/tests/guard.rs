@@ -30,6 +30,10 @@ fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).to_string()
 }
 
+fn stdout(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stdout).to_string()
+}
+
 #[test]
 fn the_binary_blocks_a_secret_read() {
     let output = guard(
@@ -113,4 +117,59 @@ fn the_binary_emits_a_harness_config_it_can_be_wired_with() {
         parsed["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
         "/opt/bin/harness-guard check"
     );
+}
+
+/// The envelope sent by a harness that reads its verdict from the hook's stdout.
+fn envelope(tool: &str, input: &str) -> String {
+    format!(
+        r#"{{"hook_event_name":"pre_tool_call","tool_name":"{tool}","tool_input":{input},
+             "session_id":"s1","cwd":"/w","extra":{{}}}}"#
+    )
+}
+
+#[test]
+fn the_binary_says_a_block_on_stdout_for_the_harness_that_reads_it_there() {
+    // The one failure that makes this adapter look installed and enforce nothing: that runtime reads
+    // the verdict out of stdout and treats empty stdout as no opinion, whatever the exit code was.
+    // So the exit code alone is not the assertion worth making here — the parsed directive is.
+    let output = guard(
+        &["check", "--harness", "hermes"],
+        &envelope("terminal", r#"{"command":"cat ~/.ssh/id_rsa"}"#),
+    );
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    let said: serde_json::Value =
+        serde_json::from_str(stdout(&output).trim()).expect("stdout is one JSON object");
+    assert_eq!(said["decision"], "block");
+    assert!(
+        said["reason"]
+            .as_str()
+            .expect("a reason")
+            .contains("private-keys"),
+        "{said}"
+    );
+}
+
+#[test]
+fn the_binary_says_an_unreadable_payload_on_stdout_too() {
+    // Reached by the wrong `--harness`, a renamed field, or arguments the runtime could not
+    // serialise as a mapping. All of them block, and a block that runtime cannot see is not one.
+    let output = guard(
+        &["check", "--harness", "hermes"],
+        r#"{"tool_name":"Bash","tool_input":{"command":"rm -rf /"}}"#,
+    );
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    let said: serde_json::Value =
+        serde_json::from_str(stdout(&output).trim()).expect("stdout is one JSON object");
+    assert_eq!(said["decision"], "block");
+}
+
+#[test]
+fn the_binary_leaves_that_harness_no_opinion_on_a_permitted_call() {
+    let output = guard(
+        &["check", "--harness", "hermes"],
+        &envelope("read_file", r#"{"path":"Cargo.toml"}"#),
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(output.stdout.is_empty(), "{}", stdout(&output));
+    assert!(output.stderr.is_empty(), "{}", stderr(&output));
 }

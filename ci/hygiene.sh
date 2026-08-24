@@ -6,7 +6,7 @@ set -uo pipefail
 
 # Extend as needed. Case-insensitive, word-boundary matched where sensible.
 DENY=(
-  'wego' 'bamboohr' 'sprinklr' 'wenrix' 'openclaw' 'hermes'
+  'wego' 'bamboohr' 'sprinklr' 'wenrix' 'openclaw'
   'payment_ref' 'booking_ref' 'partner_ref'
   '@wego' 'PAY-[0-9]' 'p9zy63u53v' 'WFVQZ'
 )

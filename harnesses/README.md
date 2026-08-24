@@ -52,3 +52,4 @@ opens when it is confused is not a guard.
 | Harness | Config it writes | Notes |
 |---|---|---|
 | `claude-code/` | `.claude/settings.json` | Path and command denies plus the `PreToolUse` hook. |
+| `hermes/` | `cli-config.yaml` | The `pre_tool_call` hook only; that harness has no deny list. It reads its verdict from the hook's stdout, not the exit code. |
