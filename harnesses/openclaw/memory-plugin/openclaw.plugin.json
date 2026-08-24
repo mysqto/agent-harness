@@ -1,0 +1,44 @@
+{
+  "id": "harness-memory",
+  "name": "Harness memory recall",
+  "description": "Recalls what this deployment remembers and prepends its structure to a turn's context.",
+  "kind": "memory",
+  "activation": {
+    "onStartup": true,
+    "onCapabilities": [
+      "hook"
+    ]
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "read": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "title": "Reader argv",
+        "description": "The reader to spawn, as argv, up to and including the `bundle` subcommand. Written by harnesses/openclaw/install-memory.sh. An argv that is empty, or that names a read shape other than `bundle`, recalls nothing and says so in the log rather than injecting silence."
+      },
+      "timeoutMs": {
+        "type": "integer",
+        "exclusiveMinimum": 0,
+        "title": "Recall budget (ms)",
+        "description": "How long the whole lookup gets. It sits in front of a reply, so a slow read is a slow conversation: when it runs out the turn proceeds with no recalled context."
+      },
+      "maxRecords": {
+        "type": "integer",
+        "exclusiveMinimum": 0,
+        "title": "Records injected",
+        "description": "Most records one turn may carry. Also the reader's `--limit`, so a turn that wants eight records is charged for eight rather than for the service's cap."
+      },
+      "maxChars": {
+        "type": "integer",
+        "exclusiveMinimum": 0,
+        "title": "Characters injected",
+        "description": "Ceiling on the rendered block. Whatever it cuts is counted in the block, because a truncated list that reads as complete is worse than a short one."
+      }
+    }
+  }
+}

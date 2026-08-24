@@ -59,4 +59,4 @@ opens when it is confused is not a guard.
 |---|---|---|
 | `claude-code/` | `.claude/settings.json` | Path and command denies plus the `PreToolUse` hook. |
 | `hermes/` | `cli-config.yaml` | The `pre_tool_call` hook only; that harness has no deny list. It reads its verdict from the hook's stdout, not the exit code. |
-| `openclaw/` | nothing — it prints a fragment | The exec gate, plus a plugin that spawns the guard. |
+| `openclaw/` | nothing — it prints a fragment | The exec gate, plus a plugin that spawns the guard. A second installer wires memory recall through a plugin that owns the memory slot. |

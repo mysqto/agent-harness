@@ -352,8 +352,299 @@ JS
 else
   fail "node is not installed, so the plugin's decision path went untested"
 fi
+## OpenClaw recall #############################################################
+# The other half of that harness: a plugin owning the memory slot that recalls before a reply. What
+# is tested here is the opposite of what is tested above — this one must fail *open*. A lookup that
+# cannot answer has to let the turn through, and it has to stay distinguishable in the log from a
+# lookup that legitimately found nothing.
+
+ocmem="harnesses/openclaw/install-memory.sh"
+memwork="$work/openclaw-memory"
+mkdir -p "$memwork/state" "$memwork/plug" "$memwork/bin"
+memconfig="$memwork/state/openclaw.json"
+printf '{"gateway":{"port":19002}}\n' > "$memconfig"
+
+# Stand-ins for the read tool, one per answer it can give. Each ignores its arguments except the one
+# that records them: what the plugin appends to the configured argv is part of the wiring.
+reader() { echo "$memwork/bin/reader-$1"; }
+cat > "$(reader records)" <<'STUB'
+#!/usr/bin/env bash
+[ -n "${READER_ARGS_FILE:-}" ] && printf '%s\n' "$*" > "$READER_ARGS_FILE"
+cat <<'JSON'
+{"records":[
+ {"record_id":"01AAAA","received_at":"2026-01-01T00:00:00Z","action":"deploy","outcome":"ok",
+  "agent":"builder","entities":[{"kind":"service","id":"api"}],"attrs":{"env":"staging"},
+  "tags":["release"]},
+ {"record_id":"01BBBB","received_at":"2026-01-02T00:00:00Z","action":"review","outcome":"failed",
+  "agent":"builder","entities":[{"kind":"pull_request","id":"12"}],"attrs":{},"tags":[]}],
+ "degraded":false,"omitted":[],"token_estimate":57}
+JSON
+STUB
+cat > "$(reader empty)" <<'STUB'
+#!/usr/bin/env bash
+[ -n "${READER_ARGS_FILE:-}" ] && printf '%s\n' "$*" > "$READER_ARGS_FILE"
+printf '{"records":[],"degraded":false,"omitted":[],"token_estimate":0}'
+STUB
+cat > "$(reader degraded)" <<'STUB'
+#!/usr/bin/env bash
+cat <<'JSON'
+{"records":[{"record_id":"01CCCC","received_at":"2026-01-03T00:00:00Z","action":"deploy",
+ "outcome":"ok","agent":"builder","entities":[],"attrs":{},"tags":[]}],
+ "degraded":true,"omitted":["entity timeline was not consulted in time"],"token_estimate":22}
+JSON
+STUB
+cat > "$(reader refused)" <<'STUB'
+#!/usr/bin/env bash
+echo "the service refused this request (400): unknown parameter" >&2
+exit 8
+STUB
+cat > "$(reader garbage)" <<'STUB'
+#!/usr/bin/env bash
+printf 'not json at all'
+STUB
+cat > "$(reader slow)" <<'STUB'
+#!/usr/bin/env bash
+sleep 30
+STUB
+chmod +x "$memwork"/bin/reader-*
+
+echo "→ the recall installer refuses a read tool that is not there"
+set +e
+"$ocmem" --config "$memconfig" --plugin-dir "$memwork/plug" --reader "$memwork/bin/absent" \
+  >/dev/null 2>&1
+code=$?
+set -e
+[ "$code" -ne 0 ] || fail "the recall installer wired a reader that does not exist"
+
+echo "→ the recall installer refuses a target that is not there"
+set +e
+"$ocmem" --config "$memwork/state/absent.json" --plugin-dir "$memwork/plug" \
+  --reader "$(reader records)" >/dev/null 2>&1
+code=$?
+set -e
+[ "$code" -ne 0 ] || fail "the recall installer succeeded with no config to merge into"
+
+echo "→ installing beside a config it must not touch"
+membefore="$(cat "$memconfig")"
+"$ocmem" --config "$memconfig" --plugin-dir "$memwork/plug" --reader "$(reader records)" \
+  --socket "$memwork/state/main.read.sock" --agent main >/dev/null
+memfragment="$memwork/plug/config-fragment.json"
+[ -f "$memfragment" ] || fail "no recall fragment was written"
+for file in index.mjs openclaw.plugin.json package.json; do
+  [ -f "$memwork/plug/$file" ] || fail "the recall plugin is missing $file"
+done
+[ "$(cat "$memconfig")" = "$membefore" ] || fail "the recall installer edited the live config"
+
+echo "→ the fragment names the slot, and names it exclusively"
+python3 - "$memfragment" "$memwork/plug" "$(reader records)" <<'PY' || status=1
+import json, sys
+fragment, plugin_dir, reader = sys.argv[1], sys.argv[2], sys.argv[3]
+config = json.load(open(fragment))
+problems = []
+plugins = config.get("plugins", {})
+
+if plugins.get("slots", {}).get("memory") != "harness-memory":
+    problems.append(f"the memory slot is {plugins.get('slots')!r}, so the built-in still fills it")
+if plugins.get("load", {}).get("paths") != [plugin_dir]:
+    problems.append(f"load paths are {plugins.get('load')!r}, not where the plugin was installed")
+
+entry = plugins.get("entries", {}).get("harness-memory")
+if not entry:
+    problems.append("the recall plugin has no entry, so it is installed and not enabled")
+else:
+    if entry.get("enabled") is not True:
+        problems.append("the recall plugin entry is not enabled")
+    argv = entry.get("config", {}).get("read")
+    if not isinstance(argv, list) or not argv:
+        problems.append(f"the reader is {argv!r}, not an argv the plugin can spawn")
+    else:
+        if argv[0] != reader:
+            problems.append(f"the reader argv does not name the read tool: {argv}")
+        # One read shape is wired, and the plugin refuses any other. A fragment naming a different
+        # one would install a plugin that recalls nothing on every turn.
+        if "bundle" not in argv:
+            problems.append(f"the reader argv names no bundle read: {argv}")
+        if "--socket" not in argv:
+            problems.append(f"the reader argv names no socket: {argv}")
+    budget = entry.get("config", {}).get("timeoutMs")
+    host = entry.get("hooks", {}).get("timeouts", {}).get("before_prompt_build")
+    if not isinstance(budget, int) or not isinstance(host, int):
+        problems.append(f"the lookup is unbounded: plugin={budget!r} host={host!r}")
+    elif host <= budget:
+        problems.append("the host would time out first, and its message says only that a hook failed")
+
+# Two things owning memory is worse than either. The slot disables the built-in backend; the recall
+# sub-agent is a separate plugin and has to be turned off by name.
+if plugins.get("entries", {}).get("active-memory", {}).get("enabled") is not False:
+    problems.append("the built-in recall sub-agent is left on, so two things inject memory")
+
+for problem in problems:
+    print(f"::error::generated fragment: {problem}")
+sys.exit(1 if problems else 0)
+PY
+
+echo "→ a second run changes nothing"
+memdigest="$(cat "$memfragment" "$memwork/plug/index.mjs" | cksum)"
+"$ocmem" --config "$memconfig" --plugin-dir "$memwork/plug" --reader "$(reader records)" \
+  --socket "$memwork/state/main.read.sock" --agent main >/dev/null
+[ "$(cat "$memfragment" "$memwork/plug/index.mjs" | cksum)" = "$memdigest" ] \
+  || fail "a second recall install rewrote the plugin or the fragment differently"
+[ "$(cat "$memconfig")" = "$membefore" ] || fail "a second recall install edited the live config"
+
+echo "→ it will not overwrite somebody else's plugin directory"
+memother="$memwork/other"
+mkdir -p "$memother"
+printf '{"id":"some-other-plugin"}\n' > "$memother/openclaw.plugin.json"
+set +e
+"$ocmem" --config "$memconfig" --plugin-dir "$memother" --reader "$(reader records)" >/dev/null 2>&1
+code=$?
+set -e
+[ "$code" -ne 0 ] || fail "the recall installer overwrote a directory holding another plugin"
+grep -q 'some-other-plugin' "$memother/openclaw.plugin.json" \
+  || fail "the other plugin's manifest was replaced"
+
+echo "→ --apply refuses to drop the load path the guard plugin lives on"
+set +e
+"$ocmem" --config "$memconfig" --plugin-dir "$memwork/plug" --reader "$(reader records)" \
+  --openclaw "$stub/openclaw" --apply >/dev/null 2>&1
+code=$?
+set -e
+[ "$code" -ne 0 ] || fail "--apply would have replaced an existing plugins.load.paths"
+
+echo "→ recall fails open, and says which kind of nothing it got"
+if command -v node >/dev/null 2>&1; then
+  # Written out rather than inlined because it is run several times: once against the plugin, then
+  # once against each mutant, to check these assertions can actually fail.
+  cat > "$work/recall-assertions.mjs" <<'JS'
+// Exercises the recall path without a gateway around it. argv[2] is the module under test, argv[3]
+// the directory holding the stand-in readers.
+const [, , modulePath, binDir] = process.argv;
+const mod = await import(modulePath);
+const { recall, renderContext, injectionFrom, report, bounds, actorFor, HEADING } = mod;
+
+const problems = [];
+const reader = (name, ...rest) => [`${binDir}/reader-${name}`, "bundle", ...rest];
+const recorder = () => {
+  const lines = [];
+  return { lines, info: (m) => lines.push(["info", String(m)]), warn: (m) => lines.push(["warn", String(m)]) };
+};
+const said = (log, level) => log.lines.filter(([at]) => at === level).map(([, m]) => m).join("\n");
+
+// A lookup that found something reaches the injection point, as structure and not as prose.
+const found = await recall({ read: reader("records") }, "builder");
+const injected = injectionFrom(found);
+if (found.kind !== "recalled") problems.push(`a bundle with records gave ${found.kind}: ${found.why ?? ""}`);
+if (!injected?.prependContext) problems.push("a bundle with records injected nothing");
+else {
+  const text = injected.prependContext;
+  if (!text.startsWith(HEADING)) problems.push("the injected block does not say what it is");
+  for (const expected of ["action=deploy", "outcome=ok", "service:api", "env=staging", "action=review"]) {
+    if (!text.includes(expected)) problems.push(`the injected block dropped ${expected}`);
+  }
+}
+
+// An empty match: no context, and a line saying the store was quiet rather than broken.
+const emptyLog = recorder();
+const empty = await recall({ read: reader("empty") }, "builder");
+report(empty, emptyLog);
+if (empty.kind !== "empty") problems.push(`an empty bundle gave ${empty.kind}`);
+if (injectionFrom(empty) !== undefined) problems.push("an empty bundle injected something");
+if (!/matched nothing/.test(said(emptyLog, "info"))) problems.push("an empty match was not reported as one");
+if (said(emptyLog, "warn")) problems.push(`an empty match warned: ${said(emptyLog, "warn")}`);
+
+// Every way a lookup can fail to answer: the turn proceeds, and the log says the plumbing failed.
+for (const [label, settings] of [
+  ["no reader configured", {}],
+  ["a reader that is not there", { read: reader("absent") }],
+  ["a read shape this does not inject", { read: [`${binDir}/reader-records`, "records"] }],
+  ["a refused read", { read: reader("refused") }],
+  ["an unreadable answer", { read: reader("garbage") }],
+  ["a reader that never answered", { read: reader("slow"), timeoutMs: 200 }],
+]) {
+  const log = recorder();
+  const outcome = await recall(settings, "builder");
+  report(outcome, log);
+  if (outcome.kind !== "unavailable") problems.push(`${label} gave ${outcome.kind}, not unavailable`);
+  if (injectionFrom(outcome) !== undefined) problems.push(`${label} injected context`);
+  if (!/recall unavailable/.test(said(log, "warn"))) problems.push(`${label} was not warned about`);
+  if (/matched nothing/.test(said(log, "info"))) problems.push(`${label} was reported as an empty match`);
+  if (!outcome.why) problems.push(`${label} gave no reason`);
+}
+
+// A partial bundle is safe to answer from and unsafe to act on, so it has to say so.
+const partial = await recall({ read: reader("degraded") }, "builder");
+if (partial.kind !== "recalled" || !partial.degraded) problems.push("a degraded bundle did not report itself");
+if (!/partial/i.test(injectionFrom(partial)?.prependContext ?? "")) {
+  problems.push("a degraded bundle injected a block that reads as complete");
+}
+
+// A capped list must not read as the whole truth.
+const capped = renderContext(
+  { records: [{ action: "a" }, { action: "b" }, { action: "c" }], degraded: false },
+  { maxRecords: 1, maxChars: 4096 },
+);
+if (!/2 further record/.test(capped)) problems.push("a capped list did not say what it left out");
+
+// The bounds the plugin adds, and the actor the host supplied, reach the process it spawns.
+const argsFile = `${binDir}/../args`;
+process.env.READER_ARGS_FILE = argsFile;
+await recall({ read: reader("empty"), timeoutMs: 4000, maxRecords: 3 }, "builder");
+delete process.env.READER_ARGS_FILE;
+const passed = (await import("node:fs")).readFileSync(argsFile, "utf8");
+for (const expected of ["--limit 3", "--deadline-ms 2000", "--timeout-ms 3200", "--actor builder"]) {
+  if (!passed.includes(expected)) problems.push(`the reader was not given ${expected}: ${passed.trim()}`);
+}
+// A bound an operator already chose is theirs, not this file's to replace.
+if (bounds(["r", "bundle", "--limit", "1"], 5000, 8).includes("--limit")) {
+  problems.push("a configured --limit was overridden");
+}
+if (actorFor(["r", "bundle", "--actor", "other"], "builder").length !== 0) {
+  problems.push("a configured --actor was overridden");
+}
+// An agent id that would be read as a flag is not passed as one.
+if (actorFor(["r", "bundle"], "--actor").length !== 0) problems.push("an agent id shaped like a flag was passed");
+
+for (const problem of problems) console.log(`::error::openclaw recall: ${problem}`);
+process.exit(problems.length ? 1 : 0);
+JS
+  plugin="$PWD/harnesses/openclaw/memory-plugin/index.mjs"
+  node "$work/recall-assertions.mjs" "$plugin" "$memwork/bin" || status=1
+  [ "$status" -eq 0 ] && note "injects structure; fails open on no reader, no binary, a refusal, \
+garbage and no answer; and an empty match reads differently"
+
+  echo "→ the fail-open assertions can fail: breaking each one is caught"
+  # Two agents this week shipped a guard that silently allowed everything. The way that ships is
+  # assertions that pass whatever the code does, so each claim is checked by breaking it on a copy
+  # and requiring the run to go red.
+  mutant_dir="$work/mutants"
+  mkdir -p "$mutant_dir"
+  survived=0
+  mutate() {
+    local name="$1" expression="$2" out="$mutant_dir/$1.mjs"
+    sed "$expression" "$plugin" > "$out"
+    cmp -s "$out" "$plugin" && {
+      fail "mutant $name changed nothing, so it proves nothing"
+      return
+    }
+    if node "$work/recall-assertions.mjs" "$out" "$memwork/bin" >/dev/null 2>&1; then
+      fail "mutant $name survived: the assertions do not exercise that path"
+      survived=1
+    else
+      note "mutant $name was caught"
+    fi
+  }
+  # A failure that injects whatever it has: the fail-open path stops being distinguishable from a hit.
+  mutate injects-on-failure 's/outcome?.kind === "recalled" ?/outcome?.kind !== "impossible" ?/'
+  # A quiet store reported as a broken one: the distinction the log exists to keep.
+  mutate empty-as-failure 's/answer({ kind: "empty" });/answer({ kind: "unavailable", why: "no rows" });/'
+  # A lookup that ran out of time inventing an answer instead of admitting it.
+  mutate timeout-invents 's|child.kill("SIGKILL");|answer({ kind: "recalled", context: "invented", count: 1 }); return;|'
+  [ "$survived" -eq 0 ] || fail "the fail-open path is asserted rather than exercised"
+else
+  fail "node is not installed, so the recall plugin's outcome path went untested"
+fi
 
 if [ "$status" -eq 0 ]; then
-  echo "glue: clean — installers parse, wire a hook, and the hook refuses"
+  echo "glue: clean — installers parse, the hook refuses, and recall fails open"
 fi
 exit "$status"

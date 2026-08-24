@@ -1,0 +1,215 @@
+#!/usr/bin/env bash
+# Wires the read half into an OpenClaw deployment: a plugin that owns `plugins.slots.memory` and
+# recalls from this deployment's own memory service before a reply.
+#
+# Separate from install.sh because it is separate work. That script installs the tool policy, and
+# every line of it is generated from spec/tool-policy.json; recall is not a tool rule, and a policy
+# generator emitting memory config would put a setting the policy has no opinion on into output the
+# policy is supposed to own.
+#
+# Idempotent, and it never writes the harness's config file — that file is one large JSON5 document
+# holding credentials, so this prints the fragment to merge and the validated command that merges it.
+# `--apply` runs that command; without it nothing outside the plugin directory is touched.
+set -euo pipefail
+
+here="$(cd "$(dirname "$0")" && pwd)"
+
+PLUGIN_ID="harness-memory"
+READER="${HARNESS_YAAM_READ:-$HOME/.local/bin/yaam-read}"
+OPENCLAW="${HARNESS_OPENCLAW:-openclaw}"
+CONFIG=""
+PLUGIN_DIR="${HARNESS_OPENCLAW_MEMORY_PLUGIN_DIR:-$HOME/.local/share/harness/openclaw-memory-plugin}"
+AGENT="main"
+SOCKET=""
+BUDGET_MS=5000
+MAX_RECORDS=8
+MAX_CHARS=2000
+APPLY=0
+
+usage() {
+  cat <<'USAGE'
+usage: harnesses/openclaw/install-memory.sh [--config FILE] [--plugin-dir DIR] [--agent NAME]
+                                            [--reader PATH] [--socket PATH] [--budget-ms MS]
+                                            [--openclaw CMD] [--apply]
+
+  --config FILE     the harness config to merge into. Default follows the documented order:
+                    $OPENCLAW_CONFIG_PATH, $OPENCLAW_STATE_DIR/openclaw.json, ~/.openclaw/openclaw.json
+  --plugin-dir DIR  where the recall plugin is installed
+                    (default ~/.local/share/harness/openclaw-memory-plugin)
+  --agent NAME      agent whose read socket recall goes through          (default main)
+  --reader PATH     the read tool to spawn                              (default ~/.local/bin/yaam-read)
+  --socket PATH     the sidecar's read socket
+                    (default ~/.local/state/harness/sockets/<agent>.read.sock)
+  --budget-ms MS    how long one lookup gets, in front of a reply        (default 5000)
+  --openclaw CMD    the harness CLI, used to apply                       (default openclaw on PATH)
+  --apply           merge the fragment with `openclaw config patch`. Without this, nothing outside
+                    the plugin directory is written and the commands are printed instead.
+USAGE
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --config)      CONFIG="$2"; shift 2 ;;
+    --plugin-dir)  PLUGIN_DIR="$2"; shift 2 ;;
+    --agent)       AGENT="$2"; shift 2 ;;
+    --reader)      READER="$2"; shift 2 ;;
+    --socket)      SOCKET="$2"; shift 2 ;;
+    --budget-ms)   BUDGET_MS="$2"; shift 2 ;;
+    --openclaw)    OPENCLAW="$2"; shift 2 ;;
+    --apply)       APPLY=1; shift ;;
+    -h|--help)     usage; exit 0 ;;
+    *)             echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+case "$BUDGET_MS" in
+  ''|*[!0-9]*) echo "--budget-ms takes milliseconds: $BUDGET_MS" >&2; exit 2 ;;
+esac
+[ "$BUDGET_MS" -gt 0 ] || { echo "--budget-ms must be positive" >&2; exit 2; }
+
+# A reader that is not there would be wired anyway and fail open on every turn — quietly enough that
+# a deployment could run for weeks believing it had recall. Refused here instead.
+command -v "$READER" >/dev/null 2>&1 || [ -x "$READER" ] || {
+  echo "read tool not found: $READER — install it, or pass --reader" >&2
+  exit 1
+}
+
+[ -n "$SOCKET" ] || SOCKET="$HOME/.local/state/harness/sockets/$AGENT.read.sock"
+
+# The documented resolution order, replicated rather than asked of the CLI so this gives the same
+# answer when the CLI is not installed — and because the answer decides whether we refuse.
+if [ -z "$CONFIG" ]; then
+  if [ -n "${OPENCLAW_CONFIG_PATH:-}" ]; then
+    CONFIG="$OPENCLAW_CONFIG_PATH"
+  elif [ -n "${OPENCLAW_STATE_DIR:-}" ]; then
+    CONFIG="$OPENCLAW_STATE_DIR/openclaw.json"
+  else
+    CONFIG="$HOME/.openclaw/openclaw.json"
+  fi
+fi
+
+# No config means no deployment to wire. Writing one from here would produce a file the harness has
+# never validated, so this stops instead.
+[ -f "$CONFIG" ] || {
+  echo "no harness config at $CONFIG — set it up first, or pass --config" >&2
+  exit 1
+}
+
+# A plugin directory holding some other plugin is not ours to overwrite.
+manifest="$PLUGIN_DIR/openclaw.plugin.json"
+if [ -f "$manifest" ]; then
+  found="$(sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$manifest" | head -1)"
+  [ "$found" = "$PLUGIN_ID" ] || {
+    echo "$PLUGIN_DIR already holds the plugin '$found' — pass a different --plugin-dir" >&2
+    exit 1
+  }
+fi
+
+mkdir -p "$PLUGIN_DIR"
+for file in openclaw.plugin.json package.json index.mjs; do
+  install -m 0644 "$here/memory-plugin/$file" "$PLUGIN_DIR/$file"
+done
+echo "→ installed the recall plugin in $PLUGIN_DIR"
+
+# Two budgets, and the wider one is the host's. The host does default this hook to 15s, but 15s in
+# front of a reply is a conversation that looks hung; and the host's own timeout says only that a
+# hook failed, where the plugin's says whether the store was quiet or the reader was.
+HOST_MS=$((BUDGET_MS * 2))
+
+# The socket is on the command line here, unlike the write path, which takes it from the environment.
+# The reason there was an allowlist pattern that would have had to match a socket path; nothing
+# matches this argv, and a plugin spawning from the gateway's own environment is a weaker thing to
+# depend on than an argument this file wrote.
+fragment="$PLUGIN_DIR/config-fragment.json"
+cat > "$fragment" <<JSON
+{
+  "plugins": {
+    "load": {
+      "paths": ["$PLUGIN_DIR"]
+    },
+    "slots": {
+      "memory": "$PLUGIN_ID"
+    },
+    "entries": {
+      "$PLUGIN_ID": {
+        "enabled": true,
+        "hooks": {
+          "timeouts": {
+            "before_prompt_build": $HOST_MS
+          }
+        },
+        "config": {
+          "read": ["$READER", "bundle", "--socket", "$SOCKET"],
+          "timeoutMs": $BUDGET_MS,
+          "maxRecords": $MAX_RECORDS,
+          "maxChars": $MAX_CHARS
+        }
+      },
+      "active-memory": {
+        "enabled": false
+      }
+    }
+  }
+}
+JSON
+echo "→ wrote $fragment"
+
+if [ "$APPLY" -eq 1 ]; then
+  command -v "$OPENCLAW" >/dev/null 2>&1 || [ -x "$OPENCLAW" ] || {
+    echo "harness CLI not found: $OPENCLAW — needed for --apply, or merge by hand" >&2
+    exit 1
+  }
+  # A patch replaces an array rather than extending it, so an existing load path would be dropped.
+  # Refused rather than merged blind: this harness's other plugin — the guard — lives on that list,
+  # and dropping it would unwire the tool policy to install recall.
+  existing="$("$OPENCLAW" config get plugins.load.paths 2>/dev/null || true)"
+  case "$existing" in
+    ''|'[]'|'null'|*"$PLUGIN_DIR"*) ;;
+    *)
+      echo "plugins.load.paths already holds entries a patch would replace:" >&2
+      echo "  $existing" >&2
+      echo "add \"$PLUGIN_DIR\" to that array by hand, then re-run without --apply" >&2
+      exit 1
+      ;;
+  esac
+  "$OPENCLAW" config patch --file "$fragment" --dry-run
+  "$OPENCLAW" config patch --file "$fragment"
+  echo "→ merged $fragment into $CONFIG"
+else
+  cat <<MERGE
+
+$CONFIG was left alone. Merge the fragment with one validated write:
+
+  $OPENCLAW config patch --file "$fragment" --dry-run   # schema-checks it, writes nothing
+  $OPENCLAW config patch --file "$fragment"
+
+A patch replaces arrays rather than extending them, and the guard plugin lives on the same list.
+Check it first, and add the directory to what is already there instead if that list is not empty:
+
+  $OPENCLAW config get plugins.load.paths
+MERGE
+fi
+
+cat <<NEXT
+
+What the fragment claims, so it can be checked rather than trusted:
+
+  plugins.slots.memory = $PLUGIN_ID   one plugin owns memory, and naming it disables the built-in
+  plugins.entries.active-memory.enabled = false   nothing else may inject memory into a prompt
+
+Neither is decoration. Leave the slot unset and the built-in memory plugin fills it on a first-come
+basis, and two things answer "what do we remember" from two stores.
+
+Check the reader answers before restarting anything, with no model in the loop:
+
+  $READER bundle --socket "$SOCKET" --limit 3
+
+Expect JSON with a records array — an empty one is a valid answer and exits 0. Exit 9 means the
+socket is not being served; check the sidecar for agent "$AGENT" is running and that this is the
+\`.read.sock\` rather than the record socket beside it.
+
+Then restart the gateway and confirm the plugin loaded and took the slot:
+
+  $OPENCLAW plugins doctor
+  $OPENCLAW plugins inspect $PLUGIN_ID --runtime --json
+NEXT
