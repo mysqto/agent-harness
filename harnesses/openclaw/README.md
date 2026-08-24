@@ -57,11 +57,13 @@ handler can return `{ block: true, blockReason }` — so `plugin/index.mjs` is t
 the call to the guard and turn a non-zero exit into that refusal. It decides nothing; adding a rule
 never means editing it.
 
-**Every failure blocks.** A guard that is not configured, cannot be started, or does not answer in
-time is the same answer as a guard that refused, because "we could not tell" and "it was fine" are
-different things and only one of them is safe. The budget the plugin gives the host is twice the one
-it enforces on itself, so the plugin's own refusal always lands before a host-side hook timeout could
-decide anything.
+**Every failure blocks, on both sides of the boundary.** A guard that is not configured, cannot be
+started, or does not answer in time is the same answer as a guard that refused, because "we could not
+tell" and "it was fine" are different things and only one of them is safe. The plugin never throws and
+never resolves to "allow" on a failure, and the harness agrees: a `before_tool_call` handler that
+throws is caught and turned into a blocked call, not a permitted one. The budget the plugin gives the
+host is twice the one it enforces on itself, so the plugin's own refusal — which carries a reason
+naming the policy rule — always lands before a host-side hook timeout could answer with a generic one.
 
 ## The write path needs nothing new
 
@@ -150,3 +152,7 @@ reading a different policy than you think — pass `--policy` explicitly and try
 
 That checks the guard. To check the *plugin* is loaded, restart the gateway and confirm it appears in
 `openclaw plugins`; a load path pointing at nothing loads silently.
+
+The plugin directory is discovered the ordinary way — a directory holding `openclaw.plugin.json` and
+an `index.mjs`, named in `plugins.load.paths`. No packaging step, and nothing imported from the
+harness itself, so the plugin cannot break on a harness upgrade that moves an internal module.
