@@ -78,6 +78,176 @@ check '{"tool_name":"Bash","tool_input":{"command":"ls && sudo rm -rf ~"}}' 2
 check '{"tool_name":"WebFetch","tool_input":{"url":"https://unlisted.test/x"}}' 2
 check '{"tool_name":"Read","tool_input":{"file_path":"README.md"}}' 0
 
+## OpenClaw ###################################################################
+# This harness reaches the tool-call boundary through a plugin rather than a hook command, and its
+# config is one large file holding credentials. So what is tested here is different: that the
+# installer refuses to touch that file, that the fragment it prints is real, and that the plugin
+# fails closed.
+
+oc="harnesses/openclaw/install.sh"
+ocwork="$work/openclaw"
+mkdir -p "$ocwork/state" "$ocwork/plug"
+config="$ocwork/state/openclaw.json"
+printf '{"gateway":{"port":19001}}\n' > "$config"
+
+echo "→ the openclaw installer refuses a target that is not there"
+set +e
+"$oc" --guard "$guard" --config "$ocwork/state/absent.json" --plugin-dir "$ocwork/plug" \
+  >/dev/null 2>&1
+code=$?
+set -e
+[ "$code" -ne 0 ] || fail "the installer succeeded with no config to merge into"
+
+echo "→ installing beside a config it must not touch"
+before="$(cat "$config")"
+"$oc" --guard "$guard" --policy "$PWD/spec/tool-policy.json" \
+  --config "$config" --plugin-dir "$ocwork/plug" >/dev/null
+fragment="$ocwork/plug/config-fragment.json"
+[ -f "$fragment" ] || fail "no config fragment was written"
+for file in index.mjs openclaw.plugin.json package.json; do
+  [ -f "$ocwork/plug/$file" ] || fail "the plugin is missing $file"
+done
+[ "$(cat "$config")" = "$before" ] || fail "the installer edited the live config"
+
+echo "→ the fragment is valid JSON and carries what it claims"
+python3 - "$fragment" "$ocwork/plug" <<'PY' || status=1
+import json, sys
+fragment, plugin_dir = sys.argv[1], sys.argv[2]
+config = json.load(open(fragment))
+problems = []
+
+exec_gate = config.get("tools", {}).get("exec", {})
+if exec_gate.get("security") != "allowlist":
+    problems.append(f"exec security is {exec_gate.get('security')!r}, not the default-deny posture")
+if exec_gate.get("ask") != "on-miss":
+    problems.append(f"exec ask is {exec_gate.get('ask')!r}, so a miss would not reach a person")
+
+plugins = config.get("plugins", {})
+paths = plugins.get("load", {}).get("paths", [])
+if paths != [plugin_dir]:
+    problems.append(f"load paths are {paths}, not the directory the plugin was installed to")
+if any("${" in path for path in paths):
+    problems.append("a placeholder survived into the fragment, so the plugin would never load")
+
+entry = plugins.get("entries", {}).get("harness-tool-policy")
+if not entry:
+    problems.append("the guard plugin has no entry, so it is installed and not enabled")
+else:
+    if entry.get("enabled") is not True:
+        problems.append("the guard plugin entry is not enabled")
+    argv = entry.get("config", {}).get("guard")
+    if not isinstance(argv, list) or not argv:
+        problems.append(f"the guard is {argv!r}, not an argv the plugin can spawn")
+    elif "--harness" not in argv or "openclaw" not in argv:
+        problems.append(f"the guard argv does not select this harness: {argv}")
+
+# The one thing this harness must NOT claim: its node deny list matches command ids, not shell text.
+rendered = json.dumps(config)
+if "denyCommands" in rendered:
+    problems.append("the fragment claims a command deny list this harness cannot apply")
+
+for problem in problems:
+    print(f"::error::generated fragment: {problem}")
+sys.exit(1 if problems else 0)
+PY
+
+echo "→ the guard the fragment names refuses and permits"
+# Read the argv the plugin would spawn, so what is exercised is the fragment's own wiring rather
+# than a command line this script composed.
+mapfile -t ocargv < <(python3 -c \
+  'import json,sys; print(*json.load(open(sys.argv[1]))["plugins"]["entries"]["harness-tool-policy"]["config"]["guard"], sep="\n")' \
+  "$fragment")
+occheck() {
+  local payload="$1" expected="$2" code
+  set +e
+  printf '%s' "$payload" | "${ocargv[@]}" >/dev/null 2>&1
+  code=$?
+  set -e
+  if [ "$code" != "$expected" ]; then
+    fail "openclaw: expected exit $expected, got $code, for $payload"
+  else
+    note "exit $code — $payload"
+  fi
+}
+occheck '{"toolName":"exec","params":{"command":"cat ~/.ssh/id_rsa"}}' 2
+occheck '{"toolName":"exec","params":{"command":"ls && sudo rm -rf ~"}}' 2
+occheck '{"toolName":"web_fetch","params":{"url":"https://unlisted.test/x"}}' 2
+occheck '{"toolName":"apply_patch","params":{},"derivedPaths":["/etc/crontab"]}' 2
+occheck '{"toolName":"read","params":{"path":"README.md"}}' 0
+
+echo "→ a second run changes nothing"
+digest="$(cat "$fragment" "$ocwork/plug/index.mjs" | cksum)"
+"$oc" --guard "$guard" --policy "$PWD/spec/tool-policy.json" \
+  --config "$config" --plugin-dir "$ocwork/plug" >/dev/null
+[ "$(cat "$fragment" "$ocwork/plug/index.mjs" | cksum)" = "$digest" ] \
+  || fail "a second run rewrote the plugin or the fragment differently"
+[ "$(cat "$config")" = "$before" ] || fail "a second run edited the live config"
+
+echo "→ it will not overwrite somebody else's plugin directory"
+other="$ocwork/other"
+mkdir -p "$other"
+printf '{"id":"some-other-plugin"}\n' > "$other/openclaw.plugin.json"
+set +e
+"$oc" --guard "$guard" --config "$config" --plugin-dir "$other" >/dev/null 2>&1
+code=$?
+set -e
+[ "$code" -ne 0 ] || fail "the installer overwrote a directory holding another plugin"
+grep -q 'some-other-plugin' "$other/openclaw.plugin.json" \
+  || fail "the other plugin's manifest was replaced"
+
+echo "→ --apply refuses to drop load paths a patch would replace"
+stub="$ocwork/bin"
+mkdir -p "$stub"
+cat > "$stub/openclaw" <<'STUB'
+#!/usr/bin/env bash
+# Enough of the harness CLI to answer the one question the installer asks before it applies.
+if [ "$1" = "config" ] && [ "$2" = "get" ]; then
+  echo '["/opt/somebody-elses-plugin"]'
+  exit 0
+fi
+echo "stub: refusing to run $*" >&2
+exit 1
+STUB
+chmod +x "$stub/openclaw"
+set +e
+"$oc" --guard "$guard" --config "$config" --plugin-dir "$ocwork/plug" \
+  --openclaw "$stub/openclaw" --apply >/dev/null 2>&1
+code=$?
+set -e
+[ "$code" -ne 0 ] || fail "--apply would have replaced an existing plugins.load.paths"
+
+echo "→ the plugin fails closed"
+if command -v node >/dev/null 2>&1; then
+  node --input-type=module - "$guard" <<'JS' || status=1
+import { consult } from "./harnesses/openclaw/plugin/index.mjs";
+
+const guard = [process.argv[2], "check", "--harness", "openclaw"];
+const silent = { warn() {} };
+const problems = [];
+const blocked = (result) => Boolean(result && result.block);
+
+// A refusal the policy makes, and a call it permits: the plugin must pass both through unchanged.
+if (!blocked(await consult(guard, 5000, { toolName: "exec", params: { command: "cat ~/.ssh/id_rsa" } }, silent)))
+  problems.push("a denied call was let through");
+if (blocked(await consult(guard, 5000, { toolName: "read", params: { path: "README.md" } }, silent)))
+  problems.push("a permitted call was blocked");
+
+// Every way the guard can fail to answer has to end in a refusal, not a pass.
+if (!blocked(await consult([], 5000, { toolName: "exec", params: { command: "ls" } }, silent)))
+  problems.push("an unconfigured guard let a call through");
+if (!blocked(await consult(["/nonexistent/guard"], 5000, { toolName: "exec", params: { command: "ls" } }, silent)))
+  problems.push("a guard that cannot be started let a call through");
+if (!blocked(await consult(["/bin/sleep", "5"], 150, { toolName: "exec", params: { command: "ls" } }, silent)))
+  problems.push("a guard that never answered let a call through");
+
+for (const problem of problems) console.log(`::error::openclaw plugin: ${problem}`);
+process.exit(problems.length ? 1 : 0);
+JS
+  [ "$status" -eq 0 ] && note "refuses on deny, on no guard, on no binary and on no answer"
+else
+  fail "node is not installed, so the plugin's decision path went untested"
+fi
+
 if [ "$status" -eq 0 ]; then
   echo "glue: clean — installers parse, wire a hook, and the hook refuses"
 fi

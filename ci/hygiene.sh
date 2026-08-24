@@ -5,8 +5,12 @@
 set -uo pipefail
 
 # Extend as needed. Case-insensitive, word-boundary matched where sensible.
+#
+# `openclaw` came off this list when harnesses/openclaw/ landed: it names a third-party harness this
+# repo ships glue for, so it is public vocabulary rather than borrowed. That reasoning does not extend
+# to anything else here — a harness name being sayable is not a licence for a deployment's own nouns.
 DENY=(
-  'wego' 'bamboohr' 'sprinklr' 'wenrix' 'openclaw' 'hermes'
+  'wego' 'bamboohr' 'sprinklr' 'wenrix' 'hermes'
   'payment_ref' 'booking_ref' 'partner_ref'
   '@wego' 'PAY-[0-9]' 'p9zy63u53v' 'WFVQZ'
 )

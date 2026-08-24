@@ -15,7 +15,7 @@ usage() {
 usage: setup/install.sh [--adapter NAME] [--harness NAME] [--prefix DIR] [--memory-url URL]
 
   --adapter NAME     adapter to install from adapters/ (cli, webhook)
-  --harness NAME     harness to wire the tool policy into, from harnesses/ (claude-code)
+  --harness NAME     harness to wire the tool policy into, from harnesses/ (claude-code, openclaw)
   --prefix DIR       where binaries go            (default ~/.local)
   --memory-url URL   memory service base URL      (default http://127.0.0.1:8080)
 

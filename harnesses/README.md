@@ -33,6 +33,12 @@ Layer 2 does not check whether layer 1 ran, and layer 1 does not check whether l
 That independence is the point: each is a complete control on its own, and the generated config
 carries the hook wiring so installing one installs both.
 
+**How layer 2 attaches is the harness's business.** Some harnesses run a hook command and read its
+exit code; others only reach the tool-call boundary from inside a plugin. Either way the guard is a
+separate process the harness spawns, so the mechanism changes and the control does not — and a
+harness that offers no such attachment point can carry layer 1 alone, provided its installer says so
+rather than implying five layers where there are four.
+
 A generator may **omit** a rule its harness cannot express — the hook still enforces it — but it must
 never emit an *allow* the policy does not grant. Layer 1 is a convenience; layer 2 is the control.
 
@@ -52,3 +58,4 @@ opens when it is confused is not a guard.
 | Harness | Config it writes | Notes |
 |---|---|---|
 | `claude-code/` | `.claude/settings.json` | Path and command denies plus the `PreToolUse` hook. |
+| `openclaw/` | nothing — it prints a fragment | The exec gate, plus a plugin that spawns the guard. |

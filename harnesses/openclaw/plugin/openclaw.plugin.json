@@ -1,0 +1,31 @@
+{
+  "id": "harness-tool-policy",
+  "name": "Harness tool policy",
+  "description": "Refuses a tool call the declared tool policy denies.",
+  "activation": {
+    "onStartup": true
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "guard": {
+        "type": "array",
+        "items": { "type": "string" },
+        "title": "Guard argv",
+        "description": "The guard to spawn, as argv. Written by harnesses/openclaw/install.sh; an empty or missing value refuses every tool call rather than passing it."
+      },
+      "timeoutMs": {
+        "type": "integer",
+        "exclusiveMinimum": 0,
+        "title": "Guard timeout (ms)",
+        "description": "How long the guard gets to answer before the call is refused for want of an answer."
+      },
+      "policyVersion": {
+        "type": "integer",
+        "title": "Policy version",
+        "description": "Version of the tool policy this fragment was generated from, so a stale config is visible."
+      }
+    }
+  }
+}
