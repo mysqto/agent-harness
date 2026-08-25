@@ -77,10 +77,58 @@ const DEFAULT_MAX_CHARS = 2000;
 const STDOUT_CAP = 262_144;
 const STDERR_CAP = 4096;
 
+/** The read shape the fallback uses when the bundle matched nothing. */
+const SEARCH_SHAPE = "search";
+
+/**
+ * Most terms one fallback needle carries.
+ *
+ * A needle is an OR of quoted words, and every extra word widens what ranks. Enough for a question
+ * a person asked; short of turning a pasted log into a query.
+ */
+const MAX_SEARCH_TERMS = 12;
+
+/** Shortest word worth searching for. Below this a token is punctuation or an article. */
+const MIN_TERM_CHARS = 3;
+
+/**
+ * Words dropped from a needle.
+ *
+ * Not a general stoplist: full-text ranking already discounts what is common. These are the words
+ * that turn up in the *framing* of a question rather than its subject, so an OR containing them
+ * ranks every record that ever used them alongside the one the question is about.
+ */
+const SEARCH_STOPWORDS = new Set([
+  "the", "and", "for", "with", "you", "your", "what", "when", "where", "which", "who", "why", "how",
+  "any", "are", "was", "were", "has", "have", "had", "did", "does", "can", "could", "would", "should",
+  "this", "that", "these", "those", "there", "here", "about", "from", "into", "our", "know",
+  "knowledge", "memory", "remember", "anything", "something", "please", "tell", "give", "get",
+]);
+
+/**
+ * How little of the budget is still worth a second lookup.
+ *
+ * The fallback shares one deadline with the bundle rather than getting its own: the outer bound this
+ * hook registers is what stands between recall and a reply that looks hung, and a fallback that
+ * could double the wait would spend a bound someone else set.
+ */
+const MIN_FALLBACK_MS = 600;
+
 /** What the injected block says it is. The model is told the shape it is getting, not just the text. */
 const HEADING =
   "Recalled from this deployment's memory. Record structure only — these are frontmatter fields, " +
   "not the records' contents.";
+
+/**
+ * What the fallback's block says it is, and it says something different on purpose.
+ *
+ * A bundle is composed: the service gathered records around keys and reports when the gathering was
+ * partial. A search is ranked: these records contain words from the question, which is a weaker
+ * claim, and a model told otherwise would present a keyword hit as an established connection.
+ */
+const SEARCH_HEADING =
+  "Found by searching this deployment's memory for words in this message — these records mention " +
+  "them and may not be about them. Record structure only, not the records' contents.";
 
 /**
  * The bounds this plugin adds to the configured argv.
@@ -236,7 +284,7 @@ function line(record) {
  * Whatever is cut is counted. A capped list that reads as the whole truth is the failure this is
  * guarding against: the model would treat "eight records" as "everything there is", and act on it.
  */
-function renderContext(answer, limits) {
+function renderContext(answer, limits, heading = HEADING) {
   const records = Array.isArray(answer?.records) ? answer.records : [];
   if (records.length === 0) return "";
 
@@ -261,7 +309,52 @@ function renderContext(answer, limits) {
         "Safe to answer a question from, not safe to act on.",
     );
   }
-  return [HEADING, ...lines, ...notes].join("\n");
+  return [heading, ...lines, ...notes].join("\n");
+}
+
+/**
+ * The same reader and socket, asked for the search shape instead of the bundle.
+ *
+ * Derived from the configured argv rather than configured separately: the two reads differ by one
+ * word, and a second argv to keep in step is a second thing to get wrong — a fallback pointed at
+ * another socket would answer from another store without saying so.
+ *
+ * Returns nothing when the configured argv does not name the bundle shape, which `unusable` has
+ * already refused by then.
+ */
+function searchArgv(argv) {
+  const at = argv.indexOf(READ_SHAPE);
+  if (at < 0) return undefined;
+  const swapped = argv.slice();
+  swapped[at] = SEARCH_SHAPE;
+  return swapped;
+}
+
+/**
+ * A full-text needle built from the message, or nothing if the message carries no subject.
+ *
+ * Every word is quoted and the words are OR-ed. Quoting is not cosmetic: the needle is a match
+ * expression the index parses, so an unquoted `?` from an ordinary question is a syntax error and
+ * the whole read is refused — which is exactly how the first version of this failed.
+ *
+ * OR rather than AND because this runs only after the bundle matched nothing: the precise question
+ * has already been asked and missed, and what is left worth doing is ranking whatever mentions any
+ * of these words. The reader's own `--limit` is what keeps that honest.
+ */
+function needleFrom(text) {
+  if (typeof text !== "string") return undefined;
+  const seen = new Set();
+  const terms = [];
+  for (const raw of text.split(/[^A-Za-z0-9_-]+/)) {
+    if (terms.length >= MAX_SEARCH_TERMS) break;
+    const word = raw.trim();
+    if (word.length < MIN_TERM_CHARS) continue;
+    const folded = word.toLowerCase();
+    if (SEARCH_STOPWORDS.has(folded) || seen.has(folded)) continue;
+    seen.add(folded);
+    terms.push(`"${word}"`);
+  }
+  return terms.length > 0 ? terms.join(" OR ") : undefined;
 }
 
 /** The reason a lookup could not be made at all, decided before anything is spawned. */
@@ -307,7 +400,11 @@ async function recall(settings, turn) {
   const why = unusable(argv);
   if (why) return { kind: "unavailable", why, asked: named };
 
-  const args = [
+  // One deadline for however many reads happen, so the outer bound this hook registered still means
+  // what it says.
+  const deadline = Date.now() + budgetMs;
+
+  const asked = [
     ...argv.slice(1),
     ...entitiesFor(argv, named),
     ...inferenceFor(argv, settings?.specDir, turn?.text),
@@ -315,20 +412,89 @@ async function recall(settings, turn) {
     ...bounds(argv, budgetMs, limits.maxRecords),
   ];
 
+  const first = await once(argv[0], asked, budgetMs);
+  if (first.kind === "failed") return { kind: "unavailable", why: first.why, asked: named };
+  if (first.records.length > 0) {
+    return composed(first, limits, HEADING, { asked: named, via: READ_SHAPE });
+  }
+
+  // The bundle answered and matched nothing. Everything below is the second question, and it is a
+  // different question: not "what is filed under these keys" but "what mentions these words".
+  const fallback = fallbackFor(settings, argv, turn, deadline);
+  if (!fallback) return { kind: "empty", asked: named };
+
+  const second = await once(argv[0], fallback.args, fallback.budgetMs);
+  // A failed fallback is still an empty bundle, not an outage: the precise read succeeded and found
+  // nothing, which is an answer. Reporting it as unavailable would call a working store broken.
+  if (second.kind === "failed") {
+    return { kind: "empty", asked: named, fallbackFailed: second.why };
+  }
+  if (second.records.length === 0) return { kind: "empty", asked: named, searched: true };
+  return composed(second, limits, SEARCH_HEADING, { asked: named, via: SEARCH_SHAPE });
+}
+
+/**
+ * The fallback read, or nothing when it is switched off, has no needle, or has no time.
+ *
+ * Three ways to decline, and each is the ordinary case for some turn: a deployment that wants only
+ * what its keys support, a message with no subject in it, and a bundle that used the budget.
+ */
+function fallbackFor(settings, argv, turn, deadline) {
+  if (settings?.searchFallback === false) return undefined;
+  const needle = needleFrom(turn?.text);
+  if (!needle) return undefined;
+  const left = deadline - Date.now();
+  if (left < MIN_FALLBACK_MS) return undefined;
+  const argvSearch = searchArgv(argv);
+  if (!argvSearch) return undefined;
+  return {
+    args: [...argvSearch.slice(1), "--query", needle, ...bounds(argvSearch, left, settings?.maxRecords ?? DEFAULT_MAX_RECORDS)],
+    budgetMs: left,
+  };
+}
+
+/** An answer with records in it, rendered — or the failure that none of them fit. */
+function composed(answer, limits, heading, extra) {
+  const context = renderContext(answer, limits, heading);
+  if (!context) {
+    // Records matched, and not one of them fit the ceiling. Distinct from an empty match: the fix is
+    // a bigger ceiling, not a fuller store.
+    return {
+      kind: "unavailable",
+      why: `${answer.records.length} record(s) matched and none fit within ${limits.maxChars} characters`,
+      ...extra,
+    };
+  }
+  return {
+    kind: "recalled",
+    context,
+    count: answer.records.length,
+    degraded: answer.degraded === true,
+    tokenEstimate: Number.isFinite(answer.token_estimate) ? answer.token_estimate : undefined,
+    ...extra,
+  };
+}
+
+/**
+ * One reader invocation, bounded and parsed. Never rejects.
+ *
+ * Resolves `{kind: "answer", records, degraded, token_estimate}` or `{kind: "failed", why}`. The
+ * caller decides what a failure means, because it does not mean the same thing for the read that
+ * carries the question and the read that follows it.
+ */
+function once(argv0, args, budgetMs) {
   return new Promise((resolve) => {
     let settled = false;
-    const answer = (outcome) => {
+    const done = (outcome) => {
       if (settled) return;
       settled = true;
-      // Every outcome carries what was asked about, so the log can say whether an empty answer was
-      // a quiet store or a turn that had nothing to ask with.
-      resolve({ ...outcome, asked: named });
+      resolve(outcome);
     };
-    const failed = (reason) => answer({ kind: "unavailable", why: reason });
+    const failed = (why) => done({ kind: "failed", why });
 
     let child;
     try {
-      child = spawn(argv[0], args, { stdio: ["ignore", "pipe", "pipe"] });
+      child = spawn(argv0, args, { stdio: ["ignore", "pipe", "pipe"] });
     } catch (error) {
       failed(`the reader could not be started: ${error?.message ?? error}`);
       return;
@@ -370,24 +536,7 @@ async function recall(settings, turn) {
         failed("the reader answered a shape with no records in it");
         return;
       }
-      if (parsed.records.length === 0) {
-        answer({ kind: "empty" });
-        return;
-      }
-      const context = renderContext(parsed, limits);
-      if (!context) {
-        // Records matched, and not one of them fit the ceiling. Distinct from an empty match: the
-        // fix is a bigger ceiling, not a fuller store.
-        failed(`${parsed.records.length} record(s) matched and none fit within ${limits.maxChars} characters`);
-        return;
-      }
-      answer({
-        kind: "recalled",
-        context,
-        count: parsed.records.length,
-        degraded: parsed.degraded === true,
-        tokenEstimate: Number.isFinite(parsed.token_estimate) ? parsed.token_estimate : undefined,
-      });
+      done({ kind: "answer", ...parsed });
     });
   });
 }
@@ -479,6 +628,11 @@ export default {
 // Exported for tests: the outcome path is worth exercising without a gateway around it.
 export {
   recall,
+  once,
+  composed,
+  fallbackFor,
+  searchArgv,
+  needleFrom,
   renderContext,
   injectionFrom,
   report,
@@ -492,6 +646,10 @@ export {
   unusable,
   PLUGIN_ID,
   READ_SHAPE,
+  SEARCH_SHAPE,
+  SEARCH_HEADING,
+  MAX_SEARCH_TERMS,
+  MIN_FALLBACK_MS,
   THREAD_MARKER,
   MAX_INFER_CHARS,
   DEFAULT_TIMEOUT_MS,

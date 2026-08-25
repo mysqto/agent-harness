@@ -369,7 +369,7 @@ printf '{"gateway":{"port":19002}}\n' > "$memconfig"
 reader() { echo "$memwork/bin/reader-$1"; }
 cat > "$(reader records)" <<'STUB'
 #!/usr/bin/env bash
-[ -n "${READER_ARGS_FILE:-}" ] && printf '%s\n' "$*" > "$READER_ARGS_FILE"
+[ -n "${READER_ARGS_FILE:-}" ] && printf '%s\n' "$*" >> "$READER_ARGS_FILE"
 cat <<'JSON'
 {"records":[
  {"record_id":"01AAAA","received_at":"2026-01-01T00:00:00Z","action":"deploy","outcome":"ok",
@@ -382,8 +382,24 @@ JSON
 STUB
 cat > "$(reader empty)" <<'STUB'
 #!/usr/bin/env bash
-[ -n "${READER_ARGS_FILE:-}" ] && printf '%s\n' "$*" > "$READER_ARGS_FILE"
+[ -n "${READER_ARGS_FILE:-}" ] && printf '%s\n' "$*" >> "$READER_ARGS_FILE"
 printf '{"records":[],"degraded":false,"omitted":[],"token_estimate":0}'
+STUB
+# Empty for the bundle, a hit for the search: the only reader that can tell the two reads apart, and
+# the only way to exercise a fallback that fires because the precise question missed.
+cat > "$(reader fallback)" <<'STUB'
+#!/usr/bin/env bash
+[ -n "${READER_ARGS_FILE:-}" ] && printf '%s\n' "$*" >> "$READER_ARGS_FILE"
+if [ "${1:-}" = "search" ]; then
+  cat <<'JSON'
+{"records":[{"record_id":"01SEARCH","received_at":"2026-01-05T00:00:00Z","action":"import",
+ "outcome":"success","agent":"memory_import","entities":[],"attrs":{"source":"2026-03-13.md"},
+ "tags":["imported"]}],
+ "degraded":false,"omitted":[],"token_estimate":18}
+JSON
+else
+  printf '{"records":[],"degraded":false,"omitted":[],"token_estimate":0}'
+fi
 STUB
 cat > "$(reader degraded)" <<'STUB'
 #!/usr/bin/env bash
@@ -403,7 +419,7 @@ STUB
 # to name the thread cannot pass by being answered anyway.
 cat > "$(reader thread)" <<'STUB'
 #!/usr/bin/env bash
-[ -n "${READER_ARGS_FILE:-}" ] && printf '%s\n' "$*" > "$READER_ARGS_FILE"
+[ -n "${READER_ARGS_FILE:-}" ] && printf '%s\n' "$*" >> "$READER_ARGS_FILE"
 case " $* " in
   *"--entity=chat_thread:c0example/1700000000.000100"*)
     cat <<'JSON'
@@ -577,7 +593,7 @@ if command -v node >/dev/null 2>&1; then
 const [, , modulePath, binDir] = process.argv;
 const mod = await import(modulePath);
 const { recall, renderContext, injectionFrom, report, bounds, actorFor, turnOf, threadOf, HEADING,
-        MAX_INFER_CHARS } = mod;
+        MAX_INFER_CHARS, needleFrom, searchArgv, SEARCH_SHAPE, SEARCH_HEADING } = mod;
 
 const problems = [];
 const reader = (name, ...rest) => [`${binDir}/reader-${name}`, "bundle", ...rest];
@@ -759,6 +775,65 @@ const configured = await (async () => {
 })();
 if (configured.includes("--entity=")) problems.push(`a configured --entity was added to: ${configured.trim()}`);
 
+// --- the search fallback -----------------------------------------------------------------------
+// A bundle that matched nothing asks a second, weaker question. These assertions are about keeping
+// the two apart: what it asks, that it says which one answered, and that it can be switched off.
+const fellBack = await (async () => {
+  const file = `${binDir}/../fallback-args`;
+  process.env.READER_ARGS_FILE = file;
+  const outcome = await recall({ ...wired, read: reader("fallback") },
+    turnOf(wired, { prompt: "any knowledge abou this? WUPGHGJ7ELJM626" }, {
+      agentId: "main", channelId: "c0example:thread:1700000000.000100",
+    }));
+  delete process.env.READER_ARGS_FILE;
+  const asked = (await import("node:fs")).readFileSync(file, "utf8").trim().split("\n");
+  return { outcome, asked };
+})();
+if (fellBack.asked.length !== 2) {
+  problems.push(`an empty bundle did not fall back to a search: ${fellBack.asked.join(" | ")}`);
+} else {
+  const [first, second] = fellBack.asked;
+  if (!first.startsWith("bundle")) problems.push(`the first read was not the bundle: ${first}`);
+  if (!second.startsWith("search")) problems.push(`the fallback was not the search shape: ${second}`);
+  // The needle is what the first version got wrong: an unquoted question mark is a syntax error the
+  // index refuses, so every term is quoted and the framing words are not terms at all.
+  if (!second.includes('"WUPGHGJ7ELJM626"')) problems.push(`the needle lost the identifier: ${second}`);
+  if (second.includes("?")) problems.push(`the needle carried punctuation the index will refuse: ${second}`);
+  for (const framing of ['"any"', '"knowledge"', '"this"']) {
+    if (second.includes(framing)) problems.push(`the needle searched for a framing word ${framing}: ${second}`);
+  }
+}
+// A search hit is a weaker claim than a composed bundle, and the block has to say so or a model
+// presents a keyword match as an established connection.
+if (fellBack.outcome?.kind !== "recalled") {
+  problems.push(`the fallback did not recall: ${JSON.stringify(fellBack.outcome)}`);
+} else {
+  if (fellBack.outcome.via !== SEARCH_SHAPE) problems.push(`the outcome did not say it came from a search: ${fellBack.outcome.via}`);
+  if (!fellBack.outcome.context.startsWith(SEARCH_HEADING)) {
+    problems.push(`a search hit was injected under the bundle's heading: ${fellBack.outcome.context.slice(0, 80)}`);
+  }
+}
+// Off is off, and an empty bundle stays an empty answer.
+const noFallback = await (async () => {
+  const file = `${binDir}/../nofallback-args`;
+  process.env.READER_ARGS_FILE = file;
+  const outcome = await recall({ ...wired, searchFallback: false, read: reader("empty") },
+    turnOf(wired, { prompt: "any knowledge abou this? WUPGHGJ7ELJM626" }, { agentId: "main", channelId: "c0example" }));
+  delete process.env.READER_ARGS_FILE;
+  return { outcome, asked: (await import("node:fs")).readFileSync(file, "utf8").trim().split("\n") };
+})();
+if (noFallback.asked.length !== 1) problems.push(`searchFallback:false still searched: ${noFallback.asked.join(" | ")}`);
+if (noFallback.outcome?.kind !== "empty") problems.push(`with the fallback off an empty bundle was not empty: ${noFallback.outcome?.kind}`);
+// A question with no subject in it is not worth a second lookup.
+if (needleFrom("do you remember anything about this?") !== undefined) {
+  problems.push("a message of nothing but framing words produced a needle");
+}
+// The fallback reads the same store: same reader, same socket, one word different.
+const swapped = searchArgv(["yaam-read", "bundle", "--socket", "/srv/x.sock"]);
+if (swapped.join(" ") !== "yaam-read search --socket /srv/x.sock") {
+  problems.push(`the fallback did not reuse the reader and socket: ${swapped.join(" ")}`);
+}
+
 for (const problem of problems) console.log(`::error::openclaw recall: ${problem}`);
 process.exit(problems.length ? 1 : 0);
 JS
@@ -791,7 +866,15 @@ garbage and no answer; and an empty match reads differently"
   # A failure that injects whatever it has: the fail-open path stops being distinguishable from a hit.
   mutate injects-on-failure 's/outcome?.kind === "recalled" ?/outcome?.kind !== "impossible" ?/'
   # A quiet store reported as a broken one: the distinction the log exists to keep.
-  mutate empty-as-failure 's/answer({ kind: "empty" });/answer({ kind: "unavailable", why: "no rows" });/'
+  mutate empty-as-failure 's/if (!fallback) return { kind: "empty", asked: named };/if (!fallback) return { kind: "unavailable", why: "no rows" };/'
+  # The fallback presenting a ranked keyword hit as a composed bundle: the provenance the second
+  # heading exists to keep. This is the mutant that matters most about the fallback -- everything
+  # else it could get wrong is visible, and this one reads as a better answer than it is.
+  mutate search-as-bundle 's/return composed(second, limits, SEARCH_HEADING, { asked: named, via: SEARCH_SHAPE });/return composed(second, limits, HEADING, { asked: named, via: READ_SHAPE });/'
+  # A needle that keeps the question mark: the syntax error that made the first version useless.
+  mutate needle-unquoted 's/terms.push(`"${word}"`);/terms.push(word);/'
+  # A fallback that fires whatever the config says.
+  mutate fallback-ignores-config 's/if (settings?.searchFallback === false) return undefined;/if (false) return undefined;/'
   # A lookup that ran out of time inventing an answer instead of admitting it.
   mutate timeout-invents 's|child.kill("SIGKILL");|answer({ kind: "recalled", context: "invented", count: 1 }); return;|'
   # A turn that stops naming its thread. This is the failure the plugin was built to end, and it has

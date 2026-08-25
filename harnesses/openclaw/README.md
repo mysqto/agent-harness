@@ -247,13 +247,39 @@ not decide it —
 
 `--actor` is the agent the host names for the run, appended when the argv does not already name one;
 the socket decides what that agent is allowed to see, so asking about an actor never widens scope.
-`search` was the alternative and needs a needle, which means deriving one from the user's prose — a
-step with no honest implementation that does not put a model in this path. Prose *is* read now, and
-the reason that is not the same decision is below: it is read by the deployment's own extraction
-rules, inside the reader, and what comes out are lookup keys rather than an answer.
+`search` was the alternative and needs a needle, which means deriving one from the user's prose.
+This file used to say that had no honest implementation short of putting a model in the path. That
+was too strong, and `search` now runs as a *fallback* — see below. What stands is the ordering:
+`bundle` is the read that carries the question, and search is what is left when it missed.
 
 A partial bundle is rendered as partial, and a capped list says how many rows it left out. A short
 list that reads as the whole truth is a list the model will act on.
+
+### The search fallback, and why it is second
+
+A bundle matches on keys. Where a deployment has records with no entity references at all — an
+imported corpus, most obviously — no key reaches them and no amount of inference invents one. That is
+not a store with nothing in it, and recall reporting `matched nothing` says the same words for both.
+
+So a bundle that matched nothing is followed by one `search`, on the same reader and the same socket
+with one word swapped. Three things keep it from being a second, sloppier bundle:
+
+- **It says which read answered.** The block carries a different heading: records that *mention* the
+  words in a message, which may not be records *about* them. A model told otherwise presents a
+  keyword hit as an established connection, and that is the failure mode of ranked retrieval.
+- **The needle is built, not passed through.** Every term is quoted and joined with `OR`, and the
+  framing words a question is made of (`any`, `knowledge`, `this`, `remember`) are dropped rather
+  than searched for. Quoting is not cosmetic: the needle is a match expression the index parses, so
+  an unquoted `?` from an ordinary question is a syntax error that refuses the whole read. A message
+  with nothing but framing in it produces no needle and no second lookup.
+- **It shares one deadline.** The fallback takes what is left of the budget the bundle did not use,
+  and is skipped below a floor. The outer bound this hook registers is what stands between recall
+  and a reply that looks hung, and a fallback that could double the wait would spend a bound
+  somebody else set.
+
+A fallback that fails is still an empty bundle rather than an outage: the precise read succeeded and
+found nothing, which is an answer. `config.searchFallback: false` turns it off for a deployment that
+wants only what its keys support.
 
 ### What a turn can say about itself
 
