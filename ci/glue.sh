@@ -398,6 +398,24 @@ cat > "$(reader refused)" <<'STUB'
 echo "the service refused this request (400): unknown parameter" >&2
 exit 8
 STUB
+# Answers one read and one only: the one naming the thread its record was filed under. Anything else
+# gets the empty page a bundle returns for an entity nothing was written about — so a turn that fails
+# to name the thread cannot pass by being answered anyway.
+cat > "$(reader thread)" <<'STUB'
+#!/usr/bin/env bash
+[ -n "${READER_ARGS_FILE:-}" ] && printf '%s\n' "$*" > "$READER_ARGS_FILE"
+case " $* " in
+  *"--entity=chat_thread:c0example/1700000000.000100"*)
+    cat <<'JSON'
+{"records":[{"record_id":"01THREAD","received_at":"2026-01-04T00:00:00Z","action":"note",
+ "outcome":"ok","agent":"someone_else",
+ "entities":[{"kind":"chat_thread","id":"c0example/1700000000.000100"}],
+ "attrs":{},"tags":[]}],"degraded":false,"omitted":[],"token_estimate":31}
+JSON
+    ;;
+  *) printf '{"records":[],"degraded":false,"omitted":[],"token_estimate":0}' ;;
+esac
+STUB
 cat > "$(reader garbage)" <<'STUB'
 #!/usr/bin/env bash
 printf 'not json at all'
@@ -466,6 +484,14 @@ else:
             problems.append(f"the reader argv names no bundle read: {argv}")
         if "--socket" not in argv:
             problems.append(f"the reader argv names no socket: {argv}")
+    # What lets a bundle name the turn. Without a thread kind every turn asks about the actor alone,
+    # which is the shape of empty answer this plugin was rewired to stop producing.
+    if not entry.get("config", {}).get("threadEntity"):
+        problems.append("no threadEntity, so a turn in a thread asks about nothing but its actor")
+    # And the spec directory is off unless asked for: this script cannot guess where one lives, and
+    # an invented path would make every turn spend a lookup on a read the reader refuses.
+    if "specDir" in entry.get("config", {}):
+        problems.append("a specDir was wired that nobody asked for")
     budget = entry.get("config", {}).get("timeoutMs")
     host = entry.get("hooks", {}).get("timeouts", {}).get("before_prompt_build")
     if not isinstance(budget, int) or not isinstance(host, int):
@@ -482,6 +508,36 @@ for problem in problems:
     print(f"::error::generated fragment: {problem}")
 sys.exit(1 if problems else 0)
 PY
+
+echo "→ the recall installer refuses a spec directory that is not one"
+set +e
+"$ocmem" --config "$memconfig" --plugin-dir "$memwork/plug" --reader "$(reader records)" \
+  --spec-dir "$memwork/bin" >/dev/null 2>&1
+code=$?
+set -e
+[ "$code" -ne 0 ] || fail "the recall installer wired a spec directory holding no entity rules"
+
+echo "→ a spec directory that is one reaches the config the plugin reads"
+mkdir -p "$memwork/spec"
+printf 'version: 1\nkinds: {}\n' > "$memwork/spec/entities.yaml"
+printf 'version: 1\ndefaults:\n  window: 4\n  confidence: 0.7\nkinds: {}\n' \
+  > "$memwork/spec/extractors.yaml"
+"$ocmem" --config "$memconfig" --plugin-dir "$memwork/plug" --reader "$(reader records)" \
+  --socket "$memwork/state/main.read.sock" --agent main --spec-dir "$memwork/spec" \
+  --thread-kind chat_thread >/dev/null
+python3 - "$memfragment" "$memwork/spec" <<'TURNCFG' || status=1
+import json, sys
+config = json.load(open(sys.argv[1]))["plugins"]["entries"]["harness-memory"]["config"]
+if config.get("specDir") != sys.argv[2]:
+    print(f"::error::generated fragment: specDir is {config.get('specDir')!r}")
+    sys.exit(1)
+if config.get("threadEntity") != "chat_thread":
+    print(f"::error::generated fragment: threadEntity is {config.get('threadEntity')!r}")
+    sys.exit(1)
+TURNCFG
+# Put the fragment back to what the rest of this section asserts about.
+"$ocmem" --config "$memconfig" --plugin-dir "$memwork/plug" --reader "$(reader records)" \
+  --socket "$memwork/state/main.read.sock" --agent main >/dev/null
 
 echo "→ a second run changes nothing"
 memdigest="$(cat "$memfragment" "$memwork/plug/index.mjs" | cksum)"
@@ -520,7 +576,8 @@ if command -v node >/dev/null 2>&1; then
 // the directory holding the stand-in readers.
 const [, , modulePath, binDir] = process.argv;
 const mod = await import(modulePath);
-const { recall, renderContext, injectionFrom, report, bounds, actorFor, HEADING } = mod;
+const { recall, renderContext, injectionFrom, report, bounds, actorFor, turnOf, threadOf, HEADING,
+        MAX_INFER_CHARS } = mod;
 
 const problems = [];
 const reader = (name, ...rest) => [`${binDir}/reader-${name}`, "bundle", ...rest];
@@ -531,7 +588,7 @@ const recorder = () => {
 const said = (log, level) => log.lines.filter(([at]) => at === level).map(([, m]) => m).join("\n");
 
 // A lookup that found something reaches the injection point, as structure and not as prose.
-const found = await recall({ read: reader("records") }, "builder");
+const found = await recall({ read: reader("records") }, { agentId: "builder" });
 const injected = injectionFrom(found);
 if (found.kind !== "recalled") problems.push(`a bundle with records gave ${found.kind}: ${found.why ?? ""}`);
 if (!injected?.prependContext) problems.push("a bundle with records injected nothing");
@@ -545,7 +602,7 @@ else {
 
 // An empty match: no context, and a line saying the store was quiet rather than broken.
 const emptyLog = recorder();
-const empty = await recall({ read: reader("empty") }, "builder");
+const empty = await recall({ read: reader("empty") }, { agentId: "builder" });
 report(empty, emptyLog);
 if (empty.kind !== "empty") problems.push(`an empty bundle gave ${empty.kind}`);
 if (injectionFrom(empty) !== undefined) problems.push("an empty bundle injected something");
@@ -562,7 +619,7 @@ for (const [label, settings] of [
   ["a reader that never answered", { read: reader("slow"), timeoutMs: 200 }],
 ]) {
   const log = recorder();
-  const outcome = await recall(settings, "builder");
+  const outcome = await recall(settings, { agentId: "builder" });
   report(outcome, log);
   if (outcome.kind !== "unavailable") problems.push(`${label} gave ${outcome.kind}, not unavailable`);
   if (injectionFrom(outcome) !== undefined) problems.push(`${label} injected context`);
@@ -572,7 +629,7 @@ for (const [label, settings] of [
 }
 
 // A partial bundle is safe to answer from and unsafe to act on, so it has to say so.
-const partial = await recall({ read: reader("degraded") }, "builder");
+const partial = await recall({ read: reader("degraded") }, { agentId: "builder" });
 if (partial.kind !== "recalled" || !partial.degraded) problems.push("a degraded bundle did not report itself");
 if (!/partial/i.test(injectionFrom(partial)?.prependContext ?? "")) {
   problems.push("a degraded bundle injected a block that reads as complete");
@@ -588,7 +645,7 @@ if (!/2 further record/.test(capped)) problems.push("a capped list did not say w
 // The bounds the plugin adds, and the actor the host supplied, reach the process it spawns.
 const argsFile = `${binDir}/../args`;
 process.env.READER_ARGS_FILE = argsFile;
-await recall({ read: reader("empty"), timeoutMs: 4000, maxRecords: 3 }, "builder");
+await recall({ read: reader("empty"), timeoutMs: 4000, maxRecords: 3 }, { agentId: "builder" });
 delete process.env.READER_ARGS_FILE;
 const passed = (await import("node:fs")).readFileSync(argsFile, "utf8");
 for (const expected of ["--limit 3", "--deadline-ms 2000", "--timeout-ms 3200", "--actor builder"]) {
@@ -598,11 +655,109 @@ for (const expected of ["--limit 3", "--deadline-ms 2000", "--timeout-ms 3200", 
 if (bounds(["r", "bundle", "--limit", "1"], 5000, 8).includes("--limit")) {
   problems.push("a configured --limit was overridden");
 }
-if (actorFor(["r", "bundle", "--actor", "other"], "builder").length !== 0) {
+if (actorFor(["r", "bundle", "--actor", "other"], { agentId: "builder" }).length !== 0) {
   problems.push("a configured --actor was overridden");
 }
 // An agent id that would be read as a flag is not passed as one.
 if (actorFor(["r", "bundle"], "--actor").length !== 0) problems.push("an agent id shaped like a flag was passed");
+
+// ── What a turn can tell a bundle about itself ────────────────────────────────────────────────────
+// A bundle composes context out of entities and an actor. Asking about the actor alone is what left
+// every turn empty, so what is checked here is that the two things the hook payload does carry — the
+// conversation and the message — actually reach the read.
+
+// The host spells a threaded run's conversation id with the thread inside it; a record joins on the
+// two either side of a slash.
+const wired = { threadEntity: "chat_thread", specDir: "/srv/memory/spec" };
+if (threadOf("c0example:thread:1700000000.000100") !== "c0example/1700000000.000100") {
+  problems.push(`a threaded conversation id did not become an entity: ${threadOf("c0example:thread:1700000000.000100")}`);
+}
+// Not in a thread is an absence, not a fault: nothing is invented for it.
+for (const flat of ["c0example", "", ":thread:1700000000.000100", undefined]) {
+  if (threadOf(flat) !== undefined) problems.push(`${JSON.stringify(flat)} was read as a thread`);
+}
+
+// The whole payload, as the harness hands it over: `event` carries the prompt, `ctx` the ids.
+const threaded = turnOf(wired, { prompt: "  any news on this?  ", messages: [] }, {
+  agentId: "main",
+  channelId: "c0example:thread:1700000000.000100",
+});
+if (threaded.entities[0] !== "chat_thread:c0example/1700000000.000100") {
+  problems.push(`the turn did not name its thread: ${JSON.stringify(threaded.entities)}`);
+}
+if (threaded.text !== "any news on this?") problems.push(`the message did not reach the turn: ${threaded.text}`);
+if (threaded.agentId !== "main") problems.push("the actor was lost");
+
+// The one that matters: a turn in a thread finds the record filed under that thread. The reader
+// answers nothing for any other read, so this cannot pass by being answered anyway.
+const recalled = await recall({ ...wired, read: reader("thread") }, threaded);
+if (recalled.kind !== "recalled") {
+  problems.push(`a turn in a thread recalled nothing: ${recalled.kind} ${recalled.why ?? ""}`);
+} else if (!injectionFrom(recalled)?.prependContext.includes("chat_thread:c0example/1700000000.000100")) {
+  problems.push("the recalled record did not come back as the thread's");
+}
+
+// A turn that is in no thread and says nothing that reads as one asks about the actor alone, and the
+// empty answer that comes back is an empty answer — the turn proceeds, and nothing is injected.
+const bare = turnOf(wired, { prompt: "", messages: [] }, { agentId: "main", channelId: "c0example" });
+if (bare.entities.length !== 0 || bare.text !== undefined) problems.push("a bare turn invented something to ask about");
+const bareLog = recorder();
+const bareOutcome = await recall({ ...wired, read: reader("thread") }, bare);
+report(bareOutcome, bareLog);
+if (bareOutcome.kind !== "empty") problems.push(`a bare turn gave ${bareOutcome.kind}`);
+if (injectionFrom(bareOutcome) !== undefined) problems.push("a bare turn injected something");
+if (said(bareLog, "warn")) problems.push(`a bare turn warned: ${said(bareLog, "warn")}`);
+// And the same turn against a reader that cannot answer still lets the turn through.
+const brokenLog = recorder();
+const broken = await recall({ ...wired, read: reader("absent") }, bare);
+report(broken, brokenLog);
+if (broken.kind !== "unavailable") problems.push(`a bare turn with no reader gave ${broken.kind}`);
+if (injectionFrom(broken) !== undefined) problems.push("a failed bare turn injected something");
+if (!/recall unavailable/.test(said(brokenLog, "warn"))) problems.push("a failed bare turn was not warned about");
+
+// The message and the rules to read it with travel together, and never one without the other.
+const inferFile = `${binDir}/../infer-args`;
+process.env.READER_ARGS_FILE = inferFile;
+await recall({ ...wired, read: reader("empty") }, turnOf(wired, { prompt: "closing ticket PROJ-42" }, {
+  agentId: "main",
+  channelId: "c0example:thread:1700000000.000100",
+}));
+delete process.env.READER_ARGS_FILE;
+const inferred = (await import("node:fs")).readFileSync(inferFile, "utf8");
+for (const expected of [
+  "--entity=chat_thread:c0example/1700000000.000100",
+  "--infer-entities=/srv/memory/spec",
+  "--infer-from=closing ticket PROJ-42",
+]) {
+  if (!inferred.includes(expected)) problems.push(`the reader was not given ${expected}: ${inferred.trim()}`);
+}
+// No spec directory means no inference, rather than a flag the reader refuses for want of its pair.
+const halfFile = `${binDir}/../half-args`;
+process.env.READER_ARGS_FILE = halfFile;
+await recall({ threadEntity: "chat_thread", read: reader("empty") },
+  turnOf({ threadEntity: "chat_thread" }, { prompt: "closing ticket PROJ-42" }, { agentId: "main" }));
+delete process.env.READER_ARGS_FILE;
+const half = (await import("node:fs")).readFileSync(halfFile, "utf8");
+for (const absent of ["--infer-entities", "--infer-from", "--entity"]) {
+  if (half.includes(absent)) problems.push(`an unconfigured lookup still passed ${absent}: ${half.trim()}`);
+}
+// An entity kind the config never named is a vocabulary this harness does not get to invent.
+if (turnOf({}, { prompt: "x" }, { channelId: "c0example:thread:1700000000.000100" }).entities.length !== 0) {
+  problems.push("a thread was looked up under an entity kind nothing configured");
+}
+// A message longer than one argument may be keeps its end, which is where this turn is.
+const long = turnOf(wired, { prompt: `${"x".repeat(MAX_INFER_CHARS * 2)} ticket PROJ-42` }, {});
+if (long.text.length !== MAX_INFER_CHARS) problems.push(`a long message was not capped: ${long.text.length}`);
+if (!long.text.endsWith("ticket PROJ-42")) problems.push("capping a long message dropped its end");
+// Anything an operator wired by hand stays theirs.
+const configured = await (async () => {
+  const file = `${binDir}/../configured-args`;
+  process.env.READER_ARGS_FILE = file;
+  await recall({ ...wired, read: [`${binDir}/reader-empty`, "bundle", "--entity", "ticket:PROJ-9"] }, threaded);
+  delete process.env.READER_ARGS_FILE;
+  return (await import("node:fs")).readFileSync(file, "utf8");
+})();
+if (configured.includes("--entity=")) problems.push(`a configured --entity was added to: ${configured.trim()}`);
 
 for (const problem of problems) console.log(`::error::openclaw recall: ${problem}`);
 process.exit(problems.length ? 1 : 0);
@@ -639,6 +794,13 @@ garbage and no answer; and an empty match reads differently"
   mutate empty-as-failure 's/answer({ kind: "empty" });/answer({ kind: "unavailable", why: "no rows" });/'
   # A lookup that ran out of time inventing an answer instead of admitting it.
   mutate timeout-invents 's|child.kill("SIGKILL");|answer({ kind: "recalled", context: "invented", count: 1 }); return;|'
+  # A turn that stops naming its thread. This is the failure the plugin was built to end, and it has
+  # no symptom of its own: recall just goes quiet, exactly as it does on a genuinely empty store.
+  mutate thread-never-found 's|const at = channelId.indexOf(THREAD_MARKER);|const at = -1;|'
+  # The thread named under a separator no record joins on, which is the same silence one step later.
+  mutate thread-mis-spelled 's|return `${conversation}/${thread}`;|return `${conversation}:${thread}`;|'
+  # The message never read for entities, so the other half of the lookup goes missing.
+  mutate message-never-read 's|if (!text \|\| typeof specDir !== "string"|if (true \|\| typeof specDir !== "string"|'
   [ "$survived" -eq 0 ] || fail "the fail-open path is asserted rather than exercised"
 else
   fail "node is not installed, so the recall plugin's outcome path went untested"
