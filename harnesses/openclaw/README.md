@@ -97,8 +97,13 @@ that had to match a socket path would break the first time the path changed.
 Recall is wired, by a second plugin and a second installer:
 
 ```sh
-harnesses/openclaw/install-memory.sh --config ~/.openclaw/openclaw.json --agent main
+harnesses/openclaw/install-memory.sh --config ~/.openclaw/openclaw.json --agent main \
+  --thread-kind chat_thread --spec-dir /srv/memory/spec
 ```
+
+The last two are what let a bundle name the turn rather than only its actor; see *[What a turn can
+say about itself](#what-a-turn-can-say-about-itself)*. Both are optional and both are off by
+default — the plugin says at load which of them is unwired.
 
 Separate from `install.sh` because it is separate work. Everything that script emits is generated from
 `spec/tool-policy.json`; recall is not a tool rule, and a policy generator emitting memory settings
@@ -115,6 +120,7 @@ would put a decision the policy has no opinion on into output the policy owns.
         "hooks": { "timeouts": { "before_prompt_build": 10000 } },
         "config": {
           "read": ["…/yaam-read", "bundle", "--socket", "…/main.read.sock"],
+          "threadEntity": "chat_thread", "specDir": "/srv/memory/spec",
           "timeoutMs": 5000, "maxRecords": 8, "maxChars": 2000
         }
       },
@@ -242,10 +248,66 @@ not decide it —
 `--actor` is the agent the host names for the run, appended when the argv does not already name one;
 the socket decides what that agent is allowed to see, so asking about an actor never widens scope.
 `search` was the alternative and needs a needle, which means deriving one from the user's prose — a
-step with no honest implementation that does not put a model in this path.
+step with no honest implementation that does not put a model in this path. Prose *is* read now, and
+the reason that is not the same decision is below: it is read by the deployment's own extraction
+rules, inside the reader, and what comes out are lookup keys rather than an answer.
 
 A partial bundle is rendered as partial, and a capped list says how many rows it left out. A short
 list that reads as the whole truth is a list the model will act on.
+
+### What a turn can say about itself
+
+A bundle composes context out of **entities** and an **actor**. The first version of this plugin sent
+the actor and nothing else, which meant every turn asked "what has this agent done lately" — and in a
+deployment whose records were written by an importer and a bot, under names no live turn ever runs
+as, the honest answer was nothing. Every time. It logged `matched nothing`, which was true, and it
+never once looked wrong.
+
+The hook's payload is the fix, and it is worth being exact about what it does and does not carry.
+`before_prompt_build` receives `(event, ctx)`: `event` has `prompt` and `messages`, `ctx` has
+identifiers and no content. There is **no thread field on either** — nothing named `threadId`,
+`thread_ts` or `conversation`. Two things are reachable, and both become lookups:
+
+| What | Where it comes from | What it becomes |
+|---|---|---|
+| the conversation | `ctx.channelId` | `--entity <threadEntity>:<conversation>/<thread>` |
+| the message | `event.prompt` | `--infer-entities <specDir> --infer-from <text>` |
+
+**The thread arrives inside the conversation id, not beside it.** The host builds `ctx.channelId`
+from the session key, and a threaded run's key ends `…:thread:<id>`; splitting on that is the only
+route from this hook to a thread. It is the one shape here that belongs to the harness rather than to
+the deployment, and a harness that changed it would make recall go quiet rather than fail — so a turn
+that yields no thread is a fact the log carries, and two of the mutation tests exist to prove the
+assertion about it can fail.
+
+**A caveat that will bite a deployment with imported history.** The host case-folds the conversation
+half of that id for most chat providers. An entity kind whose `normalise` is `[trim]` therefore will
+not match an identifier that was stored with its original case — the two are different keys. The
+reconciliation belongs in the deployment's own `spec/entities.yaml` (fold the case there, or fold it
+in the importer); this plugin will not invent a case it was not given, because guessing one would
+produce keys that look right and match nothing.
+
+**Reading the message is a read-time inference, and that is a different bar from a write.** The
+reader's `--infer-entities` runs the deployment's own `extractors.yaml` over `--infer-from`. At write
+time an inferred reference becomes a stored join key, which is why those rules stay below the
+high-confidence floor and why a bundle joins only on references a record states at `1.0`. Here the
+output is a lookup key: it matches records that reference it at full confidence, or it matches
+nothing. A wrong guess costs one wasted lookup rather than a permanent falsehood, so this may infer
+where a writer may not — and nothing about what reaches a bundle has been loosened.
+
+Both settings are off unless configured, and neither has a default this harness could invent: an
+entity vocabulary and a spec directory both belong to the deployment. The plugin says at load which
+of them is unwired, at info, because an operator wondering why recall is thin should not have to read
+the source to find out.
+
+```
+harness-memory: no thread is looked up: set config.threadEntity to the entity kind this deployment files conversations under
+harness-memory: the message is not read for entities: set config.specDir to the deployment's spec directory
+```
+
+A flag an operator already put in the configured argv is left alone, as the bounds are: `--entity`,
+`--infer-entities` and `--infer-from` in the config are that operator's choice, and this adds none of
+its own beside them.
 
 ### Checking recall
 
@@ -257,6 +319,27 @@ Expect JSON with a `records` array; an empty one is a valid answer and exits 0. 
 is serving that socket — check the sidecar, and check this is the `.read.sock` and not the record
 socket beside it. No key is involved at any point: the sidecar signs on the caller's behalf, which is
 why the plugin can spawn a reader and hold nothing.
+
+Check the two turn settings separately, because each fails silently on its own. The reader's dry run
+needs no socket and no service:
+
+```sh
+yaam-read bundle --dry-run --entity chat_thread:c0example/1700000000.000100   # the thread half
+yaam-read bundle --dry-run --infer-entities /srv/memory/spec \
+          --infer-from "any news on ticket PROJ-42?"                          # the message half
+```
+
+The second should print a request whose `entity` parameter names what that sentence mentions. If it
+prints one with no `entity` at all, the deployment's `extractors.yaml` anchors nothing in that
+sentence — which is a rules question, not a wiring one. And an empty answer from the live socket now
+says what it asked about, which is the first thing to check when it stays empty:
+
+```
+harness-memory: the memory service matched nothing (asked about chat_thread:c0example/…); the turn proceeds with no recalled context
+harness-memory: the memory service matched nothing (asked about nothing in particular); …
+```
+
+The second line is a wiring problem. The first is a store that has nothing about this thread yet.
 
 ```sh
 openclaw plugins doctor

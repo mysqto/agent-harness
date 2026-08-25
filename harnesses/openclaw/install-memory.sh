@@ -21,6 +21,11 @@ CONFIG=""
 PLUGIN_DIR="${HARNESS_OPENCLAW_MEMORY_PLUGIN_DIR:-$HOME/.local/share/harness/openclaw-memory-plugin}"
 AGENT="main"
 SOCKET=""
+# The two things that let a bundle name this turn. Neither has a path this script could guess, and
+# the entity kind is a deployment's vocabulary rather than this harness's — so both are flags, and
+# the plugin says at load which of them is unwired.
+THREAD_KIND="chat_thread"
+SPEC_DIR=""
 BUDGET_MS=5000
 MAX_RECORDS=8
 MAX_CHARS=2000
@@ -40,6 +45,10 @@ usage: harnesses/openclaw/install-memory.sh [--config FILE] [--plugin-dir DIR] [
   --reader PATH     the read tool to spawn                              (default ~/.local/bin/yaam-read)
   --socket PATH     the sidecar's read socket
                     (default ~/.local/state/harness/sockets/<agent>.read.sock)
+  --thread-kind K   entity kind conversations are filed under, so a turn in a thread looks that
+                    thread up. Empty turns it off.                       (default chat_thread)
+  --spec-dir DIR    the deployment's spec directory (entities.yaml, extractors.yaml), so the turn's
+                    message is read for entities too. Empty turns it off.        (default: unset)
   --budget-ms MS    how long one lookup gets, in front of a reply        (default 5000)
   --openclaw CMD    the harness CLI, used to apply                       (default openclaw on PATH)
   --apply           merge the fragment with `openclaw config patch`. Without this, nothing outside
@@ -54,6 +63,8 @@ while [ $# -gt 0 ]; do
     --agent)       AGENT="$2"; shift 2 ;;
     --reader)      READER="$2"; shift 2 ;;
     --socket)      SOCKET="$2"; shift 2 ;;
+    --thread-kind) THREAD_KIND="$2"; shift 2 ;;
+    --spec-dir)    SPEC_DIR="$2"; shift 2 ;;
     --budget-ms)   BUDGET_MS="$2"; shift 2 ;;
     --openclaw)    OPENCLAW="$2"; shift 2 ;;
     --apply)       APPLY=1; shift ;;
@@ -73,6 +84,17 @@ command -v "$READER" >/dev/null 2>&1 || [ -x "$READER" ] || {
   echo "read tool not found: $READER — install it, or pass --reader" >&2
   exit 1
 }
+
+# A spec directory missing its two files would be wired anyway, and every turn would then spend a
+# lookup on a reader that refuses the read. Refused here, where it can still be spelled correctly.
+if [ -n "$SPEC_DIR" ]; then
+  for file in entities.yaml extractors.yaml; do
+    [ -f "$SPEC_DIR/$file" ] || {
+      echo "--spec-dir $SPEC_DIR holds no $file — it names the deployment's spec directory" >&2
+      exit 1
+    }
+  done
+fi
 
 [ -n "$SOCKET" ] || SOCKET="$HOME/.local/state/harness/sockets/$AGENT.read.sock"
 
@@ -120,6 +142,19 @@ HOST_MS=$((BUDGET_MS * 2))
 # The reason there was an allowlist pattern that would have had to match a socket path; nothing
 # matches this argv, and a plugin spawning from the gateway's own environment is a weaker thing to
 # depend on than an argument this file wrote.
+# What the turn can say about itself, emitted only when it was named. An empty string in the config
+# would read as configured and behave as unconfigured, and the plugin's load-time note — which is how
+# an operator finds out — would then be saying the opposite of what the file appears to say.
+TURN=""
+if [ -n "$THREAD_KIND" ]; then
+  TURN="$TURN
+          \"threadEntity\": \"$THREAD_KIND\","
+fi
+if [ -n "$SPEC_DIR" ]; then
+  TURN="$TURN
+          \"specDir\": \"$SPEC_DIR\","
+fi
+
 fragment="$PLUGIN_DIR/config-fragment.json"
 cat > "$fragment" <<JSON
 {
@@ -139,7 +174,7 @@ cat > "$fragment" <<JSON
           }
         },
         "config": {
-          "read": ["$READER", "bundle", "--socket", "$SOCKET"],
+          "read": ["$READER", "bundle", "--socket", "$SOCKET"],$TURN
           "timeoutMs": $BUDGET_MS,
           "maxRecords": $MAX_RECORDS,
           "maxChars": $MAX_CHARS
@@ -196,6 +231,21 @@ What the fragment claims, so it can be checked rather than trusted:
 
   plugins.slots.memory = $PLUGIN_ID   one plugin owns memory, and naming it disables the built-in
   plugins.entries.active-memory.enabled = false   nothing else may inject memory into a prompt
+
+A bundle composes context out of entities and an actor. With neither named, every turn asks about
+the actor alone and gets whatever that agent happened to write — which is nothing at all until this
+agent has written something, and looks exactly like a quiet store. Two settings close that:
+
+  config.threadEntity = ${THREAD_KIND:-<unset>}   a turn inside a thread looks that thread up
+  config.specDir      = ${SPEC_DIR:-<unset>}   the turn's message is read for entities too
+
+The second needs the reader to support \`--infer-entities\`; check with:
+
+  $READER bundle --dry-run --infer-entities "${SPEC_DIR:-/path/to/spec}" --infer-from "ticket PROJ-42"
+
+Expect a request whose \`entity\` parameter names what that sentence mentions. Inference at read time
+is only a lookup key: a key guessed wrongly matches nothing, and the confidence a stored reference
+needs before it reaches a bundle is untouched by it.
 
 Neither is decoration. Leave the slot unset and the built-in memory plugin fills it on a first-come
 basis, and two things answer "what do we remember" from two stores.

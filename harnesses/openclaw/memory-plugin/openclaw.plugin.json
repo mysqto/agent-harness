@@ -21,6 +21,16 @@
         "title": "Reader argv",
         "description": "The reader to spawn, as argv, up to and including the `bundle` subcommand. Written by harnesses/openclaw/install-memory.sh. An argv that is empty, or that names a read shape other than `bundle`, recalls nothing and says so in the log rather than injecting silence."
       },
+      "threadEntity": {
+        "type": "string",
+        "title": "Thread entity kind",
+        "description": "The entity kind this deployment files conversations under, as its spec/entities.yaml declares it. Set it and a turn inside a thread looks that thread up; leave it unset and no thread is asked about. There is no default, because an entity vocabulary belongs to the deployment rather than to this harness."
+      },
+      "specDir": {
+        "type": "string",
+        "title": "Entity spec directory",
+        "description": "The deployment's spec directory, holding entities.yaml and extractors.yaml. Set it and the turn's message is read for entity references, which are looked up alongside the thread and the actor. Read-time inference only: a key guessed wrongly matches nothing, and the confidence a stored reference needs to reach a bundle is untouched."
+      },
       "timeoutMs": {
         "type": "integer",
         "exclusiveMinimum": 0,

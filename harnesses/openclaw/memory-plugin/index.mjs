@@ -17,6 +17,23 @@
 // The one thing that must not blur is *which* of those happened. "The service matched nothing" and
 // "the service could not be asked" call for opposite reactions, so they are separate outcomes here
 // and separate lines in the log.
+//
+// # What this can tell a bundle about the turn
+//
+// A bundle composes context out of *entities* and an *actor*, so a caller that can name neither gets
+// whatever its actor happened to write — and where nothing was ever written under that name, an
+// empty answer every turn that looks exactly like a quiet store. The actor alone was this plugin's
+// first version, and that is the shape of hole it left.
+//
+// Two things the host does hand a `before_prompt_build` handler, and both become lookups:
+//
+//   - **the conversation**, out of `ctx.channelId`. The host derives that from the session key, and
+//     for a threaded run it carries the thread inside it. See `threadOf`.
+//   - **the message**, as `event.prompt`. It goes to the reader's own read-time entity inference,
+//     which turns prose into lookup keys.
+//
+// Neither is a guess this file makes about what the answer should contain. A lookup key that names
+// nothing matches nothing; the deployment's own rules decide what a key even is.
 
 import { spawn } from "node:child_process";
 
@@ -24,6 +41,28 @@ const PLUGIN_ID = "harness-memory";
 
 /** The read shape this injects. Any other shape is a misconfiguration, not a variation. */
 const READ_SHAPE = "bundle";
+
+/**
+ * How the host spells "and this run is inside a thread" in a conversation id.
+ *
+ * The one shape here that is the harness's rather than this deployment's: `ctx.channelId` is built
+ * from the session key, and a threaded run's key ends `…:thread:<id>`. It is the only route from
+ * this hook to the thread — the payload carries no thread field, and nothing else in the context
+ * names one.
+ *
+ * A harness that changed this spelling would leave recall quiet rather than broken, which is why a
+ * turn that yields no thread is reported rather than passed over in silence.
+ */
+const THREAD_MARKER = ":thread:";
+
+/**
+ * Most of the message handed to read-time inference.
+ *
+ * The tail of it, because the host prefixes history and envelope formatting to `event.prompt` and
+ * what this turn is actually about is at the end. A cap at all because this becomes one argument in
+ * an argument list, which has a length the operating system enforces and nothing here would survive.
+ */
+const MAX_INFER_CHARS = 4000;
 
 /** How long the whole lookup gets, in front of a reply. */
 const DEFAULT_TIMEOUT_MS = 5000;
@@ -76,6 +115,84 @@ function actorFor(argv, agentId) {
   const trimmed = agentId.trim();
   if (!trimmed || trimmed.startsWith("-")) return [];
   return ["--actor", trimmed];
+}
+
+/**
+ * The conversation this turn belongs to, as an entity identifier, or nothing.
+ *
+ * `ctx.channelId` is the host's resolved conversation id. For a threaded run it reads
+ * `<conversation><THREAD_MARKER><thread>`, and the identifier a record joins on puts those two
+ * either side of a `/` — so this is a re-spelling, not a derivation.
+ *
+ * Nothing is returned for a run that is not in a thread. That is the ordinary case for a direct
+ * message, and it is an absence rather than a fault: a conversation id with no thread in it names
+ * the conversation, and this plugin has no basis for deciding that a whole conversation is the unit
+ * a deployment files records under.
+ *
+ * **The host case-folds the conversation half** for every provider but a couple, so an identifier
+ * that reaches a record with its original case will not match one built here. That is a fact about
+ * the deployment's own `entities.yaml` — the kind's normalisation is where the two are reconciled —
+ * and not something this file can paper over without inventing a case it was not given.
+ */
+function threadOf(channelId) {
+  if (typeof channelId !== "string") return undefined;
+  const at = channelId.indexOf(THREAD_MARKER);
+  if (at <= 0) return undefined;
+  const conversation = channelId.slice(0, at);
+  const thread = channelId.slice(at + THREAD_MARKER.length);
+  // A comma is how a bundle separates its entity terms, so one inside an identifier arrives as two
+  // and the reader refuses the whole read. Dropped instead: a turn still recalls what it can.
+  if (!thread || conversation.includes(",") || thread.includes(",")) return undefined;
+  return `${conversation}/${thread}`;
+}
+
+/**
+ * What one turn knows about itself, read off the hook's own payload.
+ *
+ * Separated from the lookup so that "what the host gives us" is one function with one place to look
+ * when a harness upgrade changes it. `event` carries `prompt` and `messages` and nothing else;
+ * `ctx` carries identifiers and no content.
+ */
+function turnOf(settings, event, ctx) {
+  const kind = typeof settings?.threadEntity === "string" ? settings.threadEntity.trim() : "";
+  const thread = kind ? threadOf(ctx?.channelId ?? ctx?.chatId) : undefined;
+  const prompt = typeof event?.prompt === "string" ? event.prompt.trim() : "";
+  return {
+    agentId: ctx?.agentId,
+    entities: thread ? [`${kind}:${thread}`] : [],
+    text: prompt ? prompt.slice(-MAX_INFER_CHARS) : undefined,
+  };
+}
+
+/**
+ * The entities this turn can name outright.
+ *
+ * `--entity=` rather than two arguments, here and below, because these values come from a
+ * conversation: one that began with a `-` would be read as a flag, and a turn is not the place to
+ * discover that.
+ */
+function entitiesFor(argv, entities) {
+  if (argv.includes("--entity")) return [];
+  return entities.map((entity) => `--entity=${entity}`);
+}
+
+/**
+ * The message, and the rules to read it with.
+ *
+ * Both or neither: the reader refuses one without the other, and rightly — text nobody read, and
+ * rules nothing was read with, are each a narrower bundle than was asked for. So a deployment that
+ * configured no `specDir`, and a turn that arrived with no message, both add nothing here rather
+ * than half of something.
+ *
+ * What this buys is the other half of the hole the actor left. The reader's inference turns prose
+ * into lookup keys, and a key that names nothing matches nothing — so the bar a *writer* has to
+ * clear before it may infer a reference does not apply, and this may hand over whatever the rules
+ * support.
+ */
+function inferenceFor(argv, specDir, text) {
+  if (!text || typeof specDir !== "string" || !specDir.trim()) return [];
+  if (argv.includes("--infer-entities") || argv.includes("--infer-from")) return [];
+  return [`--infer-entities=${specDir.trim()}`, `--infer-from=${text}`];
 }
 
 /** Reads this plugin's own settings out of the harness config. */
@@ -167,25 +284,34 @@ function unusable(argv) {
 /**
  * Asks the memory service what it remembers.
  *
+ * `turn` is what this turn could say about itself — see `turnOf`. Every part of it is optional: a
+ * bundle with no entity and no actor is a legitimate, and empty, question.
+ *
  * Resolves to one of three outcomes and never rejects: `recalled` with a rendered block, `empty`
  * when the service answered and matched nothing, `unavailable` with a reason when it could not be
  * asked. The caller turns those into an injection and a log line; nothing downstream has to infer
  * which happened from an absent result.
  */
-async function recall(settings, agentId) {
+async function recall(settings, turn) {
   const argv = settings?.read;
   const budgetMs = positive(settings?.timeoutMs, DEFAULT_TIMEOUT_MS);
   const limits = {
     maxRecords: positive(settings?.maxRecords, DEFAULT_MAX_RECORDS),
     maxChars: positive(settings?.maxChars, DEFAULT_MAX_CHARS),
   };
+  // What the turn named, kept for the log. Not what the reader *inferred* from the message: that is
+  // decided inside the reader by the deployment's own rules, and this process never sees the keys it
+  // produced.
+  const named = turn?.entities ?? [];
 
   const why = unusable(argv);
-  if (why) return { kind: "unavailable", why };
+  if (why) return { kind: "unavailable", why, asked: named };
 
   const args = [
     ...argv.slice(1),
-    ...actorFor(argv, agentId),
+    ...entitiesFor(argv, named),
+    ...inferenceFor(argv, settings?.specDir, turn?.text),
+    ...actorFor(argv, turn?.agentId),
     ...bounds(argv, budgetMs, limits.maxRecords),
   ];
 
@@ -194,7 +320,9 @@ async function recall(settings, agentId) {
     const answer = (outcome) => {
       if (settled) return;
       settled = true;
-      resolve(outcome);
+      // Every outcome carries what was asked about, so the log can say whether an empty answer was
+      // a quiet store or a turn that had nothing to ask with.
+      resolve({ ...outcome, asked: named });
     };
     const failed = (reason) => answer({ kind: "unavailable", why: reason });
 
@@ -285,7 +413,13 @@ function report(outcome, logger) {
     return;
   }
   if (outcome?.kind === "empty") {
-    logger?.info?.(`${PLUGIN_ID}: the memory service matched nothing; the turn proceeds with no recalled context`);
+    // Named, because the first question about an empty answer is what was asked. A turn that could
+    // name no entity at all reads as `about nothing in particular`, and that is a different problem
+    // from a store with nothing in it — the fix for one is the wiring, for the other is time.
+    const about = outcome.asked?.length ? outcome.asked.join(", ") : "nothing in particular";
+    logger?.info?.(
+      `${PLUGIN_ID}: the memory service matched nothing (asked about ${about}); the turn proceeds with no recalled context`,
+    );
     return;
   }
   logger?.warn?.(
@@ -309,6 +443,19 @@ export default {
     const why = unusable(settings.read);
     if (why) api?.logger?.warn?.(`${PLUGIN_ID}: ${why}`);
 
+    // The two optional halves, said once each. Neither is a fault — a deployment may want the actor
+    // alone — but each is the difference between a bundle that can name this turn and one that
+    // cannot, and an operator wondering why recall is thin should not have to read this file to
+    // find out which halves are wired.
+    for (const [setting, absent] of [
+      ["threadEntity", "no thread is looked up: set config.threadEntity to the entity kind this deployment files conversations under"],
+      ["specDir", "the message is not read for entities: set config.specDir to the deployment's spec directory"],
+    ]) {
+      if (typeof settings[setting] !== "string" || !settings[setting].trim()) {
+        api?.logger?.info?.(`${PLUGIN_ID}: ${absent}`);
+      }
+    }
+
     const budgetMs = positive(settings.timeoutMs, DEFAULT_TIMEOUT_MS);
 
     // Bounded twice, and the outer bound is this plugin's to lose. The host does default this hook
@@ -319,8 +466,8 @@ export default {
     // the host's generic "the hook failed".
     api.on(
       "before_prompt_build",
-      async (_event, ctx) => {
-        const outcome = await recall(settings, ctx?.agentId);
+      async (event, ctx) => {
+        const outcome = await recall(settings, turnOf(settings, event, ctx));
         report(outcome, api?.logger);
         return injectionFrom(outcome);
       },
@@ -337,10 +484,16 @@ export {
   report,
   bounds,
   actorFor,
+  entitiesFor,
+  inferenceFor,
+  threadOf,
+  turnOf,
   settingsFrom,
   unusable,
   PLUGIN_ID,
   READ_SHAPE,
+  THREAD_MARKER,
+  MAX_INFER_CHARS,
   DEFAULT_TIMEOUT_MS,
   DEFAULT_MAX_RECORDS,
   DEFAULT_MAX_CHARS,
