@@ -53,7 +53,17 @@ pub fn verdict(harness: &str, reason: &str) -> Option<String> {
 ///
 /// `guard_command` is how that harness should invoke the hook, so the generated config wires both
 /// layers from one place and they cannot drift apart.
-pub fn generate(harness: &str, policy: &Policy, guard_command: &str) -> Result<String> {
+///
+/// `backend_args` are argv words to pin on a harness's own model backend, for the one harness that
+/// runs agents through another agent's tool loop. Empty for every other, which is why it is a slice
+/// and not an option: a harness with no such backend has nothing to say about it, and the harness
+/// that has one cannot emit its half of layer 1 without these — see [`openclaw::config`].
+pub fn generate(
+    harness: &str,
+    policy: &Policy,
+    guard_command: &str,
+    backend_args: &[String],
+) -> Result<String> {
     match harness {
         // The policy itself is the config: a harness reading this needs no translation, which is the
         // point of keeping the source of truth harness-agnostic.
@@ -63,7 +73,7 @@ pub fn generate(harness: &str, policy: &Policy, guard_command: &str) -> Result<S
         }),
         "claude-code" => claude_code::settings(policy, guard_command),
         "hermes" => Ok(hermes::hooks(policy, guard_command)),
-        "openclaw" => openclaw::config(policy, guard_command),
+        "openclaw" => openclaw::config(policy, guard_command, backend_args),
         other => Err(Error::UnknownHarness(other.to_string())),
     }
 }
@@ -87,7 +97,7 @@ mod tests {
     #[test]
     fn the_neutral_generator_emits_the_policy_itself() {
         let policy = Policy::baseline().expect("baseline");
-        let emitted = generate("neutral", &policy, "harness-guard").expect("generate");
+        let emitted = generate("neutral", &policy, "harness-guard", &[]).expect("generate");
         let round_tripped = Policy::parse(&emitted, "emitted").expect("parse");
         assert_eq!(round_tripped.secret_paths.len(), policy.secret_paths.len());
     }
@@ -100,7 +110,7 @@ mod tests {
             "unknown harness `emacs`"
         );
         assert_eq!(
-            generate("emacs", &policy, "harness-guard")
+            generate("emacs", &policy, "harness-guard", &[])
                 .expect_err("unknown")
                 .to_string(),
             "unknown harness `emacs`"
@@ -136,7 +146,7 @@ mod tests {
         let policy = Policy::baseline().expect("baseline");
         for harness in KNOWN {
             assert!(
-                generate(harness, &policy, "harness-guard").is_ok(),
+                generate(harness, &policy, "harness-guard", &[]).is_ok(),
                 "{harness} has no generator"
             );
         }

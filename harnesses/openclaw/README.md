@@ -1,8 +1,9 @@
 # OpenClaw
 
-Wires `spec/tool-policy.json` into an OpenClaw deployment: its exec gate is layer 1, and a
-`before_tool_call` plugin that spawns `harness-guard` is layer 2. A second, independent installer
-wires memory: writes through the exec tool, and recall through a plugin that owns the memory slot.
+Wires `spec/tool-policy.json` into an OpenClaw deployment: a `before_tool_call` plugin that spawns
+`harness-guard` is layer 2, and its exec gate is layer 1 wherever that gate can be emitted without
+stopping the agents. A second, independent installer wires memory: writes through the exec tool, and
+recall through a plugin that owns the memory slot.
 
 ## Install
 
@@ -32,7 +33,6 @@ would silently unload somebody else's plugin — including, if both are installe
 
 ```json
 {
-  "tools": { "exec": { "security": "allowlist", "ask": "on-miss" } },
   "plugins": {
     "load": { "paths": ["~/.local/share/harness/openclaw-plugin"] },
     "entries": {
@@ -44,6 +44,31 @@ would silently unload somebody else's plugin — including, if both are installe
   }
 }
 ```
+
+Layer 2, and nothing else. **The exec gate is not in there, and leaving it out is deliberate** — see
+*[The exec gate is emitted with its pre-approvals, or not at
+all](#the-exec-gate-is-emitted-with-its-pre-approvals-or-not-at-all)*. Ask for the gate by naming the
+commands the agents may run without being asked, one argv word per flag:
+
+```sh
+harnesses/openclaw/install.sh --config ~/.openclaw/openclaw.json \
+  --backend-arg --allowedTools --backend-arg 'Bash(git status:*),Read'
+```
+
+which puts both halves in, together:
+
+```json
+{
+  "tools": { "exec": { "security": "allowlist", "ask": "on-miss" } },
+  "agents": { "defaults": { "cliBackends": { "claude-cli": {
+    "args": ["--allowedTools", "Bash(git status:*),Read"]
+  } } } }
+}
+```
+
+One word per flag rather than one flag holding a line, because a pattern like `Bash(git status:*)`
+carries a space: re-split, it pre-approves two halves that are neither of them a command, which reads
+like a pinning and pre-approves nothing.
 
 Regenerate at any time — the policy is the source, this is output:
 
@@ -77,6 +102,33 @@ never resolves to "allow" on a failure, and the harness agrees: a `before_tool_c
 throws is caught and turned into a blocked call, not a permitted one. The budget the plugin gives the
 host is twice the one it enforces on itself, so the plugin's own refusal — which carries a reason
 naming the policy rule — always lands before a host-side hook timeout could answer with a generic one.
+
+### The hook sees the harness's own tools, not the model's
+
+`before_tool_call` fires for calls this harness dispatches. It does **not** fire for the tools an
+agent's own runtime provides. Where agents run through the Claude CLI backend, the model reaches the
+shell through that runtime's native `Bash`, and the host's relay carries an adapter for the `codex`
+CLI's tool events and none for the `claude` one — so those calls never become a hook event and the
+guard never sees them. Measured, not reasoned about: the guard blocks `cat ~/.ssh/known_hosts` as an
+`exec` tool call, and the same command through native `Bash` runs to completion with this plugin
+loaded and enabled.
+
+So, plainly: **on a `claude` backend the shell is not covered here.** Not by layer 2, which is not
+called; and not by layer 1 either, for the separate reason below. An operator who reads "a hook at
+the tool-call boundary" as covering tool calls generally has a hole, and its shape is the bad one —
+nothing fails, nothing is logged, and the refusal that never happened looks exactly like a policy
+with nothing to refuse.
+
+What the guard does still cover is every call the harness dispatches itself: its own `exec`, `read`,
+`write`, `web_fetch`, `apply_patch`, and whatever a later release adds, since intents come from the
+fields present rather than from a table of known tools. That is worth having and it is not the same
+as covering the shell.
+
+Closing the rest means wiring the guard into the other runtime as well, which is what
+`harnesses/claude-code/` generates from this same policy: a `PreToolUse` hook that sees native
+`Bash`. Two installs, one policy, two runtimes handing the same guard their calls. Whether a CLI the
+harness spawns reads a particular settings file is a deployment question — check it rather than
+assume it, the same way a load path pointing at nothing is worth checking.
 
 ## The write path needs nothing new
 
@@ -406,6 +458,47 @@ reads the policy's denied programs. Consequently:
 All three are enforced by the guard, which sees the command line, splits it on every shell operator,
 looks through `sudo` and `env`, recovers redirection targets as writes, and folds in the host's own
 `derivedPaths` for structured edit envelopes.
+
+### The exec gate is emitted with its pre-approvals, or not at all
+
+There is one more thing this gate cannot say on its own, and this one used to be emitted anyway.
+Where agents run through the Claude CLI backend, that backend decides whether the model may use its
+native tools *at all* by reading the gate as `security == "full" && ask == "off"`. Anything else is
+not a narrower permission, it is a refusal of each native tool call, without ever consulting the
+allowlist:
+
+```
+OpenClaw exec policy denied Claude native tool use (security=allowlist, ask=on-miss)
+```
+
+So `{"security": "allowlist", "ask": "on-miss"}` on such a host is not a stricter deployment, it is a
+stopped one — and nothing about it looks stopped. Recall still runs at `before_prompt_build`, so the
+agent still answers, out of memory, and writes nothing. `openclaw config patch --dry-run` passes.
+`openclaw exec-policy show` renders the dead policy as a tidy table. This generator used to emit that
+block with nothing beside it, and the deployment that turned the gate on found out by measuring.
+
+What makes the strict gate survivable is pinning the backend's own argv:
+`agents.defaults.cliBackends.claude-cli.args` carrying `--allowedTools` with the commands the agents
+need. A pre-approved command raises no permission request, so it never reaches the refusal. The two
+are therefore emitted together or neither is emitted, and `--backend-arg`s with no `--allowedTools`
+among them are refused outright rather than paired with a gate they cannot survive — that pairing is
+the bricked config spelled out, and it is the one input for which quietly succeeding would be
+indistinguishable from working.
+
+Which commands to pre-approve is not the policy's to know. The policy grants no programs, so an
+allowlist generated from it would be empty, which is the same outage by another road. Hence the
+default: no gate, the deployment's existing exec posture left alone, layer 2 doing the enforcing. A
+generator that emits less is a smaller thing to read than one whose output cannot be applied without
+disarming the agents.
+
+Read that together with *[The hook sees the harness's own tools, not the
+model's](#the-hook-sees-the-harnesss-own-tools-not-the-models)* and the shape of the gap is clear. On
+a `claude` backend, `ask: on-miss` never reaches a person: the pinning is the whole of what may run,
+and anything it does not name is refused where the request would have been raised. Layer 2 is not
+called for the shell at all. So the shell there is gated by a list of pre-approved commands and by
+nothing at all that reads the policy — which is what installing the `claude-code` harness beside this
+one is for. On a host whose agents work through this harness's own `exec` tool, both layers apply as
+written.
 
 ### Code mode is refused, not screened
 

@@ -43,6 +43,10 @@ options:
                    (neutral, claude-code, hermes, openclaw; default neutral)
   --policy FILE    policy to enforce (default: the policy built into this binary)
   --guard COMMAND  how the emitted config should invoke this guard
+  --backend-arg W  one argv word to pin on the harness's own model backend, repeatable. Only the
+                   harness that runs agents through another agent's tool loop reads these, and it
+                   emits no exec gate without an --allowedTools among them: the gate alone refuses
+                   every native tool call
   -h, --help       this text
 
 exit codes: 0 allowed, 2 blocked — including when the guard could not decide.
@@ -85,7 +89,8 @@ fn dispatch(options: Options, read_stdin: impl FnOnce() -> std::io::Result<Strin
             let command = options
                 .guard
                 .unwrap_or_else(|| format!("harness-guard check --harness {}", options.harness));
-            let config = harness::generate(&options.harness, &policy, &command)?;
+            let config =
+                harness::generate(&options.harness, &policy, &command, &options.backend_args)?;
             Ok(printed(&format!("{config}\n")))
         }
         "check" => {
@@ -138,6 +143,10 @@ struct Options {
     harness: String,
     policy: Option<PathBuf>,
     guard: Option<String>,
+    /// One argv word per occurrence, never re-split: a tool pattern like `Bash(git status:*)`
+    /// carries a space, and splitting it would pre-approve two things that are neither of them a
+    /// command — which reads as a pinning and pre-approves nothing.
+    backend_args: Vec<String>,
     help: bool,
 }
 
@@ -150,6 +159,7 @@ impl Options {
             harness: "neutral".to_string(),
             policy: None,
             guard: None,
+            backend_args: Vec::new(),
             help: false,
         };
         let mut rest = args.iter();
@@ -166,6 +176,7 @@ impl Options {
                 "--harness" => options.harness = value("--harness")?,
                 "--policy" => options.policy = Some(PathBuf::from(value("--policy")?)),
                 "--guard" => options.guard = Some(value("--guard")?),
+                "--backend-arg" => options.backend_args.push(value("--backend-arg")?),
                 flag if flag.starts_with('-') => {
                     return Err(crate::Error::Malformed {
                         what: "command line".to_string(),
@@ -454,6 +465,65 @@ mod tests {
             outcome.stdout.contains("/opt/bin/guard check"),
             "{}",
             outcome.stdout
+        );
+    }
+
+    #[test]
+    fn emit_leaves_the_exec_gate_alone_unless_it_is_told_what_to_pre_approve() {
+        // The gate without pre-approvals refuses every native tool call on the CLI backend, and the
+        // agent keeps answering from recalled context — so the output would validate, read as a
+        // policy, and quietly stop the work.
+        let outcome = invoke(&["emit", "--harness", "openclaw"], "");
+        assert_eq!(outcome.code, ALLOW);
+        assert!(!outcome.stdout.contains("allowlist"), "{}", outcome.stdout);
+        assert!(
+            outcome.stdout.contains("harness-tool-policy"),
+            "{}",
+            outcome.stdout
+        );
+    }
+
+    #[test]
+    fn emit_pins_the_backend_argv_it_was_given_beside_the_gate() {
+        let outcome = invoke(
+            &[
+                "emit",
+                "--harness",
+                "openclaw",
+                "--backend-arg",
+                "--allowedTools",
+                "--backend-arg",
+                "Bash(git status:*)",
+            ],
+            "",
+        );
+        assert_eq!(outcome.code, ALLOW);
+        assert!(outcome.stdout.contains("allowlist"), "{}", outcome.stdout);
+        assert!(
+            outcome.stdout.contains("Bash(git status:*)"),
+            "a word with a space in it survived as one argument:\n{}",
+            outcome.stdout
+        );
+    }
+
+    #[test]
+    fn emit_refuses_a_gate_whose_backend_argv_pre_approves_nothing() {
+        let outcome = invoke(
+            &[
+                "emit",
+                "--harness",
+                "openclaw",
+                "--backend-arg",
+                "--verbose",
+            ],
+            "",
+        );
+        assert_eq!(outcome.code, BLOCK);
+        assert!(outcome.stdout.is_empty(), "{}", outcome.stdout);
+        assert!(
+            outcome.stderr.contains("--allowedTools"),
+            "the refusal does not say what is missing: {}",
+            outcome.stderr
         );
     }
 

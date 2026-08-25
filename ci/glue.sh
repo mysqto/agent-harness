@@ -206,17 +206,44 @@ done
 [ "$(cat "$config")" = "$before" ] || fail "the installer edited the live config"
 
 echo "→ the fragment is valid JSON and carries what it claims"
-python3 - "$fragment" "$ocwork/plug" <<'PY' || status=1
+cat > "$work/fragment-assertions.py" <<'PY'
 import json, sys
-fragment, plugin_dir = sys.argv[1], sys.argv[2]
+fragment, plugin_dir, expect_gate = sys.argv[1], sys.argv[2], sys.argv[3]
 config = json.load(open(fragment))
 problems = []
 
+# Layer 1 is the one part of this fragment that can take an agent's ability to act away. The Claude
+# CLI backend reads the exec gate as full-and-off or nothing at all, so a strict gate with no command
+# pre-approved refuses every native tool call -- and recall keeps working, so the agent answers from
+# memory and writes nothing, with a config that validates and a policy that renders as a table. The
+# claim is therefore a coupling, checked in both directions: a strict gate exactly when the backend
+# argv pinned beside it pre-approves something.
+def pre_approves(argv):
+    return any(
+        "".join(c for c in str(word).split("=")[0] if c.isalnum()).lower() == "allowedtools"
+        for word in argv
+    )
+
 exec_gate = config.get("tools", {}).get("exec", {})
-if exec_gate.get("security") != "allowlist":
-    problems.append(f"exec security is {exec_gate.get('security')!r}, not the default-deny posture")
-if exec_gate.get("ask") != "on-miss":
-    problems.append(f"exec ask is {exec_gate.get('ask')!r}, so a miss would not reach a person")
+strict = bool(exec_gate) and (exec_gate.get("security") != "full" or exec_gate.get("ask") != "off")
+pinned = (
+    config.get("agents", {}).get("defaults", {}).get("cliBackends", {})
+    .get("claude-cli", {}).get("args", [])
+)
+if strict and not pre_approves(pinned):
+    problems.append(
+        f"a strict exec gate {exec_gate} is pinned beside {pinned}, which pre-approves nothing: "
+        "every native tool call on that backend would be refused"
+    )
+if pinned and not strict:
+    problems.append(f"the backend argv {pinned} is pinned with no exec gate for it to survive")
+if (expect_gate == "yes") != strict:
+    problems.append(f"expected a strict exec gate: {expect_gate}, found {exec_gate!r}")
+if strict:
+    if exec_gate.get("security") != "allowlist":
+        problems.append(f"exec security is {exec_gate.get('security')!r}, not default-deny")
+    if exec_gate.get("ask") != "on-miss":
+        problems.append(f"exec ask is {exec_gate.get('ask')!r}, so a miss would not reach a person")
 
 plugins = config.get("plugins", {})
 paths = plugins.get("load", {}).get("paths", [])
@@ -253,6 +280,7 @@ for problem in problems:
     print(f"::error::generated fragment: {problem}")
 sys.exit(1 if problems else 0)
 PY
+python3 "$work/fragment-assertions.py" "$fragment" "$ocwork/plug" no || status=1
 
 echo "→ the guard the fragment names refuses and permits"
 # Read the argv the plugin would spawn, so what is exercised is the fragment's own wiring rather
@@ -287,6 +315,28 @@ digest="$(cat "$fragment" "$ocwork/plug/index.mjs" | cksum)"
 [ "$(cat "$fragment" "$ocwork/plug/index.mjs" | cksum)" = "$digest" ] \
   || fail "a second run rewrote the plugin or the fragment differently"
 [ "$(cat "$config")" = "$before" ] || fail "a second run edited the live config"
+
+echo "→ layer 1 is emitted only together with the pre-approvals that survive it"
+ocpinned="$ocwork/plug-pinned"
+"$oc" --guard "$guard" --policy "$PWD/spec/tool-policy.json" \
+  --config "$config" --plugin-dir "$ocpinned" \
+  --backend-arg --allowedTools --backend-arg 'Bash(git status:*),Read' >/dev/null
+python3 "$work/fragment-assertions.py" "$ocpinned/config-fragment.json" "$ocpinned" yes || status=1
+grep -q 'Bash(git status:\*),Read' "$ocpinned/config-fragment.json" \
+  || fail "a pre-approval carrying a space did not survive as one argument"
+
+echo "→ and the shape that would refuse every native tool call is refused instead of written"
+set +e
+"$guard" emit --harness openclaw --backend-arg --verbose \
+  >"$ocwork/bricked.json" 2>"$ocwork/bricked.err"
+code=$?
+set -e
+[ "$code" -ne 0 ] || fail "emit paired a strict exec gate with backend args that pre-approve nothing"
+if [ -s "$ocwork/bricked.json" ]; then
+  fail "a refused fragment was printed anyway, so it could still be applied"
+fi
+grep -q -- '--allowedTools' "$ocwork/bricked.err" \
+  || fail "the refusal does not name what the backend argv is missing"
 
 echo "→ it will not overwrite somebody else's plugin directory"
 other="$ocwork/other"

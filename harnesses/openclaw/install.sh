@@ -16,11 +16,13 @@ CONFIG=""
 PLUGIN_DIR="${HARNESS_OPENCLAW_PLUGIN_DIR:-$HOME/.local/share/harness/openclaw-plugin}"
 AGENT="main"
 APPLY=0
+BACKEND_ARGS=()
 
 usage() {
   cat <<'USAGE'
 usage: harnesses/openclaw/install.sh [--config FILE] [--plugin-dir DIR] [--agent NAME]
-                                     [--guard PATH] [--policy FILE] [--openclaw CMD] [--apply]
+                                     [--guard PATH] [--policy FILE] [--openclaw CMD]
+                                     [--backend-arg WORD]... [--apply]
 
   --config FILE     the harness config to merge into. Default follows the documented order:
                     $OPENCLAW_CONFIG_PATH, $OPENCLAW_STATE_DIR/openclaw.json, ~/.openclaw/openclaw.json
@@ -29,6 +31,10 @@ usage: harnesses/openclaw/install.sh [--config FILE] [--plugin-dir DIR] [--agent
   --guard PATH      the guard executable to wire          (default harness-guard on PATH)
   --policy FILE     policy the plugin should enforce      (default: built into the guard)
   --openclaw CMD    the harness CLI, used to apply        (default openclaw on PATH)
+  --backend-arg W   one argv word to pin on the Claude CLI backend, repeatable. Without an
+                    --allowedTools among them no exec gate is generated at all: the gate on its own
+                    refuses every native tool call, which leaves an agent that answers and never
+                    writes. Pass the flag and the commands the agents need, one word per flag
   --apply           merge the fragment with `openclaw config patch`. Without this, nothing outside
                     the plugin directory is written and the commands are printed instead.
 USAGE
@@ -42,6 +48,7 @@ while [ $# -gt 0 ]; do
     --guard)      GUARD="$2"; shift 2 ;;
     --policy)     POLICY="$2"; shift 2 ;;
     --openclaw)   OPENCLAW="$2"; shift 2 ;;
+    --backend-arg) BACKEND_ARGS+=("$2"); shift 2 ;;
     --apply)      APPLY=1; shift ;;
     -h|--help)    usage; exit 0 ;;
     *)            echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
@@ -98,6 +105,12 @@ if [ -n "$POLICY" ]; then
   emit+=(--policy "$POLICY")
 fi
 emit+=(--guard "$hook")
+# One flag per word, never one flag holding a line: a tool pattern like `Bash(git status:*)` carries
+# a space, and a shell re-split of it would pre-approve two halves that are neither of them a
+# command — a pinning that reads right and pre-approves nothing.
+for word in ${BACKEND_ARGS[@]+"${BACKEND_ARGS[@]}"}; do
+  emit+=(--backend-arg "$word")
+done
 
 fragment="$PLUGIN_DIR/config-fragment.json"
 # `${plugin_dir}` is the generator's placeholder: it cannot know where this run installed the plugin,
@@ -145,8 +158,8 @@ cat <<NEXT
 
 Two more steps, because neither is the policy's to decide.
 
-The exec gate is now an allowlist, so name the commands that may run unattended — at minimum the
-memory writer, or agents cannot record anything:
+Name the commands that may run unattended — at minimum the memory writer, or agents cannot record
+anything:
 
   $OPENCLAW approvals allowlist add --agent $AGENT "\$HOME/.local/bin/yaam-emit"
 
