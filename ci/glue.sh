@@ -799,6 +799,13 @@ if (fellBack.asked.length !== 2) {
   // index refuses, so every term is quoted and the framing words are not terms at all.
   if (!second.includes('"WUPGHGJ7ELJM626"')) problems.push(`the needle lost the identifier: ${second}`);
   if (second.includes("?")) problems.push(`the needle carried punctuation the index will refuse: ${second}`);
+  // The search read has no --deadline-ms; the bundle's bounds are not its bounds. A fake reader
+  // accepts every flag, so this is asserted by name -- it is the one failure in this fallback that
+  // shipped, and it made the fallback fail every single time while looking wired.
+  if (second.includes("--deadline-ms")) {
+    problems.push(`the fallback passed a bundle-only flag the search read refuses: ${second}`);
+  }
+  if (!second.includes("--limit")) problems.push(`the fallback was not bounded: ${second}`);
   for (const framing of ['"any"', '"knowledge"', '"this"']) {
     if (second.includes(framing)) problems.push(`the needle searched for a framing word ${framing}: ${second}`);
   }
@@ -873,6 +880,9 @@ garbage and no answer; and an empty match reads differently"
   mutate search-as-bundle 's/return composed(second, limits, SEARCH_HEADING, { asked: named, via: SEARCH_SHAPE });/return composed(second, limits, HEADING, { asked: named, via: READ_SHAPE });/'
   # A needle that keeps the question mark: the syntax error that made the first version useless.
   mutate needle-unquoted 's/terms.push(`"${word}"`);/terms.push(word);/'
+  # The fallback bounded as though it were a bundle: a usage error the real reader refuses and every
+  # fake accepts.
+  mutate fallback-bundle-bounds 's/searchBounds(argvSearch, left/bounds(argvSearch, left/'
   # A fallback that fires whatever the config says.
   mutate fallback-ignores-config 's/if (settings?.searchFallback === false) return undefined;/if (false) return undefined;/'
   # A lookup that ran out of time inventing an answer instead of admitting it.

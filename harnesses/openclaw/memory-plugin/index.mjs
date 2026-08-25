@@ -313,6 +313,22 @@ function renderContext(answer, limits, heading = HEADING) {
 }
 
 /**
+ * What the search read is bounded by, which is not what the bundle is bounded by.
+ *
+ * Two of the bundle's three bounds and not the third: `--deadline-ms` is the deadline the *service*
+ * applies while gathering a bundle's sources, and the search read has no such flag. Passing it
+ * anyway is a usage error, and a usage error here is a fallback that never once succeeded while
+ * every fake reader in the test suite accepted it happily.
+ */
+function searchBounds(argv, budgetMs, maxRecords) {
+  const extra = [];
+  const named = (flag) => argv.includes(flag);
+  if (!named("--limit")) extra.push("--limit", String(maxRecords));
+  if (!named("--timeout-ms")) extra.push("--timeout-ms", String(Math.max(1, Math.floor(budgetMs * 0.8))));
+  return extra;
+}
+
+/**
  * The same reader and socket, asked for the search shape instead of the bundle.
  *
  * Derived from the configured argv rather than configured separately: the two reads differ by one
@@ -448,7 +464,12 @@ function fallbackFor(settings, argv, turn, deadline) {
   const argvSearch = searchArgv(argv);
   if (!argvSearch) return undefined;
   return {
-    args: [...argvSearch.slice(1), "--query", needle, ...bounds(argvSearch, left, settings?.maxRecords ?? DEFAULT_MAX_RECORDS)],
+    args: [
+      ...argvSearch.slice(1),
+      "--query",
+      needle,
+      ...searchBounds(argvSearch, left, positive(settings?.maxRecords, DEFAULT_MAX_RECORDS)),
+    ],
     budgetMs: left,
   };
 }
@@ -629,6 +650,7 @@ export default {
 export {
   recall,
   once,
+  searchBounds,
   composed,
   fallbackFor,
   searchArgv,
