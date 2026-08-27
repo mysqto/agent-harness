@@ -445,6 +445,57 @@ mod tests {
         );
     }
 
+    /// Key material is matched on what a file is called, not on where it is kept.
+    ///
+    /// The hole this closes: every pattern in the secret list that is not a literal path is a
+    /// convention — an extension, or the name of a directory — and a key store satisfies neither by
+    /// right. A store holding a signing keyring called `keyring.json` and the passphrase that
+    /// unwraps it, in a directory the deployment named itself, had both of them readable while
+    /// their `*.key` neighbours were refused. So the extension was doing all the work, and the
+    /// directory glob was a naming convention the deployment owns rather than a rule.
+    ///
+    /// Three directory names below, none of them `secrets`, because the fix has to survive a
+    /// deployment renaming its store again.
+    #[test]
+    fn key_material_is_caught_by_its_name_whatever_directory_holds_it() {
+        for dir in [
+            "/home/a/.local/state/store-secrets",
+            "/home/a/.local/state/vault",
+            "/srv/kryptos",
+        ] {
+            denied(&Intent::Read(format!("{dir}/keyring.json")), "key-material");
+            denied(
+                &Intent::Read(format!("{dir}/key.passphrase")),
+                "key-material",
+            );
+            // A suffixed copy of key material is the same key material. An extension glob matches
+            // only the last component, so every one of these fell through it.
+            denied(
+                &Intent::Read(format!("{dir}/keyring.json.bak")),
+                "key-material",
+            );
+            denied(
+                &Intent::Read(format!("{dir}/unseal.key.old")),
+                "key-material",
+            );
+            denied(&Intent::Read(format!("{dir}/writer.jks.2")), "key-material");
+            // Still caught by its extension, and still reported as that rule. The pattern has not
+            // moved; what changed is that it is no longer the only thing covering the directory.
+            denied(&Intent::Read(format!("{dir}/unseal.key")), "private-keys");
+        }
+    }
+
+    /// Refusing the whole tree is the easy answer, and it hides the question of what is in it.
+    ///
+    /// A note and a rotation log beside a key store are ordinary reads — an agent asked why a key
+    /// was rotated needs them, and neither carries a byte of key material.
+    #[test]
+    fn a_file_beside_a_key_store_that_holds_no_key_is_still_readable() {
+        allowed(&Intent::Read("/srv/kryptos/README.md".into()));
+        allowed(&Intent::Read("/srv/kryptos/rotation-log.txt".into()));
+        allowed(&Intent::Read("/srv/kryptos".into()));
+    }
+
     #[test]
     fn a_traversal_does_not_launder_a_secret_read() {
         denied(

@@ -37,6 +37,13 @@ commands and hosts are refused. A harness's own allow/deny config is generated f
 `harness-guard` enforces the same file as a pre-tool-use hook — a process that exits non-zero, with
 no model in the loop and no assumption that the generated config was ever installed.
 
+A secret is recognised by what a file is called, and only incidentally by where it sits. A pattern
+naming a directory (`**/secrets/**`) is a convention the deployment owns — its key store is free to
+be called something else — and a pattern naming an extension matches only the last component, so a
+keyring called `keyring.json` and a `key.pem.bak` beside it both fall through one. Key material
+therefore carries a rule keyed on the role word in the filename, which survives the directory being
+renamed and is narrow enough that a rotation log next to the keys stays readable.
+
 ## Why an agent does not post its own replies
 
 It is the difference between a rule and a habit. If every agent can reach the channel, "redact

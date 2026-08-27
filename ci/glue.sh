@@ -27,6 +27,110 @@ guard="$PWD/target/debug/harness-guard"
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 
+## Key material ################################################################
+# Every pattern in the secret list that is not a literal path is a convention: an extension, or the
+# name of a directory. A deployment's key store is free to satisfy neither -- it holds a signing
+# keyring called `keyring.json` and the passphrase that unwraps it, in a directory the deployment
+# named itself -- and for a while it did, with only its `*.key` neighbours refused. So the claim
+# checked here is that a key store this policy has never heard of is refused on the strength of what
+# its files are called, in a directory named nothing the policy could predict. The mutants matter
+# more than usual: with the extension pattern left in place, the section below passes just as
+# happily against the policy that shipped the hole.
+
+echo "→ a key store the policy has never heard of is refused by what its files are called"
+policy="$PWD/spec/tool-policy.json"
+keys="$work/whatever-this-deployment-called-it"
+mkdir -p "$keys" "$work/keyhome" "$work/keywork"
+for name in keyring.json key.passphrase keyring.json.bak unseal.key subject.key \
+            README.md rotation-log.txt; do
+  printf 'x\n' > "$keys/$name"
+done
+
+# Exit code only: what a person reads on a refusal is asserted by the cargo tests, which can name
+# the rule that fired. What cannot be checked there is a real directory on a real filesystem, where
+# the guard canonicalises before it matches.
+keyread() {
+  local file="$1" policy="$2" code
+  set +e
+  printf '{"tool":"read","intents":[{"kind":"read","value":"%s"}]}' "$keys/$file" \
+    | env HOME="$work/keyhome" HARNESS_WORKSPACE="$work/keywork" \
+      "$guard" check --policy "$policy" >/dev/null 2>&1
+  code=$?
+  set -e
+  echo "$code"
+}
+for secret in keyring.json key.passphrase keyring.json.bak unseal.key subject.key; do
+  [ "$(keyread "$secret" "$policy")" = 2 ] || fail "$secret was readable"
+done
+note "the keyring, its backup, the passphrase that wraps it and two keys are all refused"
+
+echo "→ and what holds no key beside them is still readable"
+# Refusing the whole tree is the easy answer and it hides the question. A note and a rotation log
+# next to a key store are ordinary reads, and an agent asked why a key was rotated needs them.
+for ordinary in README.md rotation-log.txt; do
+  [ "$(keyread "$ordinary" "$policy")" = 0 ] || fail "$ordinary beside a key store was refused"
+done
+
+echo "→ both of those claims can fail: break each on a copy of the policy and the answer flips"
+# Each mutant edits one line of a copy of the policy and requires one of the reads above to give the
+# other answer. A mutant that changes the document but not the verdict means the assertion it was
+# aimed at rests on something else, which is how a policy ships a hole with a green run over it.
+mutant_dir="$work/policy-mutants"
+mkdir -p "$mutant_dir"
+policy_mutant() {
+  local name="$1" change="$2" file="$3" flips_to="$4" out="$mutant_dir/$name.json" built
+  set +e
+  python3 - "$policy" "$out" "$change" <<'PY'
+import json, sys
+
+source, out, change = sys.argv[1], sys.argv[2], sys.argv[3]
+policy = json.load(open(source))
+before = json.dumps(policy, sort_keys=True)
+verb, _, what = change.partition(":")
+if verb == "drop-group":
+    policy["secret_paths"] = [r for r in policy["secret_paths"] if r["id"] != what]
+elif verb == "drop-pattern":
+    for rule in policy["secret_paths"]:
+        rule["patterns"] = [p for p in rule["patterns"] if p != what]
+elif verb == "widen":
+    # A group that gives up on naming what it protects and swallows a directory instead.
+    group, _, pattern = what.partition("=")
+    for rule in policy["secret_paths"]:
+        if rule["id"] == group:
+            rule["patterns"].append(pattern)
+else:
+    sys.exit(f"unknown mutation {verb!r}")
+if json.dumps(policy, sort_keys=True) == before:
+    sys.exit(f"{change!r} left the policy exactly as it was")
+json.dump(policy, open(out, "w"))
+PY
+  built=$?
+  set -e
+  if [ "$built" -ne 0 ]; then
+    fail "policy mutant $name changed nothing, so it proves nothing"
+    return
+  fi
+  if [ "$(keyread "$file" "$out")" = "$flips_to" ]; then
+    note "policy mutant $name was caught"
+  else
+    fail "policy mutant $name survived: $change did not change the verdict on $file"
+  fi
+}
+# The whole group gone. This is the state the policy shipped in, and `unseal.key` stayed refused
+# throughout it -- which is exactly why the extension could not be left to speak for the directory.
+policy_mutant key-material-dropped drop-group:key-material keyring.json 0
+# One role word at a time, so a group that is present but no longer covers a file is caught too.
+policy_mutant keyring-unmatched drop-pattern:'**/*keyring*' keyring.json.bak 0
+policy_mutant passphrase-unmatched drop-pattern:'**/*passphrase*' key.passphrase 0
+# And the extension pattern that was doing all the work, so the older half of the claim is asserted
+# rather than assumed to still hold.
+policy_mutant extension-unmatched drop-pattern:'**/*.key' unseal.key 0
+# The other direction, and the one this section exists to keep honest: a group that denies the
+# directory it found key material in would pass every assertion above while taking the rotation log
+# with it, and would be back to matching on a name the deployment owns.
+policy_mutant denies-the-whole-tree widen:key-material='**/whatever-this-deployment-called-it/**' \
+  rotation-log.txt 2
+
 echo "→ installing into a scratch project"
 HARNESS_PROJECT_DIR="$work" harnesses/claude-code/install.sh \
   --guard "$guard" --policy "$PWD/spec/tool-policy.json" >/dev/null

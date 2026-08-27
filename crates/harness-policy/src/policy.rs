@@ -192,6 +192,10 @@ mod tests {
 
         let loaded = Policy::load(&path).expect("load");
         assert_eq!(loaded.version, 1);
-        assert_eq!(loaded.secret_paths.len(), 4);
+        // Against the baseline rather than a literal, so adding a rule group is not a test edit.
+        assert_eq!(
+            loaded.secret_paths.len(),
+            Policy::baseline().expect("baseline").secret_paths.len()
+        );
     }
 }

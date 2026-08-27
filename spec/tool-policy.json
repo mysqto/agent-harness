@@ -21,6 +21,14 @@
       ]
     },
     {
+      "id": "key-material",
+      "reason": "key material — a key store, or what unwraps one",
+      "patterns": [
+        "**/*keyring*", "**/*keystore*", "**/*passphrase*",
+        "**/*.key.*", "**/*.pem.*", "**/*.p12.*", "**/*.pfx.*", "**/*.jks.*"
+      ]
+    },
+    {
       "id": "environment-files",
       "reason": "environment file — carries tokens by convention",
       "patterns": ["**/.env", "**/.env.*", "**/*.envrc"]
