@@ -494,6 +494,25 @@ mod tests {
         allowed(&Intent::Read("/srv/kryptos/README.md".into()));
         allowed(&Intent::Read("/srv/kryptos/rotation-log.txt".into()));
         allowed(&Intent::Read("/srv/kryptos".into()));
+
+        // The cost of naming files instead of the directory, asserted so nobody closes it without
+        // reading why: a recursive read *of the directory* names no key file, so no pattern here
+        // sees it. That is true of every rule in this policy that names files rather than a tree —
+        // `~/.aws/credentials` and `~/.kube/config` are the same shape — and it is what layer 4
+        // covers (§10.2). Denying the directory would catch this and take the two reads above with
+        // it, which is a trade this rule declines.
+        allowed(&Intent::Command("grep -r . /srv/kryptos".into()));
+    }
+
+    /// And a directory the policy denies as a tree does refuse exactly that, so the difference above
+    /// is the rule's shape and not a gap in the evaluator.
+    #[test]
+    fn a_tree_the_policy_denies_refuses_a_recursive_read_of_the_tree() {
+        denied(&Intent::Command("grep -r . ~/.ssh".into()), "private-keys");
+        denied(
+            &Intent::Command("grep -r . /srv/work/.secrets".into()),
+            "orchestrator-config",
+        );
     }
 
     #[test]

@@ -44,6 +44,13 @@ keyring called `keyring.json` and a `key.pem.bak` beside it both fall through on
 therefore carries a rule keyed on the role word in the filename, which survives the directory being
 renamed and is narrow enough that a rotation log next to the keys stays readable.
 
+The cost of that narrowness is stated rather than left to be discovered: a rule that names files does
+not refuse a recursive read *of the directory holding them*, because the command names no file the
+patterns can see. `grep -r . <key store>` is allowed where `grep -r . ~/.ssh` is not, and the same is
+true of `~/.aws/credentials` and `~/.kube/config`. That is layer 4's ground (§10.2), and it is
+asserted in the test suite so that closing it by denying the tree is a decision somebody makes on
+purpose rather than a tightening that quietly takes the readable files with it.
+
 ## Why an agent does not post its own replies
 
 It is the difference between a rule and a habit. If every agent can reach the channel, "redact
