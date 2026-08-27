@@ -44,6 +44,17 @@ keyring called `keyring.json` and a `key.pem.bak` beside it both fall through on
 therefore carries a rule keyed on the role word in the filename, which survives the directory being
 renamed and is narrow enough that a rotation log next to the keys stays readable.
 
+A role word on its own is not enough, and the first version of that rule proved it by refusing
+`keystore.rs` and `grep -rn passphrase .` — the guard resolves every argument of a command as a path,
+so a bare search term is a filename in the working directory. What the role word has to arrive with
+is a **data extension**: `keyring.json` and `key.passphrase` are the store and what unwraps it, while
+`keystore.rs`, `keystore.md` and a bare `passphrase` are things written *about* one. So the patterns
+name the serialisation formats rather than excusing the source ones — that keeps a language nobody
+has written in this repository yet readable, where a `.rs` exception would need extending for each
+new one. The narrowing is paid for at the other end, and stated here so it is a choice: a key store
+in a file called exactly `keyring`, with no extension, is not matched, because that string is also
+what a person greps for.
+
 The cost of that narrowness is stated rather than left to be discovered: a rule that names files does
 not refuse a recursive read *of the directory holding them*, because the command names no file the
 patterns can see. `grep -r . <key store>` is allowed where `grep -r . ~/.ssh` is not, and the same is

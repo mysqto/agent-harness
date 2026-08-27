@@ -36,13 +36,20 @@ trap 'rm -rf "$work"' EXIT
 # its files are called, in a directory named nothing the policy could predict. The mutants matter
 # more than usual: with the extension pattern left in place, the section below passes just as
 # happily against the policy that shipped the hole.
+#
+# The other half is here for the same reason. A role word matched anywhere in a filename refused
+# `keystore.rs` and a bare `grep -rn passphrase .`, because the guard resolves every argument of a
+# command as a path: the rule meant to gate the agent that reviews key handling was what stopped it
+# reading key handling. So the role word arrives with a data extension or it carries nothing, and
+# both directions are asserted below with a mutant behind each.
 
 echo "→ a key store the policy has never heard of is refused by what its files are called"
 policy="$PWD/spec/tool-policy.json"
 keys="$work/whatever-this-deployment-called-it"
 mkdir -p "$keys" "$work/keyhome" "$work/keywork"
 for name in keyring.json key.passphrase keyring.json.bak unseal.key subject.key \
-            README.md rotation-log.txt; do
+            README.md rotation-log.txt \
+            keystore.rs keyring.rs subject.rs custody.rs wrapper.rs passphrase-rotation.md; do
   printf 'x\n' > "$keys/$name"
 done
 
@@ -59,6 +66,24 @@ keyread() {
   set -e
   echo "$code"
 }
+
+# The same, for a command line, run *from inside* the key store. The guard resolves every argument of
+# a command as a path against the working directory, so a bare search term is the worst case for a
+# rule that matches on a name: `passphrase` becomes `<key store>/passphrase`, and no cargo test can
+# stand in for a real cwd on a real filesystem.
+keycmd() {
+  local line="$1" policy="$2" code
+  set +e
+  (
+    cd "$keys" || exit 3
+    printf '{"tool":"bash","intents":[{"kind":"command","value":"%s"}]}' "$line" \
+      | env HOME="$work/keyhome" HARNESS_WORKSPACE="$work/keywork" \
+        "$guard" check --policy "$policy" >/dev/null 2>&1
+  )
+  code=$?
+  set -e
+  echo "$code"
+}
 for secret in keyring.json key.passphrase keyring.json.bak unseal.key subject.key; do
   [ "$(keyread "$secret" "$policy")" = 2 ] || fail "$secret was readable"
 done
@@ -71,6 +96,22 @@ for ordinary in README.md rotation-log.txt; do
   [ "$(keyread "$ordinary" "$policy")" = 0 ] || fail "$ordinary beside a key store was refused"
 done
 
+echo "→ and so is source and prose named for key material, wherever it sits"
+# Measured on a real repository while this group was live: `crates/yaam-crypto/src/keystore.rs` and
+# `crates/yaam-cli/src/keyring.rs` were both refused, in a tree with no key material in it at all.
+# These sit in the key store itself, which is the hardest place for the rule to tell them apart.
+for source in keystore.rs keyring.rs subject.rs custody.rs wrapper.rs passphrase-rotation.md; do
+  [ "$(keyread "$source" "$policy")" = 0 ] || fail "$source was refused, and it holds no key"
+done
+note "a keystore and a keyring in source, their neighbours, and a note about passphrases all read"
+
+# And the search that finds them. Refusing this is the same fault seen from the other side: the term
+# is not a file, and a reviewer who cannot grep for a role word cannot review key handling.
+for line in "grep -rn passphrase ." "grep -rn keystore ." "grep -rln keyring ."; do
+  [ "$(keycmd "$line" "$policy")" = 0 ] || fail "\`$line\` was refused from inside a key store"
+done
+note "grepping a key store for the words its files are named after is allowed"
+
 echo "→ both of those claims can fail: break each on a copy of the policy and the answer flips"
 # Each mutant edits one line of a copy of the policy and requires one of the reads above to give the
 # other answer. A mutant that changes the document but not the verdict means the assertion it was
@@ -78,7 +119,7 @@ echo "→ both of those claims can fail: break each on a copy of the policy and 
 mutant_dir="$work/policy-mutants"
 mkdir -p "$mutant_dir"
 policy_mutant() {
-  local name="$1" change="$2" file="$3" flips_to="$4" out="$mutant_dir/$name.json" built
+  local name="$1" change="$2" probe="$3" flips_to="$4" out="$mutant_dir/$name.json" built got
   set +e
   python3 - "$policy" "$out" "$change" <<'PY'
 import json, sys
@@ -110,18 +151,26 @@ PY
     fail "policy mutant $name changed nothing, so it proves nothing"
     return
   fi
-  if [ "$(keyread "$file" "$out")" = "$flips_to" ]; then
+  # A probe is a filename in the key store, or `cmd:` and a command line run from inside it.
+  case "$probe" in
+    cmd:*) got="$(keycmd "${probe#cmd:}" "$out")" ;;
+    *)     got="$(keyread "$probe" "$out")" ;;
+  esac
+  if [ "$got" = "$flips_to" ]; then
     note "policy mutant $name was caught"
   else
-    fail "policy mutant $name survived: $change did not change the verdict on $file"
+    fail "policy mutant $name survived: $change did not change the verdict on $probe"
   fi
 }
 # The whole group gone. This is the state the policy shipped in, and `unseal.key` stayed refused
 # throughout it -- which is exactly why the extension could not be left to speak for the directory.
 policy_mutant key-material-dropped drop-group:key-material keyring.json 0
-# One role word at a time, so a group that is present but no longer covers a file is caught too.
-policy_mutant keyring-unmatched drop-pattern:'**/*keyring*' keyring.json.bak 0
-policy_mutant passphrase-unmatched drop-pattern:'**/*passphrase*' key.passphrase 0
+# One role word at a time, so a group that is present but no longer covers a file is caught too. The
+# pattern each names is the role word paired with the data extension that makes it key material --
+# dropping the pair is what a rename of the group's shape would do, and both files above depend on
+# exactly one pattern each.
+policy_mutant keyring-unmatched drop-pattern:'**/*keyring*.json*' keyring.json.bak 0
+policy_mutant passphrase-unmatched drop-pattern:'**/*.passphrase' key.passphrase 0
 # And the extension pattern that was doing all the work, so the older half of the claim is asserted
 # rather than assumed to still hold.
 policy_mutant extension-unmatched drop-pattern:'**/*.key' unseal.key 0
@@ -130,6 +179,13 @@ policy_mutant extension-unmatched drop-pattern:'**/*.key' unseal.key 0
 # with it, and would be back to matching on a name the deployment owns.
 policy_mutant denies-the-whole-tree widen:key-material='**/whatever-this-deployment-called-it/**' \
   rotation-log.txt 2
+# And the regression this group actually shipped, which is the same mistake in a third direction: a
+# role word matched anywhere in a filename with nothing paired to it. Re-add either of the two
+# patterns that did it and the assertions above go green while a source file and a grep go dark, so
+# each gets a mutant of its own rather than sharing one.
+policy_mutant role-word-alone-refuses-source widen:key-material='**/*keystore*' keystore.rs 2
+policy_mutant role-word-alone-refuses-a-search widen:key-material='**/*passphrase*' \
+  cmd:'grep -rn passphrase .' 2
 
 echo "→ installing into a scratch project"
 HARNESS_PROJECT_DIR="$work" harnesses/claude-code/install.sh \

@@ -455,7 +455,11 @@ mod tests {
     /// directory glob was a naming convention the deployment owns rather than a rule.
     ///
     /// Three directory names below, none of them `secrets`, because the fix has to survive a
-    /// deployment renaming its store again.
+    /// deployment renaming its store again. A fourth is in `ci/glue.sh`, where the files exist on a
+    /// real filesystem and the guard canonicalises before it matches.
+    ///
+    /// What the role word is *paired with* is what carries the match — see
+    /// `source_and_prose_named_for_key_material_stay_readable` for the other half of the rule.
     #[test]
     fn key_material_is_caught_by_its_name_whatever_directory_holds_it() {
         for dir in [
@@ -483,6 +487,62 @@ mod tests {
             // moved; what changed is that it is no longer the only thing covering the directory.
             denied(&Intent::Read(format!("{dir}/unseal.key")), "private-keys");
         }
+    }
+
+    /// A role word in a filename says what a file is *about*; the extension says whether its bytes
+    /// are the thing.
+    ///
+    /// The regression this asserts against, measured: `**/*keystore*` refused
+    /// `crates/yaam-crypto/src/keystore.rs` and `**/*passphrase*` refused `grep -rn passphrase .`,
+    /// because the guard resolves every command argument as a path and a bare search term resolves
+    /// to a file in the working directory. Two source files in one repository became unreadable, and
+    /// the crypto and key-store code is what most deserves a review — so the layer meant to gate the
+    /// reviewer was the layer hiding the subject from it.
+    ///
+    /// So a role word alone does not carry the match: it has to arrive with an extension that says
+    /// the file *is* a store or a passphrase. That generalises where a `.rs` exception would not —
+    /// the same rule keeps `.go`, `.py`, `.md` and a language nobody has written yet readable, and
+    /// it is why the pattern list names the data formats rather than the source ones.
+    #[test]
+    fn source_and_prose_named_for_key_material_stay_readable() {
+        for dir in [
+            "/srv/work/crates/yaam-crypto/src",
+            "/home/a/.local/state/vault",
+            "/srv/kryptos",
+        ] {
+            // Named for a key store, and one of these was measured refused.
+            allowed(&Intent::Read(format!("{dir}/keystore.rs")));
+            allowed(&Intent::Read(format!("{dir}/keyring.rs")));
+            allowed(&Intent::Read(format!("{dir}/passphrase.go")));
+            // Its neighbours in the same crate: no role word, and no reason for one to appear.
+            allowed(&Intent::Read(format!("{dir}/subject.rs")));
+            allowed(&Intent::Read(format!("{dir}/custody.rs")));
+            allowed(&Intent::Read(format!("{dir}/wrapper.rs")));
+            // Prose about key handling is where the reasoning for it lives.
+            allowed(&Intent::Read(format!("{dir}/passphrase-rotation.md")));
+            allowed(&Intent::Read(format!("{dir}/keystore.md")));
+        }
+
+        // Same stem, one dot apart: what the extension decides, on one pair.
+        denied(
+            &Intent::Read("/srv/kryptos/keyring.json".into()),
+            "key-material",
+        );
+        allowed(&Intent::Read("/srv/kryptos/keyring.rs".into()));
+
+        // A bare search term is resolved as a path against the working directory, which is how a
+        // grep for a role word became a refusal. Nothing in the policy may match a name with no
+        // extension at all, or reviewing key handling means not being able to search for it.
+        allowed(&Intent::Command("grep -rn passphrase .".into()));
+        allowed(&Intent::Command("grep -rn keystore .".into()));
+        allowed(&Intent::Command("grep -rln keyring crates".into()));
+
+        // The cost of that, stated rather than discovered: a key store in a file called exactly
+        // `keyring`, with no extension, is not matched by this group. It cannot be — that string is
+        // also what a person types to search for one, and refusing it is the regression above. The
+        // three files this group was written for all carry an extension, so nothing live rests on
+        // it; a store that drops the extension is layer 4's ground (§10.2).
+        allowed(&Intent::Read("/srv/kryptos/keyring".into()));
     }
 
     /// Refusing the whole tree is the easy answer, and it hides the question of what is in it.

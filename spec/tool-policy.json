@@ -24,8 +24,22 @@
       "id": "key-material",
       "reason": "key material — a key store, or what unwraps one",
       "patterns": [
-        "**/*keyring*", "**/*keystore*", "**/*passphrase*",
-        "**/*.key.*", "**/*.pem.*", "**/*.p12.*", "**/*.pfx.*", "**/*.jks.*"
+        "**/*.passphrase", "**/*.passphrase.*",
+        "**/*.keyring", "**/*.keyring.*",
+        "**/*.keystore", "**/*.keystore.*",
+        "**/*.key.*", "**/*.pem.*", "**/*.p12.*", "**/*.pfx.*", "**/*.jks.*",
+        "**/*keyring*.json*", "**/*keyring*.yaml*", "**/*keyring*.yml*",
+        "**/*keyring*.toml*", "**/*keyring*.db*", "**/*keyring*.bin*",
+        "**/*keyring*.dat*", "**/*keyring*.enc*", "**/*keyring*.gpg*",
+        "**/*keyring*.asc*",
+        "**/*keystore*.json*", "**/*keystore*.yaml*", "**/*keystore*.yml*",
+        "**/*keystore*.toml*", "**/*keystore*.db*", "**/*keystore*.bin*",
+        "**/*keystore*.dat*", "**/*keystore*.enc*", "**/*keystore*.gpg*",
+        "**/*keystore*.asc*",
+        "**/*passphrase*.json*", "**/*passphrase*.yaml*", "**/*passphrase*.yml*",
+        "**/*passphrase*.toml*", "**/*passphrase*.db*", "**/*passphrase*.bin*",
+        "**/*passphrase*.dat*", "**/*passphrase*.enc*", "**/*passphrase*.gpg*",
+        "**/*passphrase*.asc*"
       ]
     },
     {
