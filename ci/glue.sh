@@ -824,6 +824,25 @@ if config["digestMaxChars"] > config["maxChars"]:
     sys.exit(1)
 TURNCFG
 
+echo "→ every setting the fragment writes is one the plugin's manifest declares"
+# The host validates a plugin entry's config against `configSchema`, which is `additionalProperties:
+# false`. A setting the installer emits and the manifest does not declare is not a setting that falls
+# back to a default — it is a config the gateway refuses to load, and the installer's own fragment
+# becomes the thing that breaks the deployment. Checked here rather than on a live host, which is
+# where it was caught the first time.
+python3 - "$memfragment" "$memwork/plug/openclaw.plugin.json" <<'DECLARED' || status=1
+import json, sys
+config = json.load(open(sys.argv[1]))["plugins"]["entries"]["harness-memory"]["config"]
+schema = json.load(open(sys.argv[2])).get("configSchema", {})
+if schema.get("additionalProperties") is not False:
+    print("::error::the manifest's configSchema accepts anything, so it validates nothing")
+    sys.exit(1)
+undeclared = sorted(set(config) - set(schema.get("properties", {})))
+if undeclared:
+    print(f"::error::the fragment writes settings the manifest does not declare: {undeclared}")
+    sys.exit(1)
+DECLARED
+
 echo "→ the recall installer refuses a digest window that is not a number of days"
 for bad in 0 -3 fortnight; do
   set +e
