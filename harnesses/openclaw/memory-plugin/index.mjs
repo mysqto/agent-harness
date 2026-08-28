@@ -906,8 +906,12 @@ function report(outcome, logger) {
   reportDigest(outcome, logger);
   if (outcome?.kind === "recalled") {
     const cost = outcome.tokenEstimate === undefined ? "" : `, ~${outcome.tokenEstimate} tokens`;
+    // Which read answered, because the two are different claims and the log is where an operator
+    // finds out which one this deployment is actually living on. A store whose every turn is
+    // answered by the fallback is not recalling what it was asked about; it is ranking words.
+    const via = outcome.via ? ` via ${outcome.via}` : "";
     logger?.info?.(
-      `${PLUGIN_ID}: recalled ${outcome.count} record(s)${outcome.degraded ? " (partial)" : ""}${cost}`,
+      `${PLUGIN_ID}: recalled ${outcome.count} record(s)${via}${outcome.degraded ? " (partial)" : ""}${cost}`,
     );
     return;
   }
