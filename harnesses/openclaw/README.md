@@ -150,14 +150,15 @@ Recall is wired, by a second plugin and a second installer:
 
 ```sh
 harnesses/openclaw/install-memory.sh --config ~/.openclaw/openclaw.json --agent main \
-  --thread-kind chat_thread --spec-dir /srv/memory/spec --digest-days 14
+  --thread-kind chat_thread --spec-dir /srv/memory/spec \
+  --actors main=main_bot,pr=pr_bot,deploy=deploy_bot --digest-days 14
 ```
 
-The middle two are what let a bundle name the turn rather than only its actor; see *[What a turn can
-say about itself](#what-a-turn-can-say-about-itself)*. The last is the one block here that is not
-about the turn at all; see *[The session-opening
-digest](#the-session-opening-digest-and-why-it-is-third)*. All three are optional and all three are
-off by default — the plugin says at load which of them is unwired.
+The middle three are what let a bundle name the turn at all; see *[What a turn can say about
+itself](#what-a-turn-can-say-about-itself)*. The last is the one block here that is not about the turn
+at all; see *[The session-opening
+digest](#the-session-opening-digest-and-why-it-is-third)*. All four are optional and all four are off
+by default — the plugin says at load which of them is unwired.
 
 Separate from `install.sh` because it is separate work. Everything that script emits is generated from
 `spec/tool-policy.json`; recall is not a tool rule, and a policy generator emitting memory settings
@@ -175,6 +176,7 @@ would put a decision the policy has no opinion on into output the policy owns.
         "config": {
           "read": ["…/yaam-read", "bundle", "--socket", "…/main.read.sock"],
           "threadEntity": "chat_thread", "specDir": "/srv/memory/spec",
+          "actors": { "main": "main_bot", "pr": "pr_bot", "deploy": "deploy_bot" },
           "digestDays": 14, "digestMaxRecords": 12, "digestMaxChars": 1200,
           "timeoutMs": 5000, "maxRecords": 8, "maxChars": 2000
         }
@@ -300,8 +302,11 @@ not decide it —
 - **`token_estimate`.** The cost of what is about to go into a prompt, measured over the rows being
   returned. It is logged, so an operator can see what recall charges per turn.
 
-`--actor` is the agent the host names for the run, appended when the argv does not already name one;
-the socket decides what that agent is allowed to see, so asking about an actor never widens scope.
+`--actor` is the **writer name** the deployment's `config.actors` gives for the agent the host names
+for the run, appended when the argv does not already name one; the socket decides what that agent is
+allowed to see, so asking about an actor never widens scope. It is not the agent id — see *[An agent
+id is not a writer name](#an-agent-id-is-not-a-writer-name)*, which is where that mistake cost half of
+recall.
 `search` was the alternative and needs a needle, which means deriving one from the user's prose.
 This file used to say that had no honest implementation short of putting a model in the path. That
 was too strong, and `search` now runs as a *fallback* — see below. What stands is the ordering:
@@ -365,17 +370,24 @@ A bundle composes context out of **entities** and an **actor**. The first versio
 the actor and nothing else, which meant every turn asked "what has this agent done lately" — and in a
 deployment whose records were written by an importer and a bot, under names no live turn ever runs
 as, the honest answer was nothing. Every time. It logged `matched nothing`, which was true, and it
-never once looked wrong.
+never once looked wrong. It was worse than that, and the section below is the correction: the name it
+sent was not a name the store had ever heard, so the actor half was not merely narrow — it was inert.
 
-The hook's payload is the fix, and it is worth being exact about what it does and does not carry.
-`before_prompt_build` receives `(event, ctx)`: `event` has `prompt` and `messages`, `ctx` has
+The hook's payload is most of the fix, and it is worth being exact about what it does and does not
+carry. `before_prompt_build` receives `(event, ctx)`: `event` has `prompt` and `messages`, `ctx` has
 identifiers and no content. There is **no thread field on either** — nothing named `threadId`,
-`thread_ts` or `conversation`. Two things are reachable, and both become lookups:
+`thread_ts` or `conversation`. Three things are reachable, and all three become lookups — but only two
+of them are values the store can be asked about as they arrive:
 
 | What | Where it comes from | What it becomes |
 |---|---|---|
 | the conversation | `ctx.channelId` | `--entity <threadEntity>:<conversation>/<thread>` |
 | the message | `event.prompt` | `--infer-entities <specDir> --infer-from <text>` |
+| the agent | `ctx.agentId`, **through `config.actors`** | `--actor <writer>`, or no flag at all |
+
+The third row is not like the other two, and the difference is the subject of the next section: the
+payload's agent id is not a value the store can be asked about, so it goes through a map the
+deployment states rather than straight into the read.
 
 **The thread arrives inside the conversation id, not beside it.** The host builds `ctx.channelId`
 from the session key, and a threaded run's key ends `…:thread:<id>`; splitting on that is the only
@@ -399,14 +411,77 @@ output is a lookup key: it matches records that reference it at full confidence,
 nothing. A wrong guess costs one wasted lookup rather than a permanent falsehood, so this may infer
 where a writer may not — and nothing about what reaches a bundle has been loosened.
 
-Both settings are off unless configured, and neither has a default this harness could invent: an
-entity vocabulary and a spec directory both belong to the deployment. The plugin says at load which
-of them is unwired, at info, because an operator wondering why recall is thin should not have to read
-the source to find out.
+All three settings are off unless configured, and none has a default this harness could invent: an
+entity vocabulary, a spec directory and a set of writer names all belong to the deployment. The plugin
+says at load which of them is unwired, at info, because an operator wondering why recall is thin
+should not have to read the source to find out.
 
 ```
 harness-memory: no thread is looked up: set config.threadEntity to the entity kind this deployment files conversations under
 harness-memory: the message is not read for entities: set config.specDir to the deployment's spec directory
+harness-memory: no actor is looked up: set config.actors to this deployment's map from agent id to the writer name its records carry, for example {"main": "main_bot"} …
+```
+
+With a map wired it says what it read instead, because a map that has drifted from the keyring looks
+exactly like a map that is right:
+
+```
+harness-memory: actors: main records as main_bot, pr records as pr_bot, deploy records as deploy_bot
+```
+
+#### An agent id is not a writer name
+
+**This is where the actor half was dead on arrival, and it shipped looking like it worked.**
+`ctx.agentId` is the host's name for the run — `main`, `pr`, `deploy`. The name a record carries is the
+caller its record socket signed as, which on a deployment generating writers from a keyring is a
+different string: `main_bot`, `pr_bot`, `deploy_bot`, `memory_import`. The plugin sent the agent id.
+Measured on the live store, 77 records and every one of them written by one of those four names:
+
+| `bundle --actor` | records |
+|---|---|
+| `main` / `pr` / `deploy` | 0 / 0 / 0 |
+| `main_bot` / `pr_bot` / `deploy_bot` | 8 / 8 / 8 (the page cap) |
+
+So the actor half never matched anything on that host, and an empty page is exactly what a quiet store
+returns — the defect had no symptom. It is the failure the plugin's own header warns about, *"an empty
+answer every turn that looks exactly like a quiet store"*, one layer below where the warning was aimed.
+
+**The two names are separate deliberately, so the plugin has to be told rather than derive.** The
+socket is the evidence of who wrote, which puts the writer name in the deployment's keyring. Three
+mechanisms were available and only one of them cannot lie:
+
+- **A map in config**, `{"main": "main_bot", …}`. Verbose, and one more thing to keep in step with the
+  keyring. **Chosen**, because it invents nothing and because a stale entry fails by name rather than
+  in silence.
+- **A suffix rule**, `<agentId>_bot`. Terse, and it would have worked on the deployment this was
+  written for — which is the objection. It promotes one host's naming convention to a fact about every
+  host, and a convention and a fact are indistinguishable by their output when both return a string.
+  The next deployment to name a writer differently gets the silent zero back with a rule's confidence
+  behind it.
+- **The socket path already in `config.read`.** Looks like evidence and is not; the live deployment is
+  its own counterexample, since one read socket serves all three agents' recall. Deriving from it would
+  name that socket's writer as the actor on every turn whatever agent asked. Confidently wrong is worse
+  than absent, because absent is legible.
+
+**An agent the map does not name asks about no actor at all.** Passing the id is what produced the
+silent zero; omitting the flag asks a narrower question honestly, and the log says which happened
+rather than leaving it to be inferred from an empty page:
+
+```
+harness-memory: no actor was asked about: config.actors names no writer for agent "deploy", so this
+turn asked only about what it could name. An agent id is not a writer name — a record carries the
+caller its socket signed as, and only this deployment's keyring knows which that is
+```
+
+At info and not a warning: the turn proceeds exactly as a turn with nothing to ask about always did.
+Per turn rather than once at load, because load time cannot know which agents will arrive, and a
+renamed writer is per-turn news. A writer spelled as something that would be read as a flag in an
+argument list takes the same route, and so does one spelled as nothing — the fix is the same line of
+config either way. When an actor *was* asked about, the recall line names it, which is how an operator
+sees a page of one agent's week arriving in front of every reply:
+
+```
+harness-memory: recalled 8 record(s) via bundle, actor main_bot, ~1039 tokens
 ```
 
 A flag an operator already put in the configured argv is left alone, as the bounds are: `--entity`,

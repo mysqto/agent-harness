@@ -35,6 +35,16 @@
 // Neither is a guess this file makes about what the answer should contain. A lookup key that names
 // nothing matches nothing; the deployment's own rules decide what a key even is.
 //
+// **And the third thing has to be told rather than read off the payload.** `ctx.agentId` is the
+// host's name for this run — `main`, `pr`, `deploy` — and it is *not* the name the store filed the
+// agent's records under, which is whatever caller the record socket signed as: `main_bot`, `pr_bot`,
+// `deploy_bot`. The two are named separately on purpose, and the deployment's own setup says why —
+// the socket is the evidence of who wrote, so a writer name belongs to the keyring rather than to
+// this harness. Passing `ctx.agentId` straight through was the same hole as the actor alone, one
+// layer down: a `--actor` naming nothing matched nothing on every turn, and the warning above was
+// aimed one layer above where it happened. So `config.actors` is where a deployment states the map,
+// and where it names nothing for an agent this asks no actor at all and says so. See `actorPlan`.
+//
 // # And one thing that is not about the turn at all
 //
 // A third read runs on the turn that opens a session, and only there: a date-grouped digest of what
@@ -263,18 +273,60 @@ function bounds(argv, budgetMs, maxRecords) {
 }
 
 /**
- * The actor whose recent activity a turn asks about, when the config left it open.
+ * Whose activity a turn asks about: the writer name this agent's records were filed under.
  *
- * The socket is evidence of who is *asking*; the actor says whose activity to gather, and the host
- * knows that per run. Refused when it could be read as a flag — this goes into an argument list, and
- * a value starting with `-` would be parsed as one.
+ * **An agent id is not a writer name, and nothing here may bridge the two by guessing.** The host
+ * knows the agent this run is — `main`, `pr`, `deploy`. The store knows the caller each record was
+ * signed by — `main_bot`, `pr_bot`, `deploy_bot`, `memory_import`. They are named separately and
+ * deliberately: a record's writer is whatever its record socket signed as, so the writer name belongs
+ * to the deployment's keyring. This plugin therefore cannot derive one from the other; it has to be
+ * told, and `config.actors` is where a deployment says it.
+ *
+ * Three mechanisms were available. Two of them produce a name whatever the truth is, which is the
+ * property that makes them worse than nothing here:
+ *
+ *   - **A suffix rule** — `${agentId}_bot` — is terse, and would have worked on the deployment this
+ *     was written for. That is exactly what makes it dangerous: it promotes one deployment's naming
+ *     convention to a fact about every deployment, and the first host that calls a writer anything
+ *     else gets the silent zero back with a rule's confidence behind it. A convention and a fact are
+ *     indistinguishable by their output when both return a string.
+ *   - **The socket path** already in `config.read` looks like evidence and is not. The live
+ *     deployment is its own counterexample: one read socket serves all three agents' recall, so a
+ *     derivation would name that socket's writer as the actor for every turn whatever agent asked.
+ *     Confidently wrong is worse than absent, because absent is legible.
+ *
+ * What is left is the verbose one: a map somebody wrote down, keyed by agent id. It invents nothing,
+ * and its cost is real — one more thing to keep in step with the keyring. What makes that survivable
+ * is that a stale map fails *by name* rather than in silence: see `unmapped`.
+ *
+ * Returns which of four things the actor of this turn is, so the caller can say which happened rather
+ * than leave a reader to infer it from an empty page:
+ *
+ *   - `configured` — the read argv already names `--actor`. An operator's choice is theirs.
+ *   - `named` — the map names a usable writer for this agent. The only plan that reaches the reader.
+ *   - `unmapped` — this turn has an agent id and the config names no usable writer for it. **No
+ *     `--actor` is passed.** Passing the agent id is what asked about a writer that never existed,
+ *     and the empty set that comes back is indistinguishable from a quiet store; asking about the
+ *     entities alone asks a narrower question honestly. A writer spelled as something that would be
+ *     read as a flag takes this route too — it goes into an argument list, and the operator's fix is
+ *     the same line of config either way.
+ *   - `unnamed` — the turn carries no agent id at all, so there is nothing to look up.
  */
-function actorFor(argv, agentId) {
-  if (argv.includes("--actor")) return [];
-  if (typeof agentId !== "string") return [];
-  const trimmed = agentId.trim();
-  if (!trimmed || trimmed.startsWith("-")) return [];
-  return ["--actor", trimmed];
+function actorPlan(argv, agentId, actors) {
+  if (Array.isArray(argv) && argv.includes("--actor")) return { kind: "configured" };
+  if (typeof agentId !== "string" || !agentId.trim()) return { kind: "unnamed" };
+  const id = agentId.trim();
+  const writer = actors && typeof actors === "object" ? actors[id] : undefined;
+  if (typeof writer !== "string") return { kind: "unmapped", agentId: id };
+  const trimmed = writer.trim();
+  if (!trimmed || trimmed.startsWith("-")) return { kind: "unmapped", agentId: id };
+  return { kind: "named", writer: trimmed };
+}
+
+/** The plan above as the argv it contributes. Nothing but a `named` plan reaches the reader. */
+function actorFor(argv, agentId, actors) {
+  const plan = actorPlan(argv, agentId, actors);
+  return plan.kind === "named" ? ["--actor", plan.writer] : [];
 }
 
 /**
@@ -829,7 +881,7 @@ async function recall(settings, turn) {
   const named = turn?.entities ?? [];
 
   const why = unusable(argv);
-  if (why) return { kind: "unavailable", why, asked: named };
+  if (why) return { kind: "unavailable", why, asked: named, actor: actorPlan(argv, turn?.agentId, settings?.actors) };
 
   // One deadline for however many reads happen, so the outer bound this hook registered still means
   // what it says.
@@ -868,33 +920,37 @@ async function withDigest(outcome, settings, argv, turn, deadline) {
  * added because the session just opened" is another. They share the deadline and nothing else.
  */
 async function answerFor(settings, argv, turn, named, limits, budgetMs, deadline) {
+  // Which actor this turn asks about, or which of the three ways it asks about none. Carried on every
+  // outcome below rather than recomputed by the log: "no actor was asked about" is a fact about the
+  // read that happened, and a reader of the log must not have to re-derive it from the config.
+  const actor = actorPlan(argv, turn?.agentId, settings?.actors);
   const args = [
     ...argv.slice(1),
     ...entitiesFor(argv, named),
     ...inferenceFor(argv, settings?.specDir, turn?.text),
-    ...actorFor(argv, turn?.agentId),
+    ...actorFor(argv, turn?.agentId, settings?.actors),
     ...bounds(argv, budgetMs, limits.maxRecords),
   ];
 
   const first = await once(argv[0], args, budgetMs);
-  if (first.kind === "failed") return { kind: "unavailable", why: first.why, asked: named };
+  if (first.kind === "failed") return { kind: "unavailable", why: first.why, asked: named, actor };
   if (first.records.length > 0) {
-    return composed(first, limits, HEADING, { asked: named, via: READ_SHAPE });
+    return composed(first, limits, HEADING, { asked: named, via: READ_SHAPE, actor });
   }
 
   // The bundle answered and matched nothing. Everything below is the second question, and it is a
   // different question: not "what is filed under these keys" but "what mentions these words".
   const fallback = fallbackFor(settings, argv, turn, deadline);
-  if (!fallback) return { kind: "empty", asked: named };
+  if (!fallback) return { kind: "empty", asked: named, actor };
 
   const second = await once(argv[0], fallback.args, fallback.budgetMs);
   // A failed fallback is still an empty bundle, not an outage: the precise read succeeded and found
   // nothing, which is an answer. Reporting it as unavailable would call a working store broken.
   if (second.kind === "failed") {
-    return { kind: "empty", asked: named, fallbackFailed: second.why };
+    return { kind: "empty", asked: named, actor, fallbackFailed: second.why };
   }
-  if (second.records.length === 0) return { kind: "empty", asked: named, searched: true };
-  return composed(second, limits, SEARCH_HEADING, { asked: named, via: SEARCH_SHAPE });
+  if (second.records.length === 0) return { kind: "empty", asked: named, actor, searched: true };
+  return composed(second, limits, SEARCH_HEADING, { asked: named, via: SEARCH_SHAPE, actor });
 }
 
 /**
@@ -1033,14 +1089,19 @@ function injectionFrom(outcome) {
  */
 function report(outcome, logger) {
   reportDigest(outcome, logger);
+  reportActor(outcome, logger);
   if (outcome?.kind === "recalled") {
     const cost = outcome.tokenEstimate === undefined ? "" : `, ~${outcome.tokenEstimate} tokens`;
     // Which read answered, because the two are different claims and the log is where an operator
     // finds out which one this deployment is actually living on. A store whose every turn is
     // answered by the fallback is not recalling what it was asked about; it is ranking words.
     const via = outcome.via ? ` via ${outcome.via}` : "";
+    // And whose activity went into it, when an actor did. A bundle asks "what has this writer been
+    // doing" alongside the keys, so on a store one agent wrote most of, this clause is how an
+    // operator sees a page of that agent's week arriving in front of every reply.
+    const whose = outcome.actor?.kind === "named" ? `, actor ${outcome.actor.writer}` : "";
     logger?.info?.(
-      `${PLUGIN_ID}: recalled ${outcome.count} record(s)${via}${outcome.degraded ? " (partial)" : ""}${cost}`,
+      `${PLUGIN_ID}: recalled ${outcome.count} record(s)${via}${whose}${outcome.degraded ? " (partial)" : ""}${cost}`,
     );
     return;
   }
@@ -1049,13 +1110,39 @@ function report(outcome, logger) {
     // name no entity at all reads as `about nothing in particular`, and that is a different problem
     // from a store with nothing in it — the fix for one is the wiring, for the other is time.
     const about = outcome.asked?.length ? outcome.asked.join(", ") : "nothing in particular";
+    const whose = outcome.actor?.kind === "named" ? `, and the activity of ${outcome.actor.writer}` : "";
     logger?.info?.(
-      `${PLUGIN_ID}: the memory service matched nothing (asked about ${about}); the turn proceeds with no recalled context`,
+      `${PLUGIN_ID}: the memory service matched nothing (asked about ${about}${whose}); the turn proceeds with no recalled context`,
     );
     return;
   }
   logger?.warn?.(
     `${PLUGIN_ID}: recall unavailable, the turn proceeds without memory: ${outcome?.why ?? "no reason given"}`,
+  );
+}
+
+/**
+ * The actor's own line, said when this turn asked about none because the config named none.
+ *
+ * The whole point of the mechanism above is that this case is *loud*. A `--actor` naming a writer
+ * nothing was ever written under returns an empty page, and an empty page is exactly what a quiet
+ * store returns — so the defect had no symptom at all, and every recall line in the log read `via
+ * search` while nobody could see why. Not passing the flag is the honest question; this line is what
+ * makes the difference visible without reading the config.
+ *
+ * At info and every turn it happens, not once at load: an agent id the map has never heard of is
+ * per-turn news — a new agent, a renamed writer, a map that drifted from the keyring — and load time
+ * cannot know which agents will actually arrive. Nothing warns, because the turn proceeds exactly as
+ * a turn with no actor to ask about always did.
+ */
+function reportActor(outcome, logger) {
+  const plan = outcome?.actor;
+  if (plan?.kind !== "unmapped") return;
+  logger?.info?.(
+    `${PLUGIN_ID}: no actor was asked about: config.actors names no writer for agent ` +
+      `"${plan.agentId}", so this turn asked only about what it could name. An agent id is not a ` +
+      `writer name — a record carries the caller its socket signed as, and only this deployment's ` +
+      `keyring knows which that is`,
   );
 }
 
@@ -1117,6 +1204,26 @@ export default {
       }
     }
 
+    // The third half, and the one whose absence used to be invisible. The other two are settings a
+    // deployment may reasonably not want; this one is the difference between an actor lookup and no
+    // actor lookup at all, and until it existed the plugin sent an agent id that matched nothing and
+    // reported the result as a quiet store. Said either way — what is mapped, or that nothing is —
+    // because a map that has drifted from the keyring looks exactly like a map that is right.
+    const actors = settings.actors && typeof settings.actors === "object" ? settings.actors : {};
+    const mapped = Object.entries(actors).filter(([, writer]) => typeof writer === "string" && writer.trim());
+    if (mapped.length === 0) {
+      api?.logger?.info?.(
+        `${PLUGIN_ID}: no actor is looked up: set config.actors to this deployment's map from agent ` +
+          `id to the writer name its records carry, for example {"main": "main_bot"}. The names are ` +
+          `the keyring's and this plugin cannot derive one from the other, so an agent it does not ` +
+          `name asks about no actor rather than about a writer that may not exist`,
+      );
+    } else {
+      api?.logger?.info?.(
+        `${PLUGIN_ID}: actors: ${mapped.map(([id, writer]) => `${id} records as ${writer.trim()}`).join(", ")}`,
+      );
+    }
+
     // The third, said the same way and for the same reason. Off is the right default — a digest is
     // tokens spent on something nobody asked for — so its absence is a note rather than a warning.
     if (positive(settings.digestDays, 0) <= 0) {
@@ -1169,6 +1276,8 @@ export {
   report,
   bounds,
   actorFor,
+  actorPlan,
+  reportActor,
   entitiesFor,
   inferenceFor,
   threadOf,

@@ -21,11 +21,16 @@ CONFIG=""
 PLUGIN_DIR="${HARNESS_OPENCLAW_MEMORY_PLUGIN_DIR:-$HOME/.local/share/harness/openclaw-memory-plugin}"
 AGENT="main"
 SOCKET=""
-# The two things that let a bundle name this turn. Neither has a path this script could guess, and
-# the entity kind is a deployment's vocabulary rather than this harness's — so both are flags, and
-# the plugin says at load which of them is unwired.
+# The three things that let a bundle name this turn. None has a value this script could guess: the
+# entity kind is a deployment's vocabulary rather than this harness's, the spec directory is a path,
+# and the writer names are the keyring's. So all three are flags, and the plugin says at load which of
+# them is unwired.
 THREAD_KIND="chat_thread"
 SPEC_DIR=""
+# agent id → writer name, comma-separated. Empty is off, and off is the default: a writer name is
+# whatever a record socket signed as, so there is nothing here to derive it from and a guess would
+# send a `--actor` naming nobody — which returns the same empty page a quiet store returns.
+ACTORS=""
 # The window a session-opening digest covers, in days. Empty is off, and off is the default: a digest
 # is tokens spent on something nobody asked for, and only somebody who can see the store knows whether
 # what comes back reads as background or as noise.
@@ -55,6 +60,11 @@ usage: harnesses/openclaw/install-memory.sh [--config FILE] [--plugin-dir DIR] [
                     thread up. Empty turns it off.                       (default chat_thread)
   --spec-dir DIR    the deployment's spec directory (entities.yaml, extractors.yaml), so the turn's
                     message is read for entities too. Empty turns it off.        (default: unset)
+  --actors MAP      this deployment's map from agent id to the writer name that agent's records were
+                    filed under, as `main=main_bot,pr=pr_bot`. An agent id is not a writer name — a
+                    record carries whatever caller its socket signed as — so this cannot be derived
+                    and is not guessed. An agent left out of the map asks about no actor at all.
+                    Empty turns it off.                                          (default: unset)
   --digest-days N   days of recent activity a session wakes up holding, injected on the turn that
                     opens a session and only where the bundle found nothing.
                     Empty turns it off.                                          (default: unset)
@@ -74,6 +84,7 @@ while [ $# -gt 0 ]; do
     --socket)      SOCKET="$2"; shift 2 ;;
     --thread-kind) THREAD_KIND="$2"; shift 2 ;;
     --spec-dir)    SPEC_DIR="$2"; shift 2 ;;
+    --actors)      ACTORS="$2"; shift 2 ;;
     --digest-days) DIGEST_DAYS="$2"; shift 2 ;;
     --budget-ms)   BUDGET_MS="$2"; shift 2 ;;
     --openclaw)    OPENCLAW="$2"; shift 2 ;;
@@ -117,6 +128,44 @@ if [ -n "$SPEC_DIR" ]; then
       exit 1
     }
   done
+fi
+
+# A map that does not parse would reach the config as something the plugin reads as "this agent is
+# unmapped", which is a lookup that looks wired and asks about no actor on every turn — the exact
+# failure this flag exists to end, restored by a typo. Refused here, where it can still be spelled
+# correctly, and the writer names are checked for the two shapes that cannot survive an argument list.
+ACTORS_JSON=""
+if [ -n "$ACTORS" ]; then
+  seen=""
+  IFS=','
+  for pair in $ACTORS; do
+    unset IFS
+    case "$pair" in
+      *=*) ;;
+      *) echo "--actors takes agent=writer pairs: $pair" >&2; exit 2 ;;
+    esac
+    id="${pair%%=*}"
+    writer="${pair#*=}"
+    [ -n "$id" ] && [ -n "$writer" ] || {
+      echo "--actors pair names no agent or no writer: $pair" >&2; exit 2
+    }
+    case "$writer" in
+      -*) echo "--actors writer '$writer' would be read as a flag in the reader's argv" >&2; exit 2 ;;
+      *=*) echo "--actors pair has more than one '=': $pair" >&2; exit 2 ;;
+    esac
+    # Both halves land inside a JSON string this script writes by hand, and both are identifiers on
+    # either side of a socket. Anything outside that alphabet is a quoting bug waiting to happen.
+    case "$id$writer" in
+      *[!A-Za-z0-9_.-]*) echo "--actors names are identifiers: $pair" >&2; exit 2 ;;
+    esac
+    case " $seen " in
+      *" $id "*) echo "--actors names agent '$id' twice" >&2; exit 2 ;;
+    esac
+    seen="$seen $id"
+    ACTORS_JSON="$ACTORS_JSON${ACTORS_JSON:+, }\"$id\": \"$writer\""
+    IFS=','
+  done
+  unset IFS
 fi
 
 [ -n "$SOCKET" ] || SOCKET="$HOME/.local/state/harness/sockets/$AGENT.read.sock"
@@ -176,6 +225,10 @@ fi
 if [ -n "$SPEC_DIR" ]; then
   TURN="$TURN
           \"specDir\": \"$SPEC_DIR\","
+fi
+if [ -n "$ACTORS_JSON" ]; then
+  TURN="$TURN
+          \"actors\": {$ACTORS_JSON},"
 fi
 # The digest's three settings travel together or not at all: two caps with no window to apply them to
 # would read as a configured digest that never fires, which is the shape of wiring nobody debugs.
@@ -263,12 +316,24 @@ What the fragment claims, so it can be checked rather than trusted:
   plugins.slots.memory = $PLUGIN_ID   one plugin owns memory, and naming it disables the built-in
   plugins.entries.active-memory.enabled = false   nothing else may inject memory into a prompt
 
-A bundle composes context out of entities and an actor. With neither named, every turn asks about
-the actor alone and gets whatever that agent happened to write — which is nothing at all until this
-agent has written something, and looks exactly like a quiet store. Two settings close that:
+A bundle composes context out of entities and an actor, and this plugin can state neither on its own.
+With none of them named, every turn asks an empty question and gets an empty answer that looks exactly
+like a quiet store. Three settings close that:
 
   config.threadEntity = ${THREAD_KIND:-<unset>}   a turn inside a thread looks that thread up
   config.specDir      = ${SPEC_DIR:-<unset>}   the turn's message is read for entities too
+  config.actors       = ${ACTORS:-<unset>}   whose activity a turn asks about
+
+The third is the one that cannot be guessed and must not be. The host's agent id — \`main\`, \`pr\` — is
+not the name the store filed that agent's records under: a record carries whatever caller its record
+socket signed as, which on a deployment generating writers from a keyring is a different string. Send
+the agent id and the bundle asks about a writer nothing was ever written by, and answers an empty page
+every turn. So the map is stated rather than derived, and an agent this map leaves out asks about no
+actor at all and says so in the log — a narrower question, honestly asked, instead of a silent zero.
+
+Read the names off the keyring rather than off a pattern, and check one before trusting the map:
+
+  $READER bundle --socket "$SOCKET" --actor <writer> --limit 3
 
 And one setting that is not about the turn at all:
 

@@ -688,6 +688,25 @@ if [ "${1:-}" = "records" ]; then
 fi
 printf '{"records":[],"degraded":false,"omitted":[],"token_estimate":0}'
 STUB
+# Answers one read and one only: the one asking about the *writer name* `main_bot`. An `--actor
+# main` -- the agent id, which is what shipped -- gets the empty page a bundle returns for a writer
+# nothing was ever filed under, so an assertion here cannot pass by being answered anyway. This is
+# the store's own behaviour: measured on the live deployment, `--actor main`, `--actor pr` and
+# `--actor deploy` returned 0 records each while `main_bot`, `pr_bot` and `deploy_bot` returned 8.
+cat > "$(reader actor)" <<'STUB'
+#!/usr/bin/env bash
+[ -n "${READER_ARGS_FILE:-}" ] && printf '%s\n' "$*" >> "$READER_ARGS_FILE"
+case " $* " in
+  *" --actor main_bot "*)
+    cat <<'JSON'
+{"records":[{"record_id":"01ACTOR","received_at":"2026-08-27T00:00:00Z","action":"answer",
+ "outcome":"ok","agent":"main_bot","entities":[],"attrs":{},"tags":[]}],
+ "degraded":false,"omitted":[],"token_estimate":14}
+JSON
+    ;;
+  *) printf '{"records":[],"degraded":false,"omitted":[],"token_estimate":0}' ;;
+esac
+STUB
 cat > "$(reader garbage)" <<'STUB'
 #!/usr/bin/env bash
 printf 'not json at all'
@@ -764,6 +783,12 @@ else:
     # an invented path would make every turn spend a lookup on a read the reader refuses.
     if "specDir" in entry.get("config", {}):
         problems.append("a specDir was wired that nobody asked for")
+    # And the actor map, for a stronger reason than either: the writer names are the deployment's
+    # keyring's, so a map this script invented would send a `--actor` naming a writer that may never
+    # have written anything — which returns the same empty page a quiet store returns. Off unless
+    # somebody who can read the keyring says otherwise.
+    if "actors" in entry.get("config", {}):
+        problems.append("an actor map was wired that nobody asked for")
     # Same rule for the digest, and a stronger reason: the other two settings only widen a lookup
     # the turn was making anyway, where a digest is a block of tokens nobody asked for. Off unless
     # an operator who can see the store says otherwise.
@@ -801,10 +826,15 @@ printf 'version: 1\ndefaults:\n  window: 4\n  confidence: 0.7\nkinds: {}\n' \
   > "$memwork/spec/extractors.yaml"
 "$ocmem" --config "$memconfig" --plugin-dir "$memwork/plug" --reader "$(reader records)" \
   --socket "$memwork/state/main.read.sock" --agent main --spec-dir "$memwork/spec" \
-  --thread-kind chat_thread --digest-days 14 >/dev/null
+  --thread-kind chat_thread --digest-days 14 --actors 'main=main_bot,pr=pr_bot' >/dev/null
 python3 - "$memfragment" "$memwork/spec" <<'TURNCFG' || status=1
 import json, sys
 config = json.load(open(sys.argv[1]))["plugins"]["entries"]["harness-memory"]["config"]
+# The map reaches the config as a map, keyed by agent id and valued by the writer name. The plugin
+# sends the value and never the key: sending the key is the defect the whole setting replaces.
+if config.get("actors") != {"main": "main_bot", "pr": "pr_bot"}:
+    print(f"::error::generated fragment: actors is {config.get('actors')!r}")
+    sys.exit(1)
 if config.get("specDir") != sys.argv[2]:
     print(f"::error::generated fragment: specDir is {config.get('specDir')!r}")
     sys.exit(1)
@@ -845,6 +875,19 @@ if undeclared:
     print(f"::error::the fragment writes settings the manifest does not declare: {undeclared}")
     sys.exit(1)
 DECLARED
+
+echo "→ the recall installer refuses an actor map that does not parse"
+# A map with a typo in it reaches the plugin as an agent it does not name, which asks about no actor
+# on every turn — the same silence the setting exists to end, restored by a comma. Refused here, and
+# a writer that would be read as a flag is refused for the second reason: it goes into an argv.
+for bad in main 'main=' '=main_bot' 'main=-x' 'main=a,main=b' 'main=a b'; do
+  set +e
+  "$ocmem" --config "$memconfig" --plugin-dir "$memwork/plug" --reader "$(reader records)" \
+    --actors "$bad" >/dev/null 2>&1
+  code=$?
+  set -e
+  [ "$code" -ne 0 ] || fail "the recall installer wired --actors '$bad'"
+done
 
 echo "→ the recall installer refuses a digest window that is not a number of days"
 for bad in 0 -3 fortnight; do
@@ -896,7 +939,7 @@ if command -v node >/dev/null 2>&1; then
 // the directory holding the stand-in readers.
 const [, , modulePath, binDir] = process.argv;
 const mod = await import(modulePath);
-const { recall, renderContext, injectionFrom, report, bounds, actorFor, turnOf, threadOf, HEADING,
+const { recall, renderContext, injectionFrom, report, bounds, actorFor, actorPlan, turnOf, threadOf, HEADING,
         MAX_INFER_CHARS, needleFrom, searchArgv, SEARCH_SHAPE, SEARCH_HEADING,
         claimOpening, DIGEST_HEADING, SEEN_SESSIONS } = mod;
 
@@ -966,12 +1009,16 @@ if (!/2 further record/.test(capped)) problems.push("a capped list did not say w
 // The bounds the plugin adds, and the actor the host supplied, reach the process it spawns.
 const argsFile = `${binDir}/../args`;
 process.env.READER_ARGS_FILE = argsFile;
-await recall({ read: reader("empty"), timeoutMs: 4000, maxRecords: 3 }, { agentId: "builder" });
+await recall({ read: reader("empty"), timeoutMs: 4000, maxRecords: 3, actors: { builder: "builder_bot" } },
+  { agentId: "builder" });
 delete process.env.READER_ARGS_FILE;
 const passed = (await import("node:fs")).readFileSync(argsFile, "utf8");
-for (const expected of ["--limit 3", "--deadline-ms 2000", "--timeout-ms 3200", "--actor builder"]) {
+// The actor that reaches the reader is the *writer name* the map gave, never the agent id the host
+// supplied. Sending the id is the defect this whole mechanism replaces.
+for (const expected of ["--limit 3", "--deadline-ms 2000", "--timeout-ms 3200", "--actor builder_bot"]) {
   if (!passed.includes(expected)) problems.push(`the reader was not given ${expected}: ${passed.trim()}`);
 }
+if (passed.includes("--actor builder ")) problems.push(`the agent id was passed as an actor: ${passed.trim()}`);
 // A bound an operator already chose is theirs, not this file's to replace.
 if (bounds(["r", "bundle", "--limit", "1"], 5000, 8).includes("--limit")) {
   problems.push("a configured --limit was overridden");
@@ -981,6 +1028,84 @@ if (actorFor(["r", "bundle", "--actor", "other"], { agentId: "builder" }).length
 }
 // An agent id that would be read as a flag is not passed as one.
 if (actorFor(["r", "bundle"], "--actor").length !== 0) problems.push("an agent id shaped like a flag was passed");
+
+// ── An agent id is not a writer name ─────────────────────────────────────────────────────────────
+// The defect that made half of recall dead on arrival: `ctx.agentId` went straight to `--actor`, and
+// every record in the live store was written by a *writer* the keyring named separately. Measured on
+// that store: `--actor main` 0 records, `--actor main_bot` 8. So the actor half never matched
+// anything, and an empty page is exactly what a quiet store returns -- the failure had no symptom.
+//
+// The mechanism is a map somebody wrote down, because the two that could be derived both invent: a
+// `_bot` suffix promotes one deployment's convention to a fact, and the socket path in `config.read`
+// names one writer for every agent on a host where one read socket serves all three.
+const mapped = { main: "main_bot", pr: "pr_bot" };
+if (actorFor(["r", "bundle"], "main", mapped).join(" ") !== "--actor main_bot") {
+  problems.push(`a mapped agent did not ask about its writer: ${actorFor(["r", "bundle"], "main", mapped).join(" ")}`);
+}
+// **An agent the map does not name asks about no actor.** This is the decision, and it is the whole
+// fix: passing the id is what produced the silent zero, and omitting the flag asks a narrower
+// question honestly.
+for (const [label, id, map] of [
+  ["an agent the map does not name", "deploy", mapped],
+  ["an agent on a deployment with no map at all", "main", undefined],
+  ["a map that is not a map", "main", "main_bot"],
+  ["a writer that would be read as a flag", "main", { main: "--sneaky" }],
+  ["a writer named as nothing", "main", { main: "   " }],
+  ["a writer that is not a string", "main", { main: 7 }],
+]) {
+  const got = actorFor(["r", "bundle"], id, map);
+  if (got.length !== 0) problems.push(`${label} still asked about one: ${got.join(" ")}`);
+  if (actorPlan(["r", "bundle"], id, map).kind !== "unmapped") {
+    problems.push(`${label} was not reported as unmapped: ${JSON.stringify(actorPlan(["r", "bundle"], id, map))}`);
+  }
+}
+// The other three plans, told apart by name rather than by an absent argv, because "the operator
+// named one", "nothing named one" and "no agent id arrived" call for different words in the log.
+if (actorPlan(["r", "bundle", "--actor", "other"], "main", mapped).kind !== "configured") {
+  problems.push("an operator's own --actor was not left alone");
+}
+if (actorPlan(["r", "bundle"], undefined, mapped).kind !== "unnamed") problems.push("a turn with no agent id read as unmapped");
+if (actorPlan(["r", "bundle"], "main", mapped).kind !== "named") problems.push("a mapped agent was not reported as named");
+
+// End to end, against a reader that answers the writer name and nothing else. A mapped agent finds
+// the writer's records; the same turn on an unmapped agent finds nothing and **passes no --actor at
+// all**, which is the difference between a narrower question and a wrong one.
+const actorWired = { read: reader("actor"), actors: { main: "main_bot" } };
+const hit = await recall(actorWired, { agentId: "main" });
+if (hit.kind !== "recalled") problems.push(`a mapped actor recalled nothing: ${hit.kind} ${hit.why ?? ""}`);
+if (hit.actor?.kind !== "named" || hit.actor.writer !== "main_bot") {
+  problems.push(`the outcome did not name the actor it asked about: ${JSON.stringify(hit.actor)}`);
+}
+const hitLog = recorder();
+report(hit, hitLog);
+if (!/actor main_bot/.test(said(hitLog, "info"))) problems.push(`the log did not say whose activity answered: ${said(hitLog, "info")}`);
+
+const missFile = `${binDir}/../unmapped-args`;
+process.env.READER_ARGS_FILE = missFile;
+const miss = await recall({ ...actorWired, searchFallback: false }, { agentId: "deploy" });
+delete process.env.READER_ARGS_FILE;
+const missArgs = (await import("node:fs")).readFileSync(missFile, "utf8");
+if (missArgs.includes("--actor")) problems.push(`an unmapped agent id was passed as an actor: ${missArgs.trim()}`);
+if (miss.kind !== "empty") problems.push(`an unmapped agent gave ${miss.kind}, not an empty answer`);
+if (miss.actor?.kind !== "unmapped" || miss.actor.agentId !== "deploy") {
+  problems.push(`the outcome did not say the agent was unmapped: ${JSON.stringify(miss.actor)}`);
+}
+// And the log says which happened, at info and without a warning: the turn proceeds exactly as a turn
+// with nothing to ask about always did, but nobody has to read the config to find out that is why.
+const missLog = recorder();
+report(miss, missLog);
+const missSaid = said(missLog, "info");
+if (!/no actor was asked about/.test(missSaid)) problems.push(`an unmapped agent was not reported: ${missSaid}`);
+if (!/"deploy"/.test(missSaid)) problems.push(`the report did not name the unmapped agent: ${missSaid}`);
+if (!/config\.actors/.test(missSaid)) problems.push(`the report did not name the setting that fixes it: ${missSaid}`);
+if (said(missLog, "warn")) problems.push(`an unmapped agent warned: ${said(missLog, "warn")}`);
+// A turn that never had an agent id is a different absence and is not reported as a missing map.
+const anon = await recall({ ...actorWired, searchFallback: false }, {});
+const anonLog = recorder();
+report(anon, anonLog);
+if (/no actor was asked about/.test(said(anonLog, "info"))) {
+  problems.push(`a turn with no agent id was blamed on the map: ${said(anonLog, "info")}`);
+}
 
 // ── What a turn can tell a bundle about itself ────────────────────────────────────────────────────
 // A bundle composes context out of entities and an actor. Asking about the actor alone is what left
@@ -1352,11 +1477,11 @@ garbage and no answer; and an empty match reads differently"
   # A failure that injects whatever it has: the fail-open path stops being distinguishable from a hit.
   mutate injects-on-failure 's/if (outcome?.kind === "recalled") blocks.push/if (outcome?.kind !== "impossible") blocks.push/'
   # A quiet store reported as a broken one: the distinction the log exists to keep.
-  mutate empty-as-failure 's/if (!fallback) return { kind: "empty", asked: named };/if (!fallback) return { kind: "unavailable", why: "no rows" };/'
+  mutate empty-as-failure 's/if (!fallback) return { kind: "empty", asked: named, actor };/if (!fallback) return { kind: "unavailable", why: "no rows" };/'
   # The fallback presenting a ranked keyword hit as a composed bundle: the provenance the second
   # heading exists to keep. This is the mutant that matters most about the fallback -- everything
   # else it could get wrong is visible, and this one reads as a better answer than it is.
-  mutate search-as-bundle 's/return composed(second, limits, SEARCH_HEADING, { asked: named, via: SEARCH_SHAPE });/return composed(second, limits, HEADING, { asked: named, via: READ_SHAPE });/'
+  mutate search-as-bundle 's/return composed(second, limits, SEARCH_HEADING, { asked: named, via: SEARCH_SHAPE, actor });/return composed(second, limits, HEADING, { asked: named, via: READ_SHAPE, actor });/'
   # A needle that keeps the question mark: the syntax error that made the first version useless.
   mutate needle-unquoted 's/terms.push(`"${word}"`);/terms.push(word);/'
   # The host's envelope left on the front of the message. This is the defect the numbers above came
@@ -1386,6 +1511,26 @@ garbage and no answer; and an empty match reads differently"
   mutate thread-mis-spelled 's|return `${conversation}/${thread}`;|return `${conversation}:${thread}`;|'
   # The message never read for entities, so the other half of the lookup goes missing.
   mutate message-never-read 's|if (!text \|\| typeof specDir !== "string"|if (true \|\| typeof specDir !== "string"|'
+
+  # --- an agent id is not a writer name ---
+  # The defect that shipped, restored exactly: an agent the map does not name has its *id* sent as the
+  # actor. On the live store that asked about `main`, `pr` and `deploy`, which nothing was ever written
+  # by, so the actor half of every bundle matched nothing and the answer was an empty page --
+  # indistinguishable from a quiet store, which is why it survived shipping. This is the mutant this
+  # section exists for.
+  mutate actor-unmapped-id-passed \
+    's|if (typeof writer !== "string") return { kind: "unmapped", agentId: id };|if (typeof writer !== "string") return { kind: "named", writer: id };|'
+  # The same failure by the tidier route: a suffix rule instead of a map. It would have worked on this
+  # one deployment, which is the whole objection -- a convention that returns a string cannot be told
+  # apart from a fact that returns a string, and the next host to name a writer differently gets the
+  # silent zero back with a rule behind it.
+  mutate actor-suffix-invented \
+    's|const writer = actors \&\& typeof actors === "object" ? actors\[id\] : undefined;|const writer = (actors \&\& typeof actors === "object" ? actors[id] : undefined) ?? (id + "_bot");|'
+  # A writer name that would be parsed as a flag, reaching the argument list.
+  mutate actor-flag-shaped-writer 's|if (!trimmed \|\| trimmed.startsWith("-")) return { kind: "unmapped", agentId: id };|if (!trimmed) return { kind: "unmapped", agentId: id };|'
+  # And the silence itself: the omission is correct and invisible unless the log says it happened.
+  # Without this line an operator sees `via search` on every turn and no reason anywhere.
+  mutate actor-unmapped-unsaid 's|if (plan?.kind !== "unmapped") return;|if (true) return;|'
 
   # --- the session-opening digest ---
   # The two that matter most, first. This hook fires every turn, so a digest that lost its fence is a

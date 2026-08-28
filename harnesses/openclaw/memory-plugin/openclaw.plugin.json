@@ -26,6 +26,14 @@
         "title": "Thread entity kind",
         "description": "The entity kind this deployment files conversations under, as its spec/entities.yaml declares it. Set it and a turn inside a thread looks that thread up; leave it unset and no thread is asked about. There is no default, because an entity vocabulary belongs to the deployment rather than to this harness."
       },
+      "actors": {
+        "type": "object",
+        "additionalProperties": {
+          "type": "string"
+        },
+        "title": "Agent id to writer name",
+        "description": "This deployment's map from the host's agent id to the writer name that agent's records were filed under \u2014 for example {\"main\": \"main_bot\"}. The two are named separately on purpose: a record carries whatever caller its record socket signed as, so the writer name belongs to the keyring and this plugin cannot derive it from an agent id. An agent this map does not name asks about no actor at all, and says so in the log; passing the agent id instead would ask about a writer that never wrote anything and return a page indistinguishable from a quiet store."
+      },
       "specDir": {
         "type": "string",
         "title": "Entity spec directory",
