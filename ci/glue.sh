@@ -600,7 +600,10 @@ STUB
 cat > "$(reader fallback)" <<'STUB'
 #!/usr/bin/env bash
 [ -n "${READER_ARGS_FILE:-}" ] && printf '%s\n' "$*" >> "$READER_ARGS_FILE"
-if [ "${1:-}" = "search" ]; then
+if [ "${1:-}" = "records" ]; then
+  # A window, for the one assertion that asks whether a ranked hit takes the turn from the digest.
+  printf '{"records":[{"record_id":"01WINDOW","received_at":"2026-08-28T06:22:34Z","action":"deploy","outcome":"success","agent":"deploy_bot","entities":[],"attrs":{},"tags":[]}],"token_estimate":9}'
+elif [ "${1:-}" = "search" ]; then
   cat <<'JSON'
 {"records":[{"record_id":"01SEARCH","received_at":"2026-01-05T00:00:00Z","action":"import",
  "outcome":"success","agent":"memory_import","entities":[],"attrs":{"source":"2026-03-13.md"},
@@ -1191,15 +1194,30 @@ const unasked = await spawned({ threadEntity: "chat_thread", read: reader("diges
 if (injectionFrom(unasked.outcome) !== undefined) problems.push("a digest was injected with no digestDays configured");
 if (unasked.asked.some((line) => line.startsWith("records"))) problems.push(`an unconfigured digest still read the window: ${unasked.asked.join(" | ")}`);
 
-// **Recall wins the space.** A bundle that answered takes the turn, the window is not even read, and
-// nothing unasked-for is appended to an answer somebody asked for.
+// **A bundle takes the turn.** It is the composed answer to the question that was asked, so the
+// window is not even read and nothing unasked-for is appended to it.
 SEEN_SESSIONS.clear();
 const answered = await spawned({ ...digested, read: reader("records") }, digestTurn("s-hit", []));
 if (answered.outcome.kind !== "recalled") problems.push(`a bundle with records gave ${answered.outcome.kind} on an opening turn`);
 if (injectionFrom(answered.outcome)?.prependContext?.includes(DIGEST_HEADING)) {
-  problems.push("a digest was injected beside a recall that had an answer");
+  problems.push("a digest was injected beside a bundle that answered");
 }
-if (answered.asked.some((line) => line.startsWith("records"))) problems.push(`a successful recall still spent a window read: ${answered.asked.join(" | ")}`);
+if (answered.asked.some((line) => line.startsWith("records"))) problems.push(`a bundle that answered still spent a window read: ${answered.asked.join(" | ")}`);
+
+// **A ranked search does not.** The fallback's own heading concedes its records may not be about the
+// message, so a turn holding only that has been handed a rank rather than an answer. Measured rather
+// than reasoned about: this host prefixes a timestamp to the prompt, so the needle carries the date
+// and the fallback answers the clock on every turn -- under a rule where any recall took the space,
+// no digest would ever have been injected on the deployment this was built for.
+SEEN_SESSIONS.clear();
+const ranked = await spawned(
+  { ...digested, read: reader("fallback") },
+  turnOf({ threadEntity: "chat_thread" }, { prompt: "WUPGHGJ7ELJM626", messages: [] }, { agentId: "main", sessionKey: "s-ranked" }),
+);
+if (ranked.outcome.kind !== "recalled") problems.push(`the fallback did not recall on an opening turn: ${ranked.outcome.kind}`);
+const both = injectionFrom(ranked.outcome)?.prependContext ?? "";
+if (!both.startsWith(SEARCH_HEADING)) problems.push("the stronger claim was not rendered first");
+if (!both.includes(DIGEST_HEADING)) problems.push("a ranked hit took the turn from the digest");
 
 // **A digest that fails costs the turn nothing.** The bundle succeeded and matched nothing, which is
 // an answer; a window read that could not be made must not turn that into an outage.
@@ -1334,9 +1352,14 @@ garbage and no answer; and an empty match reads differently"
   # away, and the window read over the same socket may well answer.
   mutate recall-failure-sinks-digest \
     's|return withDigest(outcome, settings, argv, turn, deadline);|return outcome.kind === "unavailable" ? outcome : withDigest(outcome, settings, argv, turn, deadline);|'
-  # A digest injected beside an answer somebody actually asked for. Recall wins the space; this is the
-  # budget rule, and breaking it spends the turn's tokens twice.
-  mutate digest-outranks-recall 's|if (outcome.kind === "recalled") return outcome;|if (false) return outcome;|'
+  # A digest injected beside the composed answer to the question that was asked. Half the budget rule,
+  # and breaking it spends the turn's tokens twice.
+  mutate digest-outranks-a-bundle \
+    's|if (outcome.kind === "recalled" \&\& outcome.via === READ_SHAPE) return outcome;|if (false) return outcome;|'
+  # The other half: a ranked keyword hit taking the turn from the digest. This is the one that would
+  # have made the feature inert on a live host, where the fallback answers the date in the prompt's
+  # own timestamp every single turn.
+  mutate digest-yields-to-a-ranked-hit 's|outcome.kind === "recalled" \&\& outcome.via === READ_SHAPE|outcome.kind === "recalled"|'
   # Background presented as an answer: the same provenance failure as search-as-bundle, one step
   # further out, because a digest is not about this message at all.
   mutate digest-as-recall 's|return \[DIGEST_HEADING, ...lines|return [HEADING, ...lines|'

@@ -56,7 +56,7 @@ usage: harnesses/openclaw/install-memory.sh [--config FILE] [--plugin-dir DIR] [
   --spec-dir DIR    the deployment's spec directory (entities.yaml, extractors.yaml), so the turn's
                     message is read for entities too. Empty turns it off.        (default: unset)
   --digest-days N   days of recent activity a session wakes up holding, injected on the turn that
-                    opens a session and only where recall itself found nothing.
+                    opens a session and only where the bundle found nothing.
                     Empty turns it off.                                          (default: unset)
   --budget-ms MS    how long one lookup gets, in front of a reply        (default 5000)
   --openclaw CMD    the harness CLI, used to apply                       (default openclaw on PATH)
@@ -273,8 +273,9 @@ agent has written something, and looks exactly like a quiet store. Two settings 
 And one setting that is not about the turn at all:
 
   config.digestDays   = ${DIGEST_DAYS:-<unset>}   the turn that opens a session also carries a
-  date-grouped digest of what was recorded in that many days — but only where the two reads above
-  found nothing, so recall keeps the space whenever it has an answer.
+  date-grouped digest of what was recorded in that many days — but only where the bundle found
+  nothing, so the composed answer to the question keeps the space whenever there is one. A ranked
+  search hit does not: by its own heading it may not be about the message at all.
 
 A digest says who acted, when, and what they referenced. It cannot say what any of it was about:
 every read here returns frontmatter and this store holds no prose that could. Turn it on where that

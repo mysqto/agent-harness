@@ -673,10 +673,22 @@ function unusable(argv) {
  * asked. The caller turns those into an injection and a log line; nothing downstream has to infer
  * which happened from an absent result.
  *
- * The digest is a *field* on those outcomes rather than a fourth one, and that is the budget rule
- * written down: the two are never both injected, because the digest is only attempted on a turn where
- * recall did not recall. Recall answers the question that was actually asked, so it takes the space
- * whenever it has an answer; the digest takes the turn where recall had nothing to lose to it.
+ * The digest is a *field* on those outcomes rather than a fourth one, and the budget rule between them
+ * is written down here: **a bundle takes the turn, a ranked search does not.**
+ *
+ * A bundle is the composed answer to the question actually asked, so when it answers, nothing
+ * unasked-for goes in beside it and no second read is spent finding out what one would have said.
+ * The fallback is a weaker claim by its own heading — records that *mention* the message's words and
+ * may not be about them — and a turn holding only that has not had its question answered; it has been
+ * handed a rank. Background it can act on is worth more there, not less.
+ *
+ * That is a decision the measurement made rather than the design. This host prefixes a timestamp to
+ * `event.prompt`, so on a live deployment the needle reads `"Fri" OR "2026-08-28" OR "GMT" OR …` and
+ * the fallback answers *today's date* on every turn. Under a rule where any recall took the space, a
+ * digest would never once have been injected — gated off by a keyword hit on the clock.
+ *
+ * The cost is that the opening turn can carry both blocks. It is bounded twice — once per session, and
+ * by two ceilings that do not share — and the strongest claim is rendered first.
  *
  * The isolation runs both ways, and neither direction is incidental:
  *
@@ -707,9 +719,9 @@ async function recall(settings, turn) {
   const deadline = Date.now() + budgetMs;
 
   const outcome = await answerFor(settings, argv, turn, named, limits, budgetMs, deadline);
-  // Recall answered. Nothing unasked-for goes in beside it, and no second read is spent finding out
-  // what it would have said.
-  if (outcome.kind === "recalled") return outcome;
+  // The bundle answered the question. Nothing unasked-for goes in beside it, and no second read is
+  // spent finding out what one would have said. A ranked hit does not clear that bar — see above.
+  if (outcome.kind === "recalled" && outcome.via === READ_SHAPE) return outcome;
   return withDigest(outcome, settings, argv, turn, deadline);
 }
 

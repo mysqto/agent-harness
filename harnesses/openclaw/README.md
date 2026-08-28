@@ -415,7 +415,7 @@ on `before_prompt_build`, behind a fence:
 | `config.digestDays` is set | the config | a deployment paying for a block nobody chose |
 | `event.messages` is empty | the hook payload | every turn after the session's first |
 | the session is unseen | this process | a backend that hands over an empty history each run |
-| recall found nothing | this turn's own reads | spending the turn's tokens twice |
+| the bundle found nothing | this turn's own reads | spending the turn's tokens twice |
 | the shared deadline has room | the budget | an unasked-for read extending somebody else's wait |
 
 **The first-turn signal is read off the payload, not guessed.** `event.messages` is the session's
@@ -430,12 +430,34 @@ out by the payload signal, which a restart does not touch. A turn whose payload 
 all is never an opening: a turn this cannot tell apart from the next one is exactly the turn that
 would become every turn.
 
-**Recall wins the space, and the two are never both injected.** The digest is attempted only where the
-bundle *and* the search fallback came back with nothing — the one turn on which recall has nothing to
-lose to it. So there is no rule for splitting `maxChars` between them, because they never both want
-it. The digest has its own caps anyway (`digestMaxRecords`, `digestMaxChars`, both defaulting below
-recall's ceiling), because a window read returns a window rather than a match and is the likelier of
-the two to need cutting.
+**A bundle takes the turn; a ranked search does not.** That is the budget rule between the two, and
+it is the one decision here the measurement made rather than the design.
+
+A bundle is the composed answer to the question actually asked, so where it answers, nothing
+unasked-for goes in beside it and the window is not even read. The fallback is a weaker claim by its
+own heading — records that *mention* the message's words and may not be about them — and a turn
+holding only that has not had its question answered; it has been handed a rank. Background it can act
+on is worth more there, not less.
+
+The first version of this yielded to any recall at all, which is the obvious rule and would have
+shipped a feature that never fired once. **This host prefixes a timestamp to `event.prompt`**, so the
+needle a live turn builds reads
+
+```
+--query "Fri" OR "2026-08-28" OR "GMT" OR "Zzyzxqq"
+```
+
+and the fallback matches today's records on the *date*, on every turn, whatever the person asked. Any
+rule that let that take the space would gate the digest off on a keyword hit against the clock. (The
+needle carrying the envelope at all is worth its own look — the heading it is injected under says
+"words in this message", and a timestamp the host wrote is not one. It is left alone here because
+narrowing it changes what recall returns on every turn, which is a separate change with a separate
+measurement to take.)
+
+The cost is that an opening turn can carry both blocks. It is bounded twice — at most once per
+session, and by two ceilings that do not share. `digestMaxRecords` and `digestMaxChars` default below
+recall's own, because a window read returns a window rather than a match and is the likelier of the
+two to be cut. The stronger claim is rendered first.
 
 **One read failing does not cost the turn the other.** They fail independently, in both directions,
 and each direction has a mutant:
