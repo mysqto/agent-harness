@@ -1146,6 +1146,44 @@ if (swapped.join(" ") !== "yaam-read search --socket /srv/x.sock") {
   problems.push(`the fallback did not reuse the reader and socket: ${swapped.join(" ")}`);
 }
 
+// --- the host's envelope, and the calendar ---------------------------------------------------------
+// `event.prompt` is not the message: this host prepends an RFC-1123 timestamp, and until it was taken
+// off, every needle searched for the current date. Measured on the live store before the fix: the four
+// terms one stamp contributes matched 36 of 73 records on their own, and a bare-identifier turn came
+// back with 8 records of which 1 named the identifier. The fallback was ranking the calendar and
+// reporting it as a hit, which is worse than returning nothing, because nothing is legible.
+const STAMP = "Fri, 28 Aug 2026 15:16:51 GMT";
+const stamped = turnOf(wired, { prompt: `${STAMP}\nany knowledge abou this? WUPGHGJ7ELJM626` },
+  { agentId: "main" });
+if (stamped.text !== "any knowledge abou this? WUPGHGJ7ELJM626") {
+  problems.push(`the host's framing reached the turn as if a person had typed it: ${JSON.stringify(stamped.text)}`);
+}
+const stampedNeedle = needleFrom(stamped.text) ?? "";
+// The case the fallback exists for. It has to survive every rule added above it.
+if (!stampedNeedle.includes('"WUPGHGJ7ELJM626"')) {
+  problems.push(`a stamped turn lost the identifier the fallback is for: ${stampedNeedle}`);
+}
+for (const dated of ['"Fri"', '"Aug"', '"2026"', '"GMT"']) {
+  if (stampedNeedle.includes(dated)) problems.push(`the needle searched the calendar for ${dated}: ${stampedNeedle}`);
+}
+// And a date the person typed themselves, which no envelope strip can reach. Two rules, two reasons:
+// one is about whose words these are, the other about what a word can distinguish.
+const typed = needleFrom("what shipped on Fri 28 Aug 2026 GMT") ?? "";
+for (const dated of ['"Fri"', '"Aug"', '"2026"', '"GMT"']) {
+  if (typed.includes(dated)) problems.push(`a date somebody typed became a needle term ${dated}: ${typed}`);
+}
+// A turn that is nothing but the stamp asked nothing, and is not worth a second lookup.
+if (needleFrom(turnOf(wired, { prompt: STAMP }, { agentId: "main" }).text) !== undefined) {
+  problems.push("a prompt holding nothing but the host's stamp still produced a needle");
+}
+// An identifier is not a date, however lenient a date reader would be about it. `Date.parse` accepts
+// `PROJ-2087` as a date in the year 2087, so a stripper built on one would throw away the one kind of
+// line this fallback exists to read.
+const kept = turnOf(wired, { prompt: "PROJ-2087\nwhat happened here" }, { agentId: "main" });
+if (kept.text !== "PROJ-2087\nwhat happened here") {
+  problems.push(`an identifier line was read as the host's framing: ${JSON.stringify(kept.text)}`);
+}
+
 // --- the session-opening digest ------------------------------------------------------------------
 // The one thing here that is not about the turn. `before_prompt_build` fires every turn, so the whole
 // feature rests on a fence: off unless configured, once per session, and never in front of a recall
@@ -1321,6 +1359,19 @@ garbage and no answer; and an empty match reads differently"
   mutate search-as-bundle 's/return composed(second, limits, SEARCH_HEADING, { asked: named, via: SEARCH_SHAPE });/return composed(second, limits, HEADING, { asked: named, via: READ_SHAPE });/'
   # A needle that keeps the question mark: the syntax error that made the first version useless.
   mutate needle-unquoted 's/terms.push(`"${word}"`);/terms.push(word);/'
+  # The host's envelope left on the front of the message. This is the defect the numbers above came
+  # from: it has no symptom at all, because the fallback answers every turn and the log calls it a
+  # recall -- it just answers about the date rather than about the question.
+  mutate envelope-not-stripped 's|const message = withoutEnvelope(prompt);|const message = prompt;|'
+  # The calendar back in the needle, for a date nobody prepended. The envelope strip does not cover
+  # this and cannot: the words are the person's own.
+  mutate needle-keeps-the-calendar 's|if (calendarToken(word)) continue;|if (false) continue;|'
+  # The same rule with only its year half broken, because a bare `2026` is the single term that did
+  # the most damage -- on the live store it matched 36 of 73 records by itself.
+  mutate needle-keeps-the-year 's|YEAR_SHAPED.test(folded)|false|'
+  # A stripper that takes the front off whatever arrives. The failure this trades for the other one:
+  # a needle that lost the identifier is as useless as a needle that searched the clock, and quieter.
+  mutate envelope-eats-the-message 's|if (!tail \|\| !envelopeLine(head)) break;|if (false) break;|'
   # The fallback bounded as though it were a bundle: a usage error the real reader refuses and every
   # fake accepts.
   mutate fallback-bundle-bounds 's/searchBounds(argvSearch, left/bounds(argvSearch, left/'

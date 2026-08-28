@@ -154,6 +154,51 @@ const SEARCH_STOPWORDS = new Set([
 ]);
 
 /**
+ * Words that name a point on the calendar or the clock rather than a subject.
+ *
+ * Separate from the stoplist above, and dropped for a different reason. A framing word says nothing
+ * about *this* question; a calendar word says nothing about *any* question. Every record carries a
+ * timestamp and most prose about work carries a date, so a needle holding `2026` ranks on the store's
+ * own clock. Measured on this deployment: `"2026"` alone matched 36 of 73 records, and the four terms
+ * one host timestamp contributed matched the same 36. A term half a store contains is not a search —
+ * it is a page of the store with a search's provenance on it.
+ *
+ * Names rather than shapes, because that is what the words of a date are; the shapes are below.
+ */
+const CALENDAR_WORDS = new Set([
+  "mon", "monday", "tue", "tues", "tuesday", "wed", "weds", "wednesday", "thu", "thur", "thurs",
+  "thursday", "fri", "friday", "sat", "saturday", "sun", "sunday",
+  "jan", "january", "feb", "february", "mar", "march", "apr", "april", "may", "jun", "june",
+  "jul", "july", "aug", "august", "sep", "sept", "september", "oct", "october", "nov", "november",
+  "dec", "december",
+  "gmt", "utc", "est", "edt", "cst", "cdt", "mst", "mdt", "pst", "pdt", "cet", "cest",
+  "bst", "ist", "jst", "aest", "nzst",
+]);
+
+/**
+ * A bare year, and an ISO date.
+ *
+ * Bounded to plausible years rather than any four digits: an order number, a port and an amount are
+ * all four digits, and dropping those would be a different decision made by accident.
+ */
+const YEAR_SHAPED = /^(?:19|20|21)\d{2}$/;
+const ISO_DATE_SHAPED = /^(?:19|20|21)\d{2}-\d{2}(?:-\d{2})?$/;
+
+/** Whether one token names a moment rather than a subject. Read by the needle and by the envelope. */
+function calendarToken(word) {
+  const folded = String(word).toLowerCase();
+  return CALENDAR_WORDS.has(folded) || YEAR_SHAPED.test(folded) || ISO_DATE_SHAPED.test(folded);
+}
+
+/**
+ * How many leading lines may be read as the host's framing rather than the person's message.
+ *
+ * A bound rather than a judgement. One stamp is what this host prepends; a pasted log is a wall of
+ * timestamps that is very much the message, and a stripper with no ceiling would eat it.
+ */
+const MAX_ENVELOPE_LINES = 4;
+
+/**
  * How little of the budget is still worth a second lookup.
  *
  * The fallback shares one deadline with the bundle rather than getting its own: the outer bound this
@@ -313,6 +358,70 @@ function claimOpening(event, ctx) {
 }
 
 /**
+ * Whether one line is host framing rather than something a person wrote.
+ *
+ * The test is what the line is *made of*, not what it looks like: split it into words, and if every
+ * one of them is a calendar word, a shape a date has, or a run of digits — and at least one of them
+ * actually names a moment — then the line said when and nothing else, which is a thing a host says
+ * and not a thing a person asks.
+ *
+ * Deliberately not `Date.parse`. That would be the general reader for the general shape, and it
+ * accepts `PROJ-2087` as a date in the year 2087 — so the one line the fallback exists to read would be
+ * the line most likely to be thrown away. A classifier that is lenient in the direction of deleting
+ * the message is the wrong kind of general.
+ */
+function envelopeLine(line) {
+  // Letter/digit boundaries split too, so `2026-08-28T15:16:51Z` comes apart into its parts rather
+  // than into `28T15` and `51Z`.
+  const words = line.split(/[^A-Za-z0-9]+/).flatMap((part) =>
+    part.split(/(?<=\d)(?=[A-Za-z])|(?<=[A-Za-z])(?=\d)/)).filter(Boolean);
+  if (words.length === 0) return false;
+  let named = false;
+  for (const word of words) {
+    if (calendarToken(word)) {
+      named = true;
+      continue;
+    }
+    // A run of digits is a day, an hour, a minute, a second or an offset; a lone letter is the `T`
+    // or the `Z` a machine writes between them. Neither carries a subject, and neither on its own is
+    // enough to call the line a timestamp — that is what `named` is for.
+    if (/^\d+$/.test(word) || word.length === 1) continue;
+    return false;
+  }
+  return named;
+}
+
+/**
+ * The person's message, with the host's framing taken off the front.
+ *
+ * This is where the fallback's needle went wrong, and the mistake was one of provenance rather than
+ * of parsing: `event.prompt` is not the message, it is the message with whatever the host chose to
+ * prepend. On this host that is one RFC-1123 timestamp, and it turned every needle into a search for
+ * the current date — but the class is wider than dates, because anything the host prepends arrives
+ * the same way and is a subject nobody raised.
+ *
+ * Taken off here, at the one function that reads the payload, rather than in `needleFrom`: the
+ * envelope is not the message for the *bundle's* inference either, and a reader told to infer lookup
+ * keys from a date is being asked a question about the calendar just as surely.
+ *
+ * Only leading lines, only while something is left, and only a few of them. A prompt that is nothing
+ * but a stamp keeps it — there is no message underneath to prefer, and `needleFrom` will decline it
+ * on its own, which is the right answer arrived at by the honest route.
+ */
+function withoutEnvelope(prompt) {
+  let rest = prompt;
+  for (let stripped = 0; stripped < MAX_ENVELOPE_LINES; stripped += 1) {
+    const at = rest.indexOf("\n");
+    if (at < 0) break;
+    const head = rest.slice(0, at).trim();
+    const tail = rest.slice(at + 1).trim();
+    if (!tail || !envelopeLine(head)) break;
+    rest = tail;
+  }
+  return rest;
+}
+
+/**
  * What one turn knows about itself, read off the hook's own payload.
  *
  * Separated from the lookup so that "what the host gives us" is one function with one place to look
@@ -323,10 +432,12 @@ function turnOf(settings, event, ctx) {
   const kind = typeof settings?.threadEntity === "string" ? settings.threadEntity.trim() : "";
   const thread = kind ? threadOf(ctx?.channelId ?? ctx?.chatId) : undefined;
   const prompt = typeof event?.prompt === "string" ? event.prompt.trim() : "";
+  // The envelope comes off before the cap, not after: it sits at the front, and the cap keeps the end.
+  const message = withoutEnvelope(prompt);
   return {
     agentId: ctx?.agentId,
     entities: thread ? [`${kind}:${thread}`] : [],
-    text: prompt ? prompt.slice(-MAX_INFER_CHARS) : undefined,
+    text: message ? message.slice(-MAX_INFER_CHARS) : undefined,
     // Claimed here rather than in the lookup, because this is the one function that sees the payload
     // and the claim has to happen once per turn however the lookup then goes.
     opening: claimOpening(event, ctx),
@@ -628,6 +739,11 @@ function digestPlan(settings, argv, turn, deadline) {
  * OR rather than AND because this runs only after the bundle matched nothing: the precise question
  * has already been asked and missed, and what is left worth doing is ranking whatever mentions any
  * of these words. The reader's own `--limit` is what keeps that honest.
+ *
+ * Calendar words are refused as terms even though `turnOf` has already taken the host's stamp off the
+ * front. The two rules answer different questions and both are needed: the envelope is about *whose
+ * words these are*, and this is about *what a word can distinguish*. A date a person typed themselves
+ * is still a term every record in a dated store can match.
  */
 function needleFrom(text) {
   if (typeof text !== "string") return undefined;
@@ -637,6 +753,7 @@ function needleFrom(text) {
     if (terms.length >= MAX_SEARCH_TERMS) break;
     const word = raw.trim();
     if (word.length < MIN_TERM_CHARS) continue;
+    if (calendarToken(word)) continue;
     const folded = word.toLowerCase();
     if (SEARCH_STOPWORDS.has(folded) || seen.has(folded)) continue;
     seen.add(folded);
@@ -1056,6 +1173,10 @@ export {
   inferenceFor,
   threadOf,
   turnOf,
+  withoutEnvelope,
+  envelopeLine,
+  calendarToken,
+  MAX_ENVELOPE_LINES,
   settingsFrom,
   unusable,
   PLUGIN_ID,

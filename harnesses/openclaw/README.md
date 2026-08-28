@@ -327,6 +327,29 @@ with one word swapped. Three things keep it from being a second, sloppier bundle
   than searched for. Quoting is not cosmetic: the needle is a match expression the index parses, so
   an unquoted `?` from an ordinary question is a syntax error that refuses the whole read. A message
   with nothing but framing in it produces no needle and no second lookup.
+- **The needle is built from the message, and `event.prompt` is not the message.** The host prepends
+  an envelope — on this deployment one RFC-1123 timestamp, on the line above what the person wrote.
+  It arrives as prose and reads as prose, so for as long as it was left on, `needleFrom` turned
+  `Zzyzxqq` into `"Fri" OR "Aug" OR "2026" OR "GMT" OR "Zzyzxqq"` and the fallback ranked the
+  calendar. Measured on the live store before the fix: those four date terms matched **36 of 73
+  records on their own**; a bare-identifier turn came back with 8 records of which **1** named the
+  identifier; a greeting came back with 8 of which **1** held any of its words. All of it was
+  injected under a heading claiming the records mention words in the message.
+
+  So the envelope comes off in `turnOf`, at the one function that reads the payload, rather than in
+  `needleFrom`. It is not the message for the *bundle's* `--infer-from` either, and a fix a layer
+  later would leave the reader inferring lookup keys from a date. A leading line is framing when
+  every word in it names a moment — a weekday, a month, a year, a timezone, a run of digits — and at
+  least one of them actually is one. Only leading lines, only while something is left below them, and
+  at most four, so a pasted log stays the message it is. Deliberately **not** `Date.parse`, which
+  accepts `PROJ-2087` as a date in the year 2087: a classifier that errs towards deleting the message
+  is the wrong kind of general, and the line it would delete is the line this fallback exists for.
+- **Calendar words are not terms, wherever they came from.** A second rule, in `needleFrom`, for a
+  different reason: the envelope rule is about *whose words these are*, this one about *what a word
+  can distinguish*. Every record carries a timestamp, so `"2026"` is a term half a store matches —
+  36 of 73 here — whether the host wrote it or a person did. Weekday and month names, bare years, ISO
+  dates and timezone abbreviations are dropped as terms. Years are bounded to `19xx`–`21xx`, so an
+  order number of four digits is not quietly read as one.
 - **It shares one deadline.** The fallback takes what is left of the budget the bundle did not use,
   and is skipped below a floor. The outer bound this hook registers is what stands between recall
   and a reply that looks hung, and a fallback that could double the wait would spend a bound
@@ -441,18 +464,28 @@ on is worth more there, not less.
 
 The first version of this yielded to any recall at all, which is the obvious rule and would have
 shipped a feature that never fired once. **This host prefixes a timestamp to `event.prompt`**, so the
-needle a live turn builds reads
+needle a live turn built read
 
 ```
---query "Fri" OR "2026-08-28" OR "GMT" OR "Zzyzxqq"
+--query "Fri" OR "Aug" OR "2026" OR "GMT" OR "Zzyzxqq"
 ```
 
-and the fallback matches today's records on the *date*, on every turn, whatever the person asked. Any
-rule that let that take the space would gate the digest off on a keyword hit against the clock. (The
-needle carrying the envelope at all is worth its own look — the heading it is injected under says
-"words in this message", and a timestamp the host wrote is not one. It is left alone here because
-narrowing it changes what recall returns on every turn, which is a separate change with a separate
-measurement to take.)
+and the fallback matched today's records on the *date*, on every turn, whatever the person asked. Any
+rule that let that take the space would have gated the digest off on a keyword hit against the clock.
+
+That envelope is gone now — the measurement it was waiting for was taken, and the needle is built
+from the message rather than from the payload; see the fallback section above for the numbers and the
+rule. **The budget rule does not change with it**, and it is worth being clear why, because the
+reading that says "the fallback is honest now, so let it take the turn" is the wrong one. A search
+was never demoted for being *wrong*; it was demoted for being a *rank*. Its heading still says these
+records mention the message's words and may not be about them, and that is still not an answer to the
+question. What the fix changed is how often the rank is worth reading, not what kind of claim it is.
+
+What the fix did change is how often the fallback returns anything at all. Re-measured on the same
+store: a turn naming nothing keeps its 8 records because its own prose is generic (`refund` alone
+matches 21 of 73 here), but a greeting drops from 8 records to 1, and a bare identifier from 8 to 1 —
+the one record that actually names it. A digest now shares an opening turn with far less noise, and
+on some turns with nothing at all.
 
 The cost is that an opening turn can carry both blocks. It is bounded twice — at most once per
 session, and by two ceilings that do not share. `digestMaxRecords` and `digestMaxChars` default below
