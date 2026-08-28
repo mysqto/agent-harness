@@ -150,12 +150,14 @@ Recall is wired, by a second plugin and a second installer:
 
 ```sh
 harnesses/openclaw/install-memory.sh --config ~/.openclaw/openclaw.json --agent main \
-  --thread-kind chat_thread --spec-dir /srv/memory/spec
+  --thread-kind chat_thread --spec-dir /srv/memory/spec --digest-days 14
 ```
 
-The last two are what let a bundle name the turn rather than only its actor; see *[What a turn can
-say about itself](#what-a-turn-can-say-about-itself)*. Both are optional and both are off by
-default — the plugin says at load which of them is unwired.
+The middle two are what let a bundle name the turn rather than only its actor; see *[What a turn can
+say about itself](#what-a-turn-can-say-about-itself)*. The last is the one block here that is not
+about the turn at all; see *[The session-opening
+digest](#the-session-opening-digest-and-why-it-is-third)*. All three are optional and all three are
+off by default — the plugin says at load which of them is unwired.
 
 Separate from `install.sh` because it is separate work. Everything that script emits is generated from
 `spec/tool-policy.json`; recall is not a tool rule, and a policy generator emitting memory settings
@@ -173,6 +175,7 @@ would put a decision the policy has no opinion on into output the policy owns.
         "config": {
           "read": ["…/yaam-read", "bundle", "--socket", "…/main.read.sock"],
           "threadEntity": "chat_thread", "specDir": "/srv/memory/spec",
+          "digestDays": 14, "digestMaxRecords": 12, "digestMaxChars": 1200,
           "timeoutMs": 5000, "maxRecords": 8, "maxChars": 2000
         }
       },
@@ -386,6 +389,101 @@ harness-memory: the message is not read for entities: set config.specDir to the 
 A flag an operator already put in the configured argv is left alone, as the bounds are: `--entity`,
 `--infer-entities` and `--infer-from` in the config are that operator's choice, and this adds none of
 its own beside them.
+
+### The session-opening digest, and why it is third
+
+An agent that has to be asked before it remembers anything starts every session blind. The fix other
+systems ship is a digest injected at session start — date-grouped recent activity, arriving without
+being asked for — and it is worth having here. What it costs is what this section is mostly about,
+because the hook that can inject it fires on the wrong schedule.
+
+**The failure this design prevents is a digest on every turn.** `before_prompt_build` runs in front of
+every message a person sends, not once when a session opens. Recall on this deployment already spends
+about eleven hundred tokens a turn; a "here is what has been happening" block repeated beside it is
+that cost again, on every message, for a paragraph that does not change between them. And it has no
+symptom — it looks exactly like the feature working, only more often. Two mutation tests exist for
+that one failure.
+
+`before_agent_run` is the session-shaped hook, and it is not the answer: it is the one hook the
+harness runs **fail-closed**, so a digest that threw there would stop the agent running at all.
+Recall's whole posture is that a memory lookup which cannot answer must let the turn through, and that
+posture does not survive moving to a hook where a thrown handler is a blocked run. So the digest stays
+on `before_prompt_build`, behind a fence:
+
+| Gate | Where it comes from | What it rules out |
+|---|---|---|
+| `config.digestDays` is set | the config | a deployment paying for a block nobody chose |
+| `event.messages` is empty | the hook payload | every turn after the session's first |
+| the session is unseen | this process | a backend that hands over an empty history each run |
+| recall found nothing | this turn's own reads | spending the turn's tokens twice |
+| the shared deadline has room | the budget | an unasked-for read extending somebody else's wait |
+
+**The first-turn signal is read off the payload, not guessed.** `event.messages` is the session's
+prepared history, which the host passes *beside* `event.prompt` rather than including this turn in —
+so an empty one is the turn that opens the session. That is honest, and it is not trusted alone: one
+backend here builds that array per run and appends to it as the run proceeds, where an empty history
+is the first hook *call* rather than the first turn. So the payload signal is intersected with process
+memory of the sessions already offered a digest, keyed on `ctx.sessionKey`, and both must agree. A
+gateway restart forgets that memory, and a session running across one gets a second offer. That is the
+cheap direction to be wrong in — one extra block on one turn — and the expensive direction is ruled
+out by the payload signal, which a restart does not touch. A turn whose payload names no session at
+all is never an opening: a turn this cannot tell apart from the next one is exactly the turn that
+would become every turn.
+
+**Recall wins the space, and the two are never both injected.** The digest is attempted only where the
+bundle *and* the search fallback came back with nothing — the one turn on which recall has nothing to
+lose to it. So there is no rule for splitting `maxChars` between them, because they never both want
+it. The digest has its own caps anyway (`digestMaxRecords`, `digestMaxChars`, both defaulting below
+recall's ceiling), because a window read returns a window rather than a match and is the likelier of
+the two to need cutting.
+
+**One read failing does not cost the turn the other.** They fail independently, in both directions,
+and each direction has a mutant:
+
+- A window read that could not be made leaves the outcome exactly as recall left it, down to the
+  kind. An empty store stays `empty`, at info. Reporting it `unavailable` because a read nobody asked
+  for was refused would call a working store broken, and put an outage's noise level on an absence
+  that costs the turn nothing.
+- A bundle that could not be asked does **not** skip the digest. `unavailable` means that read was
+  refused, not that the socket went away, and the window read is a different question over the same
+  socket. Where it answers, the turn gets a digest and the log still says recall was unavailable.
+
+**A third heading, weaker again than the second.** The two existing blocks each make a claim about
+this message: one composed around its keys, one ranked on its words — and the second says so, because
+a model told otherwise presents a keyword hit as an established connection. A digest is not about the
+message at all, so it says that first, and then says the thing this deployment has to say out loud:
+
+```
+Recent activity in this deployment's memory, grouped by date. This is background, not an answer:
+nobody asked for it and none of it is necessarily about this message. Record structure only — who
+acted, when, and what they referenced. It does not say what any of it was about, and this store
+holds no prose that could.
+```
+
+That last clause is the honest limit, and it is not a gap waiting to be filled. Every read here
+returns frontmatter, deliberately and at every layer, so a digest can say that `deploy_bot` deployed
+`example/service@1a2b3c4` successfully on the 28th. It cannot say what the deploy was for, what broke, or
+what anyone concluded. A digest built over a store that holds prose reads like a briefing; this one
+reads like a table of contents.
+
+**Which is both the reason to inject it and the reason it is off by default.** A table of contents is
+worth its tokens where the reader can act on it, and here the agent can: it has a read of its own, and
+a date, an actor or a reference is enough to follow. What the digest buys is the difference between a
+session that opens knowing nothing and one that opens knowing *what exists and what is worth asking
+about* — the cheaper route to the same records. Where the records are all one shape — a store whose
+every row is `answer/partial` — the same block reads as noise and costs exactly what signal costs.
+Nobody but the operator can tell those two stores apart, so `--digest-days` stays unset until somebody
+who has looked names a window.
+
+```
+harness-memory: no session-opening digest: set config.digestDays to the number of days of recent activity a session should wake up holding
+harness-memory: injected a session-opening digest of 9 record(s) over the last 14 day(s)
+harness-memory: no session-opening digest, and recall is unaffected: …
+```
+
+The middle line is at info and appears at most once per session. A log showing it on consecutive turns
+of one conversation is the fence broken, which is the first thing to check and the thing the mutants
+exist to keep from shipping.
 
 ### Checking recall
 

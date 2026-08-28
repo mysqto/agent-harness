@@ -26,9 +26,15 @@ SOCKET=""
 # the plugin says at load which of them is unwired.
 THREAD_KIND="chat_thread"
 SPEC_DIR=""
+# The window a session-opening digest covers, in days. Empty is off, and off is the default: a digest
+# is tokens spent on something nobody asked for, and only somebody who can see the store knows whether
+# what comes back reads as background or as noise.
+DIGEST_DAYS=""
 BUDGET_MS=5000
 MAX_RECORDS=8
 MAX_CHARS=2000
+DIGEST_MAX_RECORDS=12
+DIGEST_MAX_CHARS=1200
 APPLY=0
 
 usage() {
@@ -49,6 +55,9 @@ usage: harnesses/openclaw/install-memory.sh [--config FILE] [--plugin-dir DIR] [
                     thread up. Empty turns it off.                       (default chat_thread)
   --spec-dir DIR    the deployment's spec directory (entities.yaml, extractors.yaml), so the turn's
                     message is read for entities too. Empty turns it off.        (default: unset)
+  --digest-days N   days of recent activity a session wakes up holding, injected on the turn that
+                    opens a session and only where recall itself found nothing.
+                    Empty turns it off.                                          (default: unset)
   --budget-ms MS    how long one lookup gets, in front of a reply        (default 5000)
   --openclaw CMD    the harness CLI, used to apply                       (default openclaw on PATH)
   --apply           merge the fragment with `openclaw config patch`. Without this, nothing outside
@@ -65,6 +74,7 @@ while [ $# -gt 0 ]; do
     --socket)      SOCKET="$2"; shift 2 ;;
     --thread-kind) THREAD_KIND="$2"; shift 2 ;;
     --spec-dir)    SPEC_DIR="$2"; shift 2 ;;
+    --digest-days) DIGEST_DAYS="$2"; shift 2 ;;
     --budget-ms)   BUDGET_MS="$2"; shift 2 ;;
     --openclaw)    OPENCLAW="$2"; shift 2 ;;
     --apply)       APPLY=1; shift ;;
@@ -77,6 +87,19 @@ case "$BUDGET_MS" in
   ''|*[!0-9]*) echo "--budget-ms takes milliseconds: $BUDGET_MS" >&2; exit 2 ;;
 esac
 [ "$BUDGET_MS" -gt 0 ] || { echo "--budget-ms must be positive" >&2; exit 2; }
+
+# A window that is not a whole number of days would reach the config as a value the plugin reads as
+# "off", which is a digest that looks wired and never fires. Refused here, where it can still be
+# spelled correctly.
+if [ -n "$DIGEST_DAYS" ]; then
+  case "$DIGEST_DAYS" in
+    ''|*[!0-9]*) echo "--digest-days takes whole days: $DIGEST_DAYS" >&2; exit 2 ;;
+  esac
+  [ "$DIGEST_DAYS" -gt 0 ] || {
+    echo "--digest-days must be positive; pass no --digest-days to turn the digest off" >&2
+    exit 2
+  }
+fi
 
 # A reader that is not there would be wired anyway and fail open on every turn — quietly enough that
 # a deployment could run for weeks believing it had recall. Refused here instead.
@@ -153,6 +176,14 @@ fi
 if [ -n "$SPEC_DIR" ]; then
   TURN="$TURN
           \"specDir\": \"$SPEC_DIR\","
+fi
+# The digest's three settings travel together or not at all: two caps with no window to apply them to
+# would read as a configured digest that never fires, which is the shape of wiring nobody debugs.
+if [ -n "$DIGEST_DAYS" ]; then
+  TURN="$TURN
+          \"digestDays\": $DIGEST_DAYS,
+          \"digestMaxRecords\": $DIGEST_MAX_RECORDS,
+          \"digestMaxChars\": $DIGEST_MAX_CHARS,"
 fi
 
 fragment="$PLUGIN_DIR/config-fragment.json"
@@ -238,6 +269,17 @@ agent has written something, and looks exactly like a quiet store. Two settings 
 
   config.threadEntity = ${THREAD_KIND:-<unset>}   a turn inside a thread looks that thread up
   config.specDir      = ${SPEC_DIR:-<unset>}   the turn's message is read for entities too
+
+And one setting that is not about the turn at all:
+
+  config.digestDays   = ${DIGEST_DAYS:-<unset>}   the turn that opens a session also carries a
+  date-grouped digest of what was recorded in that many days — but only where the two reads above
+  found nothing, so recall keeps the space whenever it has an answer.
+
+A digest says who acted, when, and what they referenced. It cannot say what any of it was about:
+every read here returns frontmatter and this store holds no prose that could. Turn it on where that
+is a table of contents an agent can follow up with a read of its own, and leave it off where the
+records are all one shape and the block would read as noise.
 
 The second needs the reader to support \`--infer-entities\`; check with:
 

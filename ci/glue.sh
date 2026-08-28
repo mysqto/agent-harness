@@ -642,6 +642,49 @@ JSON
   *) printf '{"records":[],"degraded":false,"omitted":[],"token_estimate":0}' ;;
 esac
 STUB
+# The digest reads a window with `records`, and these three tell the window read apart from the two
+# that answer the turn. A digest that fired on a `bundle` would be indistinguishable from recall in
+# every one of the assertions below, so each of these answers exactly one shape.
+#
+# Two dates on purpose: a digest groups by date, and a single-date fixture would pass a renderer that
+# had lost the grouping entirely.
+cat > "$(reader digest)" <<'STUB'
+#!/usr/bin/env bash
+[ -n "${READER_ARGS_FILE:-}" ] && printf '%s\n' "$*" >> "$READER_ARGS_FILE"
+if [ "${1:-}" = "records" ]; then
+  cat <<'JSON'
+{"records":[
+ {"record_id":"01DAY2","received_at":"2026-08-28T06:22:34Z","action":"deploy","outcome":"success",
+  "agent":"deploy_bot","entities":[{"kind":"commit","id":"example/service@1a2b3c4"}],"attrs":{},"tags":[]},
+ {"record_id":"01DAY1","received_at":"2026-08-26T09:20:43Z","action":"answer","outcome":"partial",
+  "agent":"main_bot","entities":[{"kind":"ticket","id":"PROJ-42"}],"attrs":{},"tags":[]}],
+ "token_estimate":40}
+JSON
+else
+  printf '{"records":[],"degraded":false,"omitted":[],"token_estimate":0}'
+fi
+STUB
+# Answers the window and refuses everything else: the reader for "one read of the pair worked".
+cat > "$(reader digest-only)" <<'STUB'
+#!/usr/bin/env bash
+[ -n "${READER_ARGS_FILE:-}" ] && printf '%s\n' "$*" >> "$READER_ARGS_FILE"
+if [ "${1:-}" = "records" ]; then
+  printf '{"records":[{"record_id":"01WINDOW","received_at":"2026-08-28T06:22:34Z","action":"deploy","outcome":"success","agent":"deploy_bot","entities":[],"attrs":{},"tags":[]}],"token_estimate":9}'
+else
+  echo "the service refused this request (400): unknown parameter" >&2
+  exit 8
+fi
+STUB
+# And the mirror of it: the turn's own reads answer, the window read does not.
+cat > "$(reader digest-broken)" <<'STUB'
+#!/usr/bin/env bash
+[ -n "${READER_ARGS_FILE:-}" ] && printf '%s\n' "$*" >> "$READER_ARGS_FILE"
+if [ "${1:-}" = "records" ]; then
+  echo "the service refused this request (400): unknown parameter" >&2
+  exit 8
+fi
+printf '{"records":[],"degraded":false,"omitted":[],"token_estimate":0}'
+STUB
 cat > "$(reader garbage)" <<'STUB'
 #!/usr/bin/env bash
 printf 'not json at all'
@@ -718,6 +761,11 @@ else:
     # an invented path would make every turn spend a lookup on a read the reader refuses.
     if "specDir" in entry.get("config", {}):
         problems.append("a specDir was wired that nobody asked for")
+    # Same rule for the digest, and a stronger reason: the other two settings only widen a lookup
+    # the turn was making anyway, where a digest is a block of tokens nobody asked for. Off unless
+    # an operator who can see the store says otherwise.
+    if "digestDays" in entry.get("config", {}):
+        problems.append("a session-opening digest was wired that nobody asked for")
     budget = entry.get("config", {}).get("timeoutMs")
     host = entry.get("hooks", {}).get("timeouts", {}).get("before_prompt_build")
     if not isinstance(budget, int) or not isinstance(host, int):
@@ -750,7 +798,7 @@ printf 'version: 1\ndefaults:\n  window: 4\n  confidence: 0.7\nkinds: {}\n' \
   > "$memwork/spec/extractors.yaml"
 "$ocmem" --config "$memconfig" --plugin-dir "$memwork/plug" --reader "$(reader records)" \
   --socket "$memwork/state/main.read.sock" --agent main --spec-dir "$memwork/spec" \
-  --thread-kind chat_thread >/dev/null
+  --thread-kind chat_thread --digest-days 14 >/dev/null
 python3 - "$memfragment" "$memwork/spec" <<'TURNCFG' || status=1
 import json, sys
 config = json.load(open(sys.argv[1]))["plugins"]["entries"]["harness-memory"]["config"]
@@ -760,7 +808,31 @@ if config.get("specDir") != sys.argv[2]:
 if config.get("threadEntity") != "chat_thread":
     print(f"::error::generated fragment: threadEntity is {config.get('threadEntity')!r}")
     sys.exit(1)
+# The window and its two caps travel together: caps with no window read as a configured digest that
+# never fires, which is the shape of wiring nobody thinks to debug.
+if config.get("digestDays") != 14:
+    print(f"::error::generated fragment: digestDays is {config.get('digestDays')!r}")
+    sys.exit(1)
+for cap in ("digestMaxRecords", "digestMaxChars"):
+    if not isinstance(config.get(cap), int) or config[cap] <= 0:
+        print(f"::error::generated fragment: the digest is uncapped: {cap}={config.get(cap)!r}")
+        sys.exit(1)
+# And it must not be able to spend the recall budget: a block nobody asked for that pushed out the
+# answer to the question that was asked would be a worse turn than no digest at all.
+if config["digestMaxChars"] > config["maxChars"]:
+    print(f"::error::generated fragment: the digest may outgrow recall's own ceiling")
+    sys.exit(1)
 TURNCFG
+
+echo "→ the recall installer refuses a digest window that is not a number of days"
+for bad in 0 -3 fortnight; do
+  set +e
+  "$ocmem" --config "$memconfig" --plugin-dir "$memwork/plug" --reader "$(reader records)" \
+    --digest-days "$bad" >/dev/null 2>&1
+  code=$?
+  set -e
+  [ "$code" -ne 0 ] || fail "the recall installer wired --digest-days $bad, which the plugin reads as off"
+done
 # Put the fragment back to what the rest of this section asserts about.
 "$ocmem" --config "$memconfig" --plugin-dir "$memwork/plug" --reader "$(reader records)" \
   --socket "$memwork/state/main.read.sock" --agent main >/dev/null
@@ -803,7 +875,8 @@ if command -v node >/dev/null 2>&1; then
 const [, , modulePath, binDir] = process.argv;
 const mod = await import(modulePath);
 const { recall, renderContext, injectionFrom, report, bounds, actorFor, turnOf, threadOf, HEADING,
-        MAX_INFER_CHARS, needleFrom, searchArgv, SEARCH_SHAPE, SEARCH_HEADING } = mod;
+        MAX_INFER_CHARS, needleFrom, searchArgv, SEARCH_SHAPE, SEARCH_HEADING,
+        claimOpening, DIGEST_HEADING, SEEN_SESSIONS } = mod;
 
 const problems = [];
 const reader = (name, ...rest) => [`${binDir}/reader-${name}`, "bundle", ...rest];
@@ -1051,6 +1124,127 @@ if (swapped.join(" ") !== "yaam-read search --socket /srv/x.sock") {
   problems.push(`the fallback did not reuse the reader and socket: ${swapped.join(" ")}`);
 }
 
+// --- the session-opening digest ------------------------------------------------------------------
+// The one thing here that is not about the turn. `before_prompt_build` fires every turn, so the whole
+// feature rests on a fence: off unless configured, once per session, and never in front of a recall
+// that had an answer. Each of those is asserted, and each has a mutant behind it, because a digest
+// that quietly went to every-turn would look exactly like this one working.
+
+const digestTurn = (session, messages) =>
+  turnOf({ threadEntity: "chat_thread" }, { prompt: "", messages }, { agentId: "main", sessionKey: session });
+const spawned = async (settings, turn) => {
+  const file = `${binDir}/../digest-args-${Math.random().toString(36).slice(2)}`;
+  process.env.READER_ARGS_FILE = file;
+  const outcome = await recall(settings, turn);
+  delete process.env.READER_ARGS_FILE;
+  const raw = (await import("node:fs")).readFileSync(file, "utf8").trim();
+  return { outcome, asked: raw ? raw.split("\n") : [] };
+};
+const digested = { threadEntity: "chat_thread", digestDays: 14 };
+
+// The payload signal, on its own. `event.messages` is the session's prepared history, which the host
+// passes beside the prompt rather than including this turn in — so an empty one is the opening turn.
+SEEN_SESSIONS.clear();
+if (claimOpening({ messages: [] }, { sessionKey: "s-unit" }) !== true) problems.push("an opening turn was not recognised");
+if (claimOpening({ messages: [] }, { sessionKey: "s-unit" }) !== false) problems.push("the same session was offered a digest twice");
+if (claimOpening({ messages: [{}] }, { sessionKey: "s-unit-2" }) !== false) problems.push("a turn with history behind it read as an opening");
+// A turn this cannot tell apart from the next one is never an opening: injecting on it is the
+// every-turn cost the fence exists to prevent.
+if (claimOpening({ messages: [] }, {}) !== false) problems.push("a turn naming no session read as an opening");
+if (claimOpening({ messages: undefined }, { sessionKey: "s-unit-3" }) !== false) problems.push("a payload with no history at all read as an opening");
+
+// **Not on every turn.** The turn that opens the session gets one; the next turn in that session does
+// not, and neither does a later turn whose history the host happens to hand over empty.
+SEEN_SESSIONS.clear();
+const first = await spawned({ ...digested, read: reader("digest") }, digestTurn("s-live", []));
+if (!injectionFrom(first.outcome)?.prependContext?.includes(DIGEST_HEADING)) {
+  problems.push(`the turn that opened a session got no digest: ${JSON.stringify(first.outcome)}`);
+}
+const second = await spawned({ ...digested, read: reader("digest") }, digestTurn("s-live", [{}]));
+if (injectionFrom(second.outcome) !== undefined) problems.push("a second turn in the same session was given a digest");
+if (second.asked.some((line) => line.startsWith("records"))) problems.push(`a second turn still read the window: ${second.asked.join(" | ")}`);
+const third = await spawned({ ...digested, read: reader("digest") }, digestTurn("s-live", []));
+if (injectionFrom(third.outcome) !== undefined) problems.push("a later turn with empty history was given a second digest");
+
+// **Off unless configured**, and off means the window is never read at all.
+SEEN_SESSIONS.clear();
+const unasked = await spawned({ threadEntity: "chat_thread", read: reader("digest") }, digestTurn("s-off", []));
+if (injectionFrom(unasked.outcome) !== undefined) problems.push("a digest was injected with no digestDays configured");
+if (unasked.asked.some((line) => line.startsWith("records"))) problems.push(`an unconfigured digest still read the window: ${unasked.asked.join(" | ")}`);
+
+// **Recall wins the space.** A bundle that answered takes the turn, the window is not even read, and
+// nothing unasked-for is appended to an answer somebody asked for.
+SEEN_SESSIONS.clear();
+const answered = await spawned({ ...digested, read: reader("records") }, digestTurn("s-hit", []));
+if (answered.outcome.kind !== "recalled") problems.push(`a bundle with records gave ${answered.outcome.kind} on an opening turn`);
+if (injectionFrom(answered.outcome)?.prependContext?.includes(DIGEST_HEADING)) {
+  problems.push("a digest was injected beside a recall that had an answer");
+}
+if (answered.asked.some((line) => line.startsWith("records"))) problems.push(`a successful recall still spent a window read: ${answered.asked.join(" | ")}`);
+
+// **A digest that fails costs the turn nothing.** The bundle succeeded and matched nothing, which is
+// an answer; a window read that could not be made must not turn that into an outage.
+SEEN_SESSIONS.clear();
+const brokenDigest = recorder();
+const halfBroken = await spawned({ ...digested, read: reader("digest-broken") }, digestTurn("s-halfbroken", []));
+report(halfBroken.outcome, brokenDigest);
+if (halfBroken.outcome.kind !== "empty") problems.push(`a failed digest turned an empty store into ${halfBroken.outcome.kind}`);
+if (injectionFrom(halfBroken.outcome) !== undefined) problems.push("a failed digest injected something");
+if (said(brokenDigest, "warn")) problems.push(`a failed digest warned: ${said(brokenDigest, "warn")}`);
+if (!/no session-opening digest/.test(said(brokenDigest, "info"))) problems.push("a failed digest was not reported at all");
+if (!/matched nothing/.test(said(brokenDigest, "info"))) problems.push("a failed digest hid the empty match beside it");
+
+// **And a recall that fails does not take the digest with it.** The bundle was refused; the window is
+// a different question over the same socket, and where it answers the turn still gets one.
+SEEN_SESSIONS.clear();
+const digestOnlyLog = recorder();
+const digestOnly = await spawned({ ...digested, read: reader("digest-only") }, digestTurn("s-refused", []));
+report(digestOnly.outcome, digestOnlyLog);
+if (digestOnly.outcome.kind !== "unavailable") problems.push(`a refused bundle gave ${digestOnly.outcome.kind}`);
+if (!/recall unavailable/.test(said(digestOnlyLog, "warn"))) problems.push("a refused bundle stopped being warned about once a digest arrived");
+if (!injectionFrom(digestOnly.outcome)?.prependContext?.includes(DIGEST_HEADING)) {
+  problems.push("a refused bundle took the digest down with it");
+}
+
+// **Provenance and shape.** A third heading, in the same register as the second and weaker again: not
+// a claim about this message at all. Grouped by date, and capped lists say what they left out.
+SEEN_SESSIONS.clear();
+const block = injectionFrom((await spawned({ ...digested, read: reader("digest") }, digestTurn("s-shape", []))).outcome).prependContext;
+if (!block.startsWith(DIGEST_HEADING)) problems.push(`the digest did not say what it is: ${block.slice(0, 80)}`);
+if (block.includes(HEADING) || block.includes(SEARCH_HEADING)) problems.push("the digest was injected under a heading that claims more than it can");
+for (const expected of ["\n2026-08-28\n", "\n2026-08-26\n", "agent=deploy_bot", "entities=ticket:PROJ-42", "last 14 day(s)"]) {
+  if (!block.includes(expected)) problems.push(`the digest dropped ${JSON.stringify(expected)}: ${block}`);
+}
+// Structure and nothing else: the honest limit of every read here, and the heading says so.
+if (!/Record structure only/.test(block)) problems.push("the digest did not say it carries no prose");
+SEEN_SESSIONS.clear();
+const cappedDigest = injectionFrom(
+  (await spawned({ ...digested, digestMaxRecords: 1, read: reader("digest") }, digestTurn("s-capped", []))).outcome,
+).prependContext;
+if (!/1 further record/.test(cappedDigest)) problems.push(`a capped digest did not say what it left out: ${cappedDigest}`);
+
+// **The window read is bounded as a window read.** Both bounds or neither -- the reader refuses one
+// alone on the grounds that it asks a different question -- and none of the bundle's own flags, which
+// `records` does not take and every fake reader here accepts happily.
+SEEN_SESSIONS.clear();
+const window = (await spawned({ ...digested, read: reader("digest") }, digestTurn("s-bounds", []))).asked
+  .find((line) => line.startsWith("records"));
+if (!window) problems.push("no window read was made on an opening turn");
+else {
+  for (const flag of ["--from-ms", "--to-ms", "--limit", "--timeout-ms"]) {
+    if (!window.includes(flag)) problems.push(`the window read was not given ${flag}: ${window}`);
+  }
+  if (window.includes("--deadline-ms")) problems.push(`the window read passed a bundle-only flag: ${window}`);
+  if (window.includes("--actor") || window.includes("--entity")) {
+    problems.push(`the window read was narrowed to this turn, which is not what it asks: ${window}`);
+  }
+  const [, from] = window.match(/--from-ms (\d+)/) ?? [];
+  const [, to] = window.match(/--to-ms (\d+)/) ?? [];
+  if (!from || !to || Number(to) - Number(from) !== 14 * 86400000) {
+    problems.push(`the window was not the configured 14 days: ${window}`);
+  }
+}
+
 for (const problem of problems) console.log(`::error::openclaw recall: ${problem}`);
 process.exit(problems.length ? 1 : 0);
 JS
@@ -1081,7 +1275,7 @@ garbage and no answer; and an empty match reads differently"
     fi
   }
   # A failure that injects whatever it has: the fail-open path stops being distinguishable from a hit.
-  mutate injects-on-failure 's/outcome?.kind === "recalled" ?/outcome?.kind !== "impossible" ?/'
+  mutate injects-on-failure 's/if (outcome?.kind === "recalled") blocks.push/if (outcome?.kind !== "impossible") blocks.push/'
   # A quiet store reported as a broken one: the distinction the log exists to keep.
   mutate empty-as-failure 's/if (!fallback) return { kind: "empty", asked: named };/if (!fallback) return { kind: "unavailable", why: "no rows" };/'
   # The fallback presenting a ranked keyword hit as a composed bundle: the provenance the second
@@ -1104,6 +1298,36 @@ garbage and no answer; and an empty match reads differently"
   mutate thread-mis-spelled 's|return `${conversation}/${thread}`;|return `${conversation}:${thread}`;|'
   # The message never read for entities, so the other half of the lookup goes missing.
   mutate message-never-read 's|if (!text \|\| typeof specDir !== "string"|if (true \|\| typeof specDir !== "string"|'
+
+  # --- the session-opening digest ---
+  # The two that matter most, first. This hook fires every turn, so a digest that lost its fence is a
+  # block of tokens in front of every message a person sends -- and it has no symptom: it looks
+  # exactly like the feature working, only more often.
+  mutate digest-on-every-turn 's|if (turn?.opening !== true) return undefined;|if (false) return undefined;|'
+  # And the other half of the fence: a digest nobody configured is the same cost arriving unasked.
+  mutate digest-ignores-config 's|if (days <= 0) return undefined;|if (false) return undefined;|'
+  # A digest failure taking recall down with it. The bundle answered and matched nothing, which is an
+  # answer about the store; reporting it as an outage because a read nobody asked for was refused
+  # would call a working store broken, and put a warning in a log that has to stay readable.
+  mutate digest-failure-sinks-recall \
+    's|if (answer.kind === "failed") return { ...outcome, digestFailed: answer.why };|if (answer.kind === "failed") return { kind: "unavailable", why: answer.why };|'
+  # The same isolation, run the other way: a bundle that could not be asked is not a socket that went
+  # away, and the window read over the same socket may well answer.
+  mutate recall-failure-sinks-digest \
+    's|return withDigest(outcome, settings, argv, turn, deadline);|return outcome.kind === "unavailable" ? outcome : withDigest(outcome, settings, argv, turn, deadline);|'
+  # A digest injected beside an answer somebody actually asked for. Recall wins the space; this is the
+  # budget rule, and breaking it spends the turn's tokens twice.
+  mutate digest-outranks-recall 's|if (outcome.kind === "recalled") return outcome;|if (false) return outcome;|'
+  # Background presented as an answer: the same provenance failure as search-as-bundle, one step
+  # further out, because a digest is not about this message at all.
+  mutate digest-as-recall 's|return \[DIGEST_HEADING, ...lines|return [HEADING, ...lines|'
+  # Half a window. The reader refuses one bound alone -- it asks a different question rather than a
+  # narrower one -- and every fake reader in this file accepts it, which is exactly how the search
+  # fallback shipped broken once already.
+  mutate digest-half-window 's|, "--to-ms", String(to)||'
+  # And the window read bounded as though it were a bundle, which is the same usage error by the
+  # other route.
+  mutate digest-bundle-bounds 's|digestBounds(argvDigest, left|bounds(argvDigest, left|'
   [ "$survived" -eq 0 ] || fail "the fail-open path is asserted rather than exercised"
 else
   fail "node is not installed, so the recall plugin's outcome path went untested"

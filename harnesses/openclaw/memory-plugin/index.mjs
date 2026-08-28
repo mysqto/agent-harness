@@ -34,6 +34,13 @@
 //
 // Neither is a guess this file makes about what the answer should contain. A lookup key that names
 // nothing matches nothing; the deployment's own rules decide what a key even is.
+//
+// # And one thing that is not about the turn at all
+//
+// A third read runs on the turn that opens a session, and only there: a date-grouped digest of what
+// this deployment recorded lately. It is the one piece of recall nobody asked for, which is exactly
+// why it is fenced — see `digestPlan` for when it declines, and `DIGEST_HEADING` for the claim it
+// makes, which is weaker again than a ranked search hit because it is not a claim about this message.
 
 import { spawn } from "node:child_process";
 
@@ -79,6 +86,47 @@ const STDERR_CAP = 4096;
 
 /** The read shape the fallback uses when the bundle matched nothing. */
 const SEARCH_SHAPE = "search";
+
+/**
+ * The read shape the session-opening digest uses.
+ *
+ * `records` and not `bundle` or `history`, because a digest is the one question here with no key in
+ * it: not "what is filed under this" but "what happened lately, by anyone". `records` is the only
+ * read that takes a window and no entity, which is the same shape the question has.
+ */
+const DIGEST_SHAPE = "records";
+
+/** Rows a digest may carry, and its `--limit`. Wider than recall's page: it is a list, not an answer. */
+const DEFAULT_DIGEST_MAX_RECORDS = 12;
+
+/** Ceiling on the rendered digest, deliberately below recall's. */
+const DEFAULT_DIGEST_MAX_CHARS = 1200;
+
+/** One day, in the milliseconds the window flags are spelled in. */
+const DAY_MS = 86_400_000;
+
+/**
+ * How little of the budget is still worth a digest.
+ *
+ * The same floor the fallback has, for the same reason: all three reads share one deadline, and the
+ * digest is the last of them to ask. Nothing that arrives unasked-for may extend a wait somebody
+ * else's question is already spending.
+ */
+const MIN_DIGEST_MS = 600;
+
+/**
+ * Sessions this process has already offered a digest to.
+ *
+ * Process memory, and the honest statement about it is that a gateway restart forgets: a session
+ * running across one gets offered a second digest. That is one extra block on one turn, which is the
+ * cheap direction to be wrong in — the expensive one is a digest on every turn, and the payload
+ * signal in `claimOpening` is what rules that out independently of this map.
+ *
+ * Bounded, because a gateway that never restarts talks to an unbounded number of conversations.
+ * Evicting the oldest key can only cause a re-offer, never a repeat within a session.
+ */
+const SEEN_SESSIONS = new Map();
+const MAX_SEEN_SESSIONS = 512;
 
 /**
  * Most terms one fallback needle carries.
@@ -129,6 +177,25 @@ const HEADING =
 const SEARCH_HEADING =
   "Found by searching this deployment's memory for words in this message — these records mention " +
   "them and may not be about them. Record structure only, not the records' contents.";
+
+/**
+ * What the digest's block says it is, and it is the weakest of the three claims on purpose.
+ *
+ * The other two answer the turn: one composed around its keys, one ranked on its words. This one was
+ * not asked for and is not about the message at all — so it says so first, before a model reads a
+ * list of recent work as background it is expected to have used.
+ *
+ * The second sentence is the limitation, stated rather than papered over. Every read in this
+ * deployment returns frontmatter, so a digest can say that an agent deployed something on Tuesday and
+ * which commit it named. It cannot say what the deploy was for, what went wrong, or what anyone
+ * concluded. A model that treats these lines as a summary of recent events will overstate them, and
+ * the only defence against that is the heading saying what they are.
+ */
+const DIGEST_HEADING =
+  "Recent activity in this deployment's memory, grouped by date. This is background, not an answer: " +
+  "nobody asked for it and none of it is necessarily about this message. Record structure only — " +
+  "who acted, when, and what they referenced. It does not say what any of it was about, and this " +
+  "store holds no prose that could.";
 
 /**
  * The bounds this plugin adds to the configured argv.
@@ -195,6 +262,57 @@ function threadOf(channelId) {
 }
 
 /**
+ * What names this session, out of the identifiers the host hands over.
+ *
+ * In preference order, because they narrow differently: `sessionKey` is the host's own name for the
+ * run's session and is what a restart resumes under; `sessionId` identifies the same thing where the
+ * key is absent; the conversation ids are a fallback that groups a whole channel rather than a
+ * session, which is coarser than wanted and still bounded — a coarse key offers *fewer* digests, not
+ * more.
+ *
+ * Nothing is returned when the payload names none of them, and a turn that cannot be told apart from
+ * the next one is never treated as an opening. Injecting on a turn this cannot identify is precisely
+ * the every-turn cost the digest exists inside a fence to avoid.
+ */
+function sessionOf(ctx) {
+  for (const value of [ctx?.sessionKey, ctx?.sessionId, ctx?.channelId, ctx?.chatId]) {
+    if (typeof value === "string" && value.trim()) return value.trim();
+  }
+  return undefined;
+}
+
+/**
+ * Whether this turn is the one that opens its session — asked once, and answered once.
+ *
+ * **`before_prompt_build` fires every turn, and the payload has no "session started" field.** What it
+ * does have is `event.messages`: the session's prepared history, which the host passes beside
+ * `event.prompt` rather than including this turn in. An empty history is the session's first turn.
+ * That is the honest signal, read off the payload rather than inferred from the clock.
+ *
+ * It is not trusted alone. One of this harness's backends builds that array per run and appends to it
+ * as the run proceeds, so an empty history there is the first *hook call* rather than the first turn
+ * — which would put a digest in front of every message. So the payload signal is intersected with
+ * process memory of the sessions already offered one, and both must agree.
+ *
+ * Claiming is the point: this marks the session seen whether or not a digest is ultimately built, so
+ * the offer is made once and a turn that declined it does not hand the offer to the turn after. What
+ * a restart forgets is one re-offer, and `SEEN_SESSIONS` says why that is the cheap direction.
+ */
+function claimOpening(event, ctx) {
+  const session = sessionOf(ctx);
+  if (!session) return false;
+  const first = Array.isArray(event?.messages) && event.messages.length === 0;
+  const seen = SEEN_SESSIONS.has(session);
+  if (!seen) {
+    if (SEEN_SESSIONS.size >= MAX_SEEN_SESSIONS) {
+      SEEN_SESSIONS.delete(SEEN_SESSIONS.keys().next().value);
+    }
+    SEEN_SESSIONS.set(session, true);
+  }
+  return first && !seen;
+}
+
+/**
  * What one turn knows about itself, read off the hook's own payload.
  *
  * Separated from the lookup so that "what the host gives us" is one function with one place to look
@@ -209,6 +327,9 @@ function turnOf(settings, event, ctx) {
     agentId: ctx?.agentId,
     entities: thread ? [`${kind}:${thread}`] : [],
     text: prompt ? prompt.slice(-MAX_INFER_CHARS) : undefined,
+    // Claimed here rather than in the lookup, because this is the one function that sees the payload
+    // and the claim has to happen once per turn however the lookup then goes.
+    opening: claimOpening(event, ctx),
   };
 }
 
@@ -313,6 +434,84 @@ function renderContext(answer, limits, heading = HEADING) {
 }
 
 /**
+ * The date a record belongs to, for grouping, or nothing.
+ *
+ * The first ten characters of the server-stamped timestamp, which is a date in the store's own
+ * spelling rather than one this file computed. Computing one would mean choosing a timezone, and a
+ * digest that quietly re-dated a record into yesterday would be wrong in the one field a reader
+ * scanning by date is relying on.
+ */
+function dayOf(record) {
+  const at = record?.received_at ?? record?.at;
+  if (typeof at !== "string" || at.length < 10) return undefined;
+  const day = at.slice(0, 10);
+  return /^\d{4}-\d{2}-\d{2}$/.test(day) ? day : undefined;
+}
+
+/**
+ * One record's structure as a digest line: everything `line` renders except the timestamp.
+ *
+ * The date is the group it sits under, so repeating it on every row would spend the budget saying
+ * what the heading above already said. Field order is fixed for the same reason it is in `line`.
+ */
+function digestLine(record) {
+  const parts = [];
+  if (record?.action) parts.push(`action=${record.action}`);
+  if (record?.outcome) parts.push(`outcome=${record.outcome}`);
+  if (record?.agent) parts.push(`agent=${record.agent}`);
+  const entities = Array.isArray(record?.entities)
+    ? record.entities.map((entity) => `${entity?.kind ?? "?"}:${entity?.id ?? "?"}`)
+    : [];
+  if (entities.length > 0) parts.push(`entities=${entities.join(",")}`);
+  if (Array.isArray(record?.tags) && record.tags.length > 0) parts.push(`tags=${record.tags.join(",")}`);
+  return parts.length > 0 ? `  - ${parts.join(" ")}` : undefined;
+}
+
+/**
+ * A window of records as a date-grouped block, or nothing.
+ *
+ * Grouped by date because that is the axis a person scanning "what has been happening" reads on, and
+ * because it is the one axis this store can render without a body: the date is stamped, the actor is
+ * signed for, and the reference was stated. Nothing here is derived.
+ *
+ * Whatever is cut is counted, exactly as `renderContext` counts it. A digest is more likely to be cut
+ * than a bundle — it is a window rather than a match — so a list that read as the whole window would
+ * be the more misleading of the two.
+ */
+function renderDigest(answer, limits, days) {
+  const records = Array.isArray(answer?.records) ? answer.records : [];
+  if (records.length === 0) return "";
+
+  const groups = [];
+  const byDay = new Map();
+  let used = 0;
+  let shown = 0;
+  for (const record of records.slice(0, limits.maxRecords)) {
+    const rendered = digestLine(record);
+    if (!rendered) continue;
+    const day = dayOf(record) ?? "undated";
+    const heading = byDay.has(day) ? 0 : day.length + 1;
+    if (used + heading + rendered.length > limits.maxChars) break;
+    if (!byDay.has(day)) {
+      const bucket = [];
+      byDay.set(day, bucket);
+      groups.push([day, bucket]);
+    }
+    byDay.get(day).push(rendered);
+    used += heading + rendered.length + 1;
+    shown += 1;
+  }
+  if (shown === 0) return "";
+
+  const lines = [];
+  for (const [day, rows] of groups) lines.push(day, ...rows);
+  const dropped = records.length - shown;
+  const notes = [`Window: the last ${days} day(s).`];
+  if (dropped > 0) notes.push(`${dropped} further record(s) in that window are not shown.`);
+  return [DIGEST_HEADING, ...lines, notes.join(" ")].join("\n");
+}
+
+/**
  * What the search read is bounded by, which is not what the bundle is bounded by.
  *
  * Two of the bundle's three bounds and not the third: `--deadline-ms` is the deadline the *service*
@@ -339,11 +538,84 @@ function searchBounds(argv, budgetMs, maxRecords) {
  * already refused by then.
  */
 function searchArgv(argv) {
+  return shapeArgv(argv, SEARCH_SHAPE);
+}
+
+/** The same reader and socket, asked for the digest's window read. See `searchArgv`. */
+function digestArgv(argv) {
+  return shapeArgv(argv, DIGEST_SHAPE);
+}
+
+/** The configured argv with its read shape replaced, or nothing when it names no shape to replace. */
+function shapeArgv(argv, shape) {
   const at = argv.indexOf(READ_SHAPE);
   if (at < 0) return undefined;
   const swapped = argv.slice();
-  swapped[at] = SEARCH_SHAPE;
+  swapped[at] = shape;
   return swapped;
+}
+
+/**
+ * What the digest read is bounded by.
+ *
+ * The search read's two flags and not the bundle's three, for the same reason: `--deadline-ms` is a
+ * bundle's flag for the deadline the service applies while gathering sources, and `records` has no
+ * such flag. Passing it is a usage error the real reader refuses and every fake reader accepts, which
+ * is the failure mode that shipped once here already.
+ */
+function digestBounds(argv, budgetMs, maxRecords) {
+  const extra = [];
+  const named = (flag) => argv.includes(flag);
+  if (!named("--limit")) extra.push("--limit", String(maxRecords));
+  if (!named("--timeout-ms")) extra.push("--timeout-ms", String(Math.max(1, Math.floor(budgetMs * 0.8))));
+  return extra;
+}
+
+/**
+ * The digest read, or nothing when it declines — which is the ordinary case for nearly every turn.
+ *
+ * Five ways to decline, and the first two are the fence:
+ *
+ *   - **The config did not ask for one.** Off unless `digestDays` names a window. A deployment whose
+ *     records are all one shape gets a block that reads as noise, and noise costs the same tokens as
+ *     signal; that judgement belongs to the operator who can see the store.
+ *   - **This is not the turn that opens the session.** See `claimOpening`. Without this the block
+ *     goes in front of every message, and recall on this deployment already costs about eleven
+ *     hundred tokens a turn.
+ *   - **The budget is spent.** The digest shares the deadline the bundle and the fallback share, and
+ *     asks last. It is the read most easily done without.
+ *   - **The window is not the operator's to be overwritten.** A configured `--from-ms` or `--to-ms`
+ *     means somebody chose a window, and half a window is refused by the reader rather than widened.
+ *   - **The argv names no shape to swap.** Already refused by `unusable` before this is reached.
+ */
+function digestPlan(settings, argv, turn, deadline) {
+  if (turn?.opening !== true) return undefined;
+  // Absent, zero, or anything that is not a whole number of days leaves it off. There is no default
+  // window: a window is a judgement about how much history is worth a reader's attention, and this
+  // file has never seen the store.
+  const days = positive(settings?.digestDays, 0);
+  if (days <= 0) return undefined;
+  const left = deadline - Date.now();
+  if (left < MIN_DIGEST_MS) return undefined;
+  const argvDigest = digestArgv(argv);
+  if (!argvDigest) return undefined;
+  const window = [];
+  if (!argvDigest.includes("--from-ms") && !argvDigest.includes("--to-ms")) {
+    // Both bounds or neither: the reader refuses one alone, on the grounds that it asks a different
+    // question rather than a narrower one.
+    const to = Date.now();
+    window.push("--from-ms", String(to - days * DAY_MS), "--to-ms", String(to));
+  }
+  const maxRecords = positive(settings?.digestMaxRecords, DEFAULT_DIGEST_MAX_RECORDS);
+  return {
+    days,
+    args: [...argvDigest.slice(1), ...window, ...digestBounds(argvDigest, left, maxRecords)],
+    budgetMs: left,
+    limits: {
+      maxRecords,
+      maxChars: positive(settings?.digestMaxChars, DEFAULT_DIGEST_MAX_CHARS),
+    },
+  };
 }
 
 /**
@@ -400,6 +672,20 @@ function unusable(argv) {
  * when the service answered and matched nothing, `unavailable` with a reason when it could not be
  * asked. The caller turns those into an injection and a log line; nothing downstream has to infer
  * which happened from an absent result.
+ *
+ * The digest is a *field* on those outcomes rather than a fourth one, and that is the budget rule
+ * written down: the two are never both injected, because the digest is only attempted on a turn where
+ * recall did not recall. Recall answers the question that was actually asked, so it takes the space
+ * whenever it has an answer; the digest takes the turn where recall had nothing to lose to it.
+ *
+ * The isolation runs both ways, and neither direction is incidental:
+ *
+ *   - **A digest that fails costs the turn nothing.** A failed digest read leaves the outcome exactly
+ *     as recall left it, down to the kind. An empty store stays `empty` — reporting it `unavailable`
+ *     because a read nobody asked for did not answer would call a working store broken.
+ *   - **A recall that fails does not take the digest with it.** `unavailable` here means the bundle
+ *     could not be asked; the window read is a different question over the same socket, and where it
+ *     answers, the turn gets a digest and the log still says recall was unavailable.
  */
 async function recall(settings, turn) {
   const argv = settings?.read;
@@ -420,7 +706,40 @@ async function recall(settings, turn) {
   // what it says.
   const deadline = Date.now() + budgetMs;
 
-  const asked = [
+  const outcome = await answerFor(settings, argv, turn, named, limits, budgetMs, deadline);
+  // Recall answered. Nothing unasked-for goes in beside it, and no second read is spent finding out
+  // what it would have said.
+  if (outcome.kind === "recalled") return outcome;
+  return withDigest(outcome, settings, argv, turn, deadline);
+}
+
+/**
+ * The digest read, folded onto whatever recall came back with. Never rejects, never changes the kind.
+ *
+ * Three shapes of nothing, all of which leave `outcome` untouched: the plan declined, the read
+ * failed, or it answered a window with nothing in it. Only the last of those is worth a word in the
+ * log at info; the middle one is worth a word too, and neither is worth a warning, because the turn
+ * proceeds exactly as it would have.
+ */
+async function withDigest(outcome, settings, argv, turn, deadline) {
+  const plan = digestPlan(settings, argv, turn, deadline);
+  if (!plan) return outcome;
+
+  const answer = await once(argv[0], plan.args, plan.budgetMs);
+  if (answer.kind === "failed") return { ...outcome, digestFailed: answer.why };
+  const context = renderDigest(answer, plan.limits, plan.days);
+  if (!context) return { ...outcome, digestEmpty: true, digestDays: plan.days };
+  return { ...outcome, digest: context, digestCount: answer.records.length, digestDays: plan.days };
+}
+
+/**
+ * The two reads that answer the turn: the bundle, then the search that follows an empty one.
+ *
+ * Split out from `recall` so that "what was asked about this message" is one function and "what is
+ * added because the session just opened" is another. They share the deadline and nothing else.
+ */
+async function answerFor(settings, argv, turn, named, limits, budgetMs, deadline) {
+  const args = [
     ...argv.slice(1),
     ...entitiesFor(argv, named),
     ...inferenceFor(argv, settings?.specDir, turn?.text),
@@ -428,7 +747,7 @@ async function recall(settings, turn) {
     ...bounds(argv, budgetMs, limits.maxRecords),
   ];
 
-  const first = await once(argv[0], asked, budgetMs);
+  const first = await once(argv[0], args, budgetMs);
   if (first.kind === "failed") return { kind: "unavailable", why: first.why, asked: named };
   if (first.records.length > 0) {
     return composed(first, limits, HEADING, { asked: named, via: READ_SHAPE });
@@ -562,9 +881,18 @@ function once(argv0, args, budgetMs) {
   });
 }
 
-/** What the host is told, given an outcome. Only a recall injects; the other two inject nothing. */
+/**
+ * What the host is told, given an outcome.
+ *
+ * Two blocks may exist and by construction never both do — the digest is only attempted where recall
+ * did not recall. Written as a join anyway, because the alternative is a branch that silently drops
+ * one of them if that construction is ever changed, and a dropped block is a failure with no symptom.
+ */
 function injectionFrom(outcome) {
-  return outcome?.kind === "recalled" ? { prependContext: outcome.context } : undefined;
+  const blocks = [];
+  if (outcome?.kind === "recalled") blocks.push(outcome.context);
+  if (typeof outcome?.digest === "string" && outcome.digest) blocks.push(outcome.digest);
+  return blocks.length > 0 ? { prependContext: blocks.join("\n\n") } : undefined;
 }
 
 /**
@@ -575,6 +903,7 @@ function injectionFrom(outcome) {
  * cannot tell them apart cannot tell a quiet week from an outage.
  */
 function report(outcome, logger) {
+  reportDigest(outcome, logger);
   if (outcome?.kind === "recalled") {
     const cost = outcome.tokenEstimate === undefined ? "" : `, ~${outcome.tokenEstimate} tokens`;
     logger?.info?.(
@@ -595,6 +924,35 @@ function report(outcome, logger) {
   logger?.warn?.(
     `${PLUGIN_ID}: recall unavailable, the turn proceeds without memory: ${outcome?.why ?? "no reason given"}`,
   );
+}
+
+/**
+ * The digest's own line, said separately from recall's or not at all.
+ *
+ * Separate because it is a separate read with a separate reason to be absent, and an operator asking
+ * "why is there no digest" is asking about the window read, not about the bundle. Nothing here warns:
+ * a digest that did not happen leaves the turn exactly as it would have been without the feature, and
+ * a warning would put an outage's noise level on an absence that costs nothing.
+ */
+function reportDigest(outcome, logger) {
+  if (typeof outcome?.digest === "string" && outcome.digest) {
+    logger?.info?.(
+      `${PLUGIN_ID}: injected a session-opening digest of ${outcome.digestCount} record(s) ` +
+        `over the last ${outcome.digestDays} day(s)`,
+    );
+    return;
+  }
+  if (outcome?.digestFailed) {
+    logger?.info?.(
+      `${PLUGIN_ID}: no session-opening digest, and recall is unaffected: ${outcome.digestFailed}`,
+    );
+    return;
+  }
+  if (outcome?.digestEmpty === true) {
+    logger?.info?.(
+      `${PLUGIN_ID}: no session-opening digest: nothing was recorded in the last ${outcome.digestDays} day(s)`,
+    );
+  }
 }
 
 export default {
@@ -626,6 +984,15 @@ export default {
       }
     }
 
+    // The third, said the same way and for the same reason. Off is the right default — a digest is
+    // tokens spent on something nobody asked for — so its absence is a note rather than a warning.
+    if (positive(settings.digestDays, 0) <= 0) {
+      api?.logger?.info?.(
+        `${PLUGIN_ID}: no session-opening digest: set config.digestDays to the number of days of ` +
+          `recent activity a session should wake up holding`,
+      );
+    }
+
     const budgetMs = positive(settings.timeoutMs, DEFAULT_TIMEOUT_MS);
 
     // Bounded twice, and the outer bound is this plugin's to lose. The host does default this hook
@@ -654,6 +1021,15 @@ export {
   composed,
   fallbackFor,
   searchArgv,
+  digestArgv,
+  digestBounds,
+  digestPlan,
+  renderDigest,
+  digestLine,
+  dayOf,
+  claimOpening,
+  sessionOf,
+  withDigest,
   needleFrom,
   renderContext,
   injectionFrom,
@@ -678,4 +1054,10 @@ export {
   DEFAULT_MAX_RECORDS,
   DEFAULT_MAX_CHARS,
   HEADING,
+  DIGEST_SHAPE,
+  DIGEST_HEADING,
+  DEFAULT_DIGEST_MAX_RECORDS,
+  DEFAULT_DIGEST_MAX_CHARS,
+  MIN_DIGEST_MS,
+  SEEN_SESSIONS,
 };
