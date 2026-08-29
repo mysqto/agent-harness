@@ -40,6 +40,10 @@ MAX_RECORDS=8
 MAX_CHARS=2000
 DIGEST_MAX_RECORDS=12
 DIGEST_MAX_CHARS=1200
+# Written whatever it is, unlike the settings above: the plugin's own default is the same number, and
+# an allowance stated in the config is one an operator can read off the file rather than off this
+# script. Zero is a real setting here — a deployment that wants no background page at all.
+ACTOR_ROWS=2
 APPLY=0
 
 usage() {
@@ -65,8 +69,12 @@ usage: harnesses/openclaw/install-memory.sh [--config FILE] [--plugin-dir DIR] [
                     record carries whatever caller its socket signed as — so this cannot be derived
                     and is not guessed. An agent left out of the map asks about no actor at all.
                     Empty turns it off.                                          (default: unset)
+  --actor-rows N    rows of an answer that may be the actor's own recent activity rather than an
+                    answer to the message. The actor is background: it fills what the entities left,
+                    up to this many, and carries nothing at all on a turn whose entities matched
+                    nothing. 0 turns the background page off.                       (default: 2)
   --digest-days N   days of recent activity a session wakes up holding, injected on the turn that
-                    opens a session and only where the bundle found nothing.
+                    opens a session and only where the turn's own entities found nothing.
                     Empty turns it off.                                          (default: unset)
   --budget-ms MS    how long one lookup gets, in front of a reply        (default 5000)
   --openclaw CMD    the harness CLI, used to apply                       (default openclaw on PATH)
@@ -85,6 +93,7 @@ while [ $# -gt 0 ]; do
     --thread-kind) THREAD_KIND="$2"; shift 2 ;;
     --spec-dir)    SPEC_DIR="$2"; shift 2 ;;
     --actors)      ACTORS="$2"; shift 2 ;;
+    --actor-rows)  ACTOR_ROWS="$2"; shift 2 ;;
     --digest-days) DIGEST_DAYS="$2"; shift 2 ;;
     --budget-ms)   BUDGET_MS="$2"; shift 2 ;;
     --openclaw)    OPENCLAW="$2"; shift 2 ;;
@@ -111,6 +120,16 @@ if [ -n "$DIGEST_DAYS" ]; then
     exit 2
   }
 fi
+
+# Not `whole days`-shaped and it reaches the config as a value the plugin reads as "unset", which is
+# an allowance that looks configured and silently is not. Zero is accepted and means zero.
+case "$ACTOR_ROWS" in
+  ''|*[!0-9]*) echo "--actor-rows takes a whole number of rows: $ACTOR_ROWS" >&2; exit 2 ;;
+esac
+[ "$ACTOR_ROWS" -le "$MAX_RECORDS" ] || {
+  echo "--actor-rows $ACTOR_ROWS would be the whole page of $MAX_RECORDS; the actor is background" >&2
+  exit 2
+}
 
 # A reader that is not there would be wired anyway and fail open on every turn — quietly enough that
 # a deployment could run for weeks believing it had recall. Refused here instead.
@@ -228,7 +247,8 @@ if [ -n "$SPEC_DIR" ]; then
 fi
 if [ -n "$ACTORS_JSON" ]; then
   TURN="$TURN
-          \"actors\": {$ACTORS_JSON},"
+          \"actors\": {$ACTORS_JSON},
+          \"actorMaxRecords\": $ACTOR_ROWS,"
 fi
 # The digest's three settings travel together or not at all: two caps with no window to apply them to
 # would read as a configured digest that never fires, which is the shape of wiring nobody debugs.
@@ -323,6 +343,7 @@ like a quiet store. Three settings close that:
   config.threadEntity = ${THREAD_KIND:-<unset>}   a turn inside a thread looks that thread up
   config.specDir      = ${SPEC_DIR:-<unset>}   the turn's message is read for entities too
   config.actors       = ${ACTORS:-<unset>}   whose activity a turn asks about
+  config.actorMaxRecords = $ACTOR_ROWS   how much of the page that activity may take
 
 The third is the one that cannot be guessed and must not be. The host's agent id — \`main\`, \`pr\` — is
 not the name the store filed that agent's records under: a record carries whatever caller its record
@@ -331,6 +352,12 @@ the agent id and the bundle asks about a writer nothing was ever written by, and
 every turn. So the map is stated rather than derived, and an agent this map leaves out asks about no
 actor at all and says so in the log — a narrower question, honestly asked, instead of a silent zero.
 
+The fourth is what keeps the third from swallowing the page. A bundle fills its entities first and
+gives the actor the rest, so an actor that matches takes everything the keys left — which on a turn
+naming no key is all of it, and the same rows arrive whatever was asked. The actor is read separately
+and bounded to \`config.actorMaxRecords\` rows behind an answer, and is not read at all on a turn whose
+entities matched nothing: there is no answer there for background to be background to.
+
 Read the names off the keyring rather than off a pattern, and check one before trusting the map:
 
   $READER bundle --socket "$SOCKET" --actor <writer> --limit 3
@@ -338,9 +365,10 @@ Read the names off the keyring rather than off a pattern, and check one before t
 And one setting that is not about the turn at all:
 
   config.digestDays   = ${DIGEST_DAYS:-<unset>}   the turn that opens a session also carries a
-  date-grouped digest of what was recorded in that many days — but only where the bundle found
-  nothing, so the composed answer to the question keeps the space whenever there is one. A ranked
-  search hit does not: by its own heading it may not be about the message at all.
+  date-grouped digest of what was recorded in that many days — but only where the turn's own
+  entities found nothing, so the composed answer to the question keeps the space whenever there is
+  one. A ranked search hit does not: by its own heading it may not be about the message at all. Nor
+  does the actor's background page, which is why it is never read on a turn with no answer under it.
 
 A digest says who acted, when, and what they referenced. It cannot say what any of it was about:
 every read here returns frontmatter and this store holds no prose that could. Turn it on where that

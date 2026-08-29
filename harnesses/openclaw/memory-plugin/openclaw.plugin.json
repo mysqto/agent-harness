@@ -32,7 +32,13 @@
           "type": "string"
         },
         "title": "Agent id to writer name",
-        "description": "This deployment's map from the host's agent id to the writer name that agent's records were filed under \u2014 for example {\"main\": \"main_bot\"}. The two are named separately on purpose: a record carries whatever caller its record socket signed as, so the writer name belongs to the keyring and this plugin cannot derive it from an agent id. An agent this map does not name asks about no actor at all, and says so in the log; passing the agent id instead would ask about a writer that never wrote anything and return a page indistinguishable from a quiet store."
+        "description": "This deployment's map from the host's agent id to the writer name that agent's records were filed under — for example {\"main\": \"main_bot\"}. The two are named separately on purpose: a record carries whatever caller its record socket signed as, so the writer name belongs to the keyring and this plugin cannot derive it from an agent id. An agent this map does not name asks about no actor at all, and says so in the log; passing the agent id instead would ask about a writer that never wrote anything and return a page indistinguishable from a quiet store."
+      },
+      "actorMaxRecords": {
+        "type": "integer",
+        "minimum": 0,
+        "title": "Background rows the actor may carry",
+        "description": "Most rows of an answer that may be the asking agent's own recent activity rather than an answer to the message. The actor is a background source: it fills what the entities left, up to this many, and it carries nothing at all on a turn whose entities matched nothing — a page of one agent's week is the same page whatever was asked, and a turn with no answer must not be given one that only looks like it. Set it to 0 for a deployment that wants no background page. Zero means zero here, not \"use the default\"."
       },
       "specDir": {
         "type": "string",
@@ -66,7 +72,7 @@
         "type": "integer",
         "exclusiveMinimum": 0,
         "title": "Session-opening digest window (days)",
-        "description": "Days of recent activity a session wakes up holding, as a date-grouped digest. Injected on the turn that opens a session, and only where the bundle and the search both matched nothing, so recall keeps the space whenever it has an answer. Unset is off, and off is the default: a digest says who acted, when, and what they referenced, and never what any of it was about — whether that reads as background or as noise depends on a store this harness has not seen."
+        "description": "Days of recent activity a session wakes up holding, as a date-grouped digest. Injected on the turn that opens a session, and only where the turn's own entities matched nothing — a composed answer keeps the space, a ranked search does not, and neither does the actor's background page, which is why the actor is never asked for on a turn that has no answer to supplement. Unset is off, and off is the default: a digest says who acted, when, and what they referenced, and never what any of it was about — whether that reads as background or as noise depends on a store this harness has not seen."
       },
       "digestMaxRecords": {
         "type": "integer",

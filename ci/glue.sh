@@ -707,6 +707,58 @@ JSON
   *) printf '{"records":[],"degraded":false,"omitted":[],"token_estimate":0}' ;;
 esac
 STUB
+# The reader for the actor's *bounded* page: it can tell the read that answers the turn from the read
+# that fetches the background, and answers each differently. Nothing else here can -- `reader-actor`
+# answers one read only, which is what an assertion about two reads cannot be built on.
+#
+# The actor branch answers three records and reports itself `degraded`, which is what the live service
+# does for any actor asked for fewer rows than it has: `--limit N` reads N+1 so that "there is more"
+# is a fact rather than a guess, and the extra row is an omission. On the deployment this was measured
+# on, `main_bot` had more history than any page it will ever be given, so that flag was on for ever.
+# **The answer must not inherit it**, and this fixture is what makes that assertable.
+cat > "$(reader background)" <<'STUB'
+#!/usr/bin/env bash
+[ -n "${READER_ARGS_FILE:-}" ] && printf '%s\n' "$*" >> "$READER_ARGS_FILE"
+if [ "${1:-}" = "records" ]; then
+  cat <<'JSON'
+{"records":[
+ {"record_id":"01DAY2","received_at":"2026-08-28T06:22:34Z","action":"deploy","outcome":"success",
+  "agent":"deploy_bot","entities":[{"kind":"commit","id":"example/service@1a2b3c4"}],"attrs":{},"tags":[]},
+ {"record_id":"01DAY1","received_at":"2026-08-26T09:20:43Z","action":"answer","outcome":"partial",
+  "agent":"main_bot","entities":[{"kind":"ticket","id":"PROJ-42"}],"attrs":{},"tags":[]}],
+ "token_estimate":40}
+JSON
+  exit 0
+fi
+case " $* " in
+  *" --actor "*)
+    cat <<'JSON'
+{"records":[
+ {"record_id":"01BG1","received_at":"2026-08-27T00:00:00Z","action":"answer","outcome":"ok",
+  "agent":"the_writer","entities":[],"attrs":{"channel":"webchat"},"tags":[]},
+ {"record_id":"01BG2","received_at":"2026-08-26T00:00:00Z","action":"check","outcome":"ok",
+  "agent":"the_writer","entities":[],"attrs":{},"tags":[]},
+ {"record_id":"01BG3","received_at":"2026-08-25T00:00:00Z","action":"verify","outcome":"ok",
+  "agent":"the_writer","entities":[],"attrs":{},"tags":[]}],
+ "degraded":true,"omitted":["actor the_writer: 1 record(s) over the bundle cap of 2"],
+ "token_estimate":30}
+JSON
+    ;;
+  *"--entity="*)
+    cat <<'JSON'
+{"records":[
+ {"record_id":"01ANS1","received_at":"2026-08-24T00:00:00Z","action":"note","outcome":"ok",
+  "agent":"someone_else","entities":[{"kind":"chat_thread","id":"c0example/1700000000.000100"}],
+  "attrs":{},"tags":[]},
+ {"record_id":"01ANS2","received_at":"2026-08-23T00:00:00Z","action":"note","outcome":"ok",
+  "agent":"someone_else","entities":[{"kind":"chat_thread","id":"c0example/1700000000.000100"}],
+  "attrs":{},"tags":[]}],
+ "degraded":false,"omitted":[],"token_estimate":25}
+JSON
+    ;;
+  *) printf '{"records":[],"degraded":false,"omitted":[],"token_estimate":0}' ;;
+esac
+STUB
 cat > "$(reader garbage)" <<'STUB'
 #!/usr/bin/env bash
 printf 'not json at all'
@@ -898,6 +950,27 @@ for bad in 0 -3 fortnight; do
   set -e
   [ "$code" -ne 0 ] || fail "the recall installer wired --digest-days $bad, which the plugin reads as off"
 done
+echo "→ the recall installer refuses an actor page that is not a share of one"
+# The actor is background: an allowance that is the whole page is the shape the fix exists to end,
+# and `-1` or `half` reach the config as a value the plugin reads as unset -- an allowance that looks
+# configured and silently is not. Zero is a real setting and is accepted.
+for bad in 9 -1 half; do
+  set +e
+  "$ocmem" --config "$memconfig" --plugin-dir "$memwork/plug" --reader "$(reader records)" \
+    --actor-rows "$bad" >/dev/null 2>&1
+  code=$?
+  set -e
+  [ "$code" -ne 0 ] || fail "the recall installer wired --actor-rows $bad"
+done
+set +e
+"$ocmem" --config "$memconfig" --plugin-dir "$memwork/plug" --reader "$(reader records)" \
+  --actors main=main_bot --actor-rows 0 >/dev/null 2>&1
+code=$?
+set -e
+[ "$code" -eq 0 ] || fail "the recall installer refused --actor-rows 0, which is a deployment wanting none"
+grep -q '"actorMaxRecords": 0' "$memwork/plug/config-fragment.json" \
+  || fail "--actor-rows 0 did not reach the config as zero"
+
 # Put the fragment back to what the rest of this section asserts about.
 "$ocmem" --config "$memconfig" --plugin-dir "$memwork/plug" --reader "$(reader records)" \
   --socket "$memwork/state/main.read.sock" --agent main >/dev/null
@@ -940,7 +1013,8 @@ if command -v node >/dev/null 2>&1; then
 const [, , modulePath, binDir] = process.argv;
 const mod = await import(modulePath);
 const { recall, renderContext, injectionFrom, report, bounds, actorFor, actorPlan, turnOf, threadOf, HEADING,
-        MAX_INFER_CHARS, needleFrom, searchArgv, SEARCH_SHAPE, SEARCH_HEADING,
+        MAX_INFER_CHARS, needleFrom, searchArgv, SEARCH_SHAPE, SEARCH_HEADING, READ_SHAPE,
+        actorAllowance, withoutActor, actorWriterIn, DEFAULT_ACTOR_MAX_RECORDS,
         claimOpening, DIGEST_HEADING, SEEN_SESSIONS } = mod;
 
 const problems = [];
@@ -1006,19 +1080,66 @@ const capped = renderContext(
 );
 if (!/2 further record/.test(capped)) problems.push("a capped list did not say what it left out");
 
-// The bounds the plugin adds, and the actor the host supplied, reach the process it spawns.
+// The bounds the plugin adds, and the actor the host supplied, reach the process it spawns -- and
+// they reach *different* processes. The turn's own question and the actor's background page are two
+// reads now, because one read with one `--limit` cannot bound two sources separately: the service
+// fills entities first and hands the actor the rest, so the actor's share was whatever the keys left.
 const argsFile = `${binDir}/../args`;
 process.env.READER_ARGS_FILE = argsFile;
-await recall({ read: reader("empty"), timeoutMs: 4000, maxRecords: 3, actors: { builder: "builder_bot" } },
-  { agentId: "builder" });
+await recall(
+  { read: reader("background"), threadEntity: "chat_thread", timeoutMs: 4000, maxRecords: 3,
+    actors: { builder: "builder_bot" } },
+  turnOf({ threadEntity: "chat_thread" }, { prompt: "any news on this?" },
+    { agentId: "builder", channelId: "c0example:thread:1700000000.000100" }),
+);
 delete process.env.READER_ARGS_FILE;
 const passed = (await import("node:fs")).readFileSync(argsFile, "utf8");
+const reads = passed.trim().split("\n");
 // The actor that reaches the reader is the *writer name* the map gave, never the agent id the host
 // supplied. Sending the id is the defect this whole mechanism replaces.
 for (const expected of ["--limit 3", "--deadline-ms 2000", "--timeout-ms 3200", "--actor builder_bot"]) {
   if (!passed.includes(expected)) problems.push(`the reader was not given ${expected}: ${passed.trim()}`);
 }
 if (passed.includes("--actor builder ")) problems.push(`the agent id was passed as an actor: ${passed.trim()}`);
+if (reads.length !== 2) problems.push(`the answer and the actor's page were not two reads: ${reads.join(" | ")}`);
+else {
+  const [answering, background] = reads;
+  // **The read that answers the turn carries no actor.** This is the whole of the fix: with the
+  // actor on this read the service gives it whatever the entities left, which on a turn naming no
+  // key is the entire page -- the same rows for a greeting, a prose question and a generic one.
+  if (answering.includes("--actor")) {
+    problems.push(`the read that answers the turn carried an actor: ${answering}`);
+  }
+  if (!answering.includes("--entity=chat_thread:c0example/1700000000.000100")) {
+    problems.push(`the answering read lost the turn's own key: ${answering}`);
+  }
+  // And the actor's read asks for its allowance and nothing else, so it *cannot* overflow the page:
+  // two entity records out of a page of three leaves one row, and one row is what it asks for.
+  if (!background.includes("--limit 1")) {
+    problems.push(`the actor's read was not bounded to its allowance: ${background}`);
+  }
+  if (background.includes("--entity") || background.includes("--infer-from")) {
+    problems.push(`the actor's read was narrowed to the turn's keys, which the answer already asked: ${background}`);
+  }
+}
+// The allowance itself: never more than the setting, never more than the page has left, and *zero*
+// where the entities matched nothing -- there is no answer there for background to be background to.
+const page8 = { maxRecords: 8, maxChars: 4096 };
+if (actorAllowance({}, page8, 0) !== 0) problems.push("a turn whose entities matched nothing was still offered an actor page");
+if (actorAllowance({}, page8, 2) !== DEFAULT_ACTOR_MAX_RECORDS) problems.push("a thin answer was not offered the full allowance");
+if (actorAllowance({}, page8, 7) !== 1) problems.push("the actor was offered more of the page than the entities left");
+if (actorAllowance({}, page8, 8) !== 0) problems.push("a full page still offered the actor a row");
+if (actorAllowance({ actorMaxRecords: 0 }, page8, 2) !== 0) {
+  problems.push("actorMaxRecords: 0 was read as unset rather than as none");
+}
+if (actorAllowance({ actorMaxRecords: 5 }, page8, 2) !== 5) problems.push("a configured allowance was ignored");
+// An operator's own `--actor` in the argv keeps its writer and loses its place on the answering read:
+// which writer is theirs, how much of the page it gets is not.
+if (actorWriterIn(["r", "bundle", "--actor", "other"]) !== "other") problems.push("an operator's writer was not read off the argv");
+if (actorWriterIn(["r", "bundle", "--actor=other"]) !== "other") problems.push("an operator's writer in the joined spelling was not read");
+if (withoutActor(["r", "bundle", "--actor", "other", "--socket", "s"]).join(" ") !== "r bundle --socket s") {
+  problems.push(`the actor was not taken off the answering read: ${withoutActor(["r", "bundle", "--actor", "other", "--socket", "s"]).join(" ")}`);
+}
 // A bound an operator already chose is theirs, not this file's to replace.
 if (bounds(["r", "bundle", "--limit", "1"], 5000, 8).includes("--limit")) {
   problems.push("a configured --limit was overridden");
@@ -1067,18 +1188,83 @@ if (actorPlan(["r", "bundle", "--actor", "other"], "main", mapped).kind !== "con
 if (actorPlan(["r", "bundle"], undefined, mapped).kind !== "unnamed") problems.push("a turn with no agent id read as unmapped");
 if (actorPlan(["r", "bundle"], "main", mapped).kind !== "named") problems.push("a mapped agent was not reported as named");
 
-// End to end, against a reader that answers the writer name and nothing else. A mapped agent finds
-// the writer's records; the same turn on an unmapped agent finds nothing and **passes no --actor at
-// all**, which is the difference between a narrower question and a wrong one.
-const actorWired = { read: reader("actor"), actors: { main: "main_bot" } };
-const hit = await recall(actorWired, { agentId: "main" });
+// ── The actor is background, and the page says where the answer stops ────────────────────────────
+// End to end against a reader that tells the two reads apart. The entities answer; the actor's page
+// is appended behind them, bounded, labelled, and **not counted as a partiality of the answer**.
+//
+// That last clause is the second regression the map above caused. `--limit N` reads N+1 rows so that
+// "there is more" is a fact rather than a guess, so an actor with more history than its share always
+// reports itself degraded -- and while the actor rode the answer's read, every keyless turn on the
+// live deployment ended `This is partial: actor main_bot: N record(s) over the bundle cap of 8 ...
+// not safe to act on`. For ever, because that agent's history outruns any page and always will. A
+// warning that is always on is a warning nobody reads, and this one sits on the sentence telling a
+// model what it may act on.
+const actorWired = { threadEntity: "chat_thread", read: reader("background"), actors: { main: "main_bot" } };
+const actorTurn = turnOf(actorWired, { prompt: "any news on this?" },
+  { agentId: "main", channelId: "c0example:thread:1700000000.000100" });
+const hit = await recall(actorWired, actorTurn);
 if (hit.kind !== "recalled") problems.push(`a mapped actor recalled nothing: ${hit.kind} ${hit.why ?? ""}`);
 if (hit.actor?.kind !== "named" || hit.actor.writer !== "main_bot") {
   problems.push(`the outcome did not name the actor it asked about: ${JSON.stringify(hit.actor)}`);
 }
+if (hit.via !== READ_SHAPE) problems.push(`a bundle that answered did not say so: ${hit.via}`);
+// **The actor's overflow is not the answer's partiality.** The fixture's actor page is `degraded`
+// and says so in `omitted`; the answer's own read is not, and the block must not read as one.
+if (hit.degraded !== false) problems.push("the actor overflowing its allowance was reported as a partial answer");
+if (/This is partial/.test(hit.context)) {
+  problems.push(`a complete answer was labelled partial because the actor has more history: ${hit.context}`);
+}
+if (/not safe to act on/.test(hit.context)) problems.push("the act-on warning fired for a background source");
+// Bounded: the actor gets its allowance out of what the entities left, and no more, whatever the
+// reader hands back. The fixture returns three rows for a page that had two to spare.
+if (hit.background?.shown !== DEFAULT_ACTOR_MAX_RECORDS) {
+  problems.push(`the actor's page was not held to its allowance: ${JSON.stringify(hit.background)}`);
+}
+if (hit.count !== 4) problems.push(`the page was not two answers plus two background rows: ${hit.count}`);
+if (hit.context.includes("01BG3") || hit.context.split("action=").length - 1 !== 4) {
+  problems.push(`the actor's read overflowed the page: ${hit.context}`);
+}
+// Labelled: two claims in one block, and the block says where one ends. Silently dropping the
+// distinction is the other way to be dishonest about a source that was cut.
+if (!hit.context.includes(`The last 2 row(s) are main_bot's own recent activity`)) {
+  problems.push(`the background rows were not told apart from the answer: ${hit.context}`);
+}
+if (!/there is more of it than is shown/.test(hit.context)) {
+  problems.push(`a cut background page did not say it was cut: ${hit.context}`);
+}
+// And in order: what the keys answered comes first, so a ceiling cuts the background rather than
+// the answer.
+if (hit.context.indexOf("01ANS2") > hit.context.indexOf("01BG1") && hit.context.includes("01ANS2")) {
+  problems.push("the actor's page displaced the records the keys matched");
+}
 const hitLog = recorder();
 report(hit, hitLog);
 if (!/actor main_bot/.test(said(hitLog, "info"))) problems.push(`the log did not say whose activity answered: ${said(hitLog, "info")}`);
+if (!/2 background row\(s\)/.test(said(hitLog, "info"))) {
+  problems.push(`the log did not say how much of the page was background: ${said(hitLog, "info")}`);
+}
+
+// A deployment that wants none says so, and no second read is made at all.
+const noneAsked = await (async () => {
+  const file = `${binDir}/../no-background-args`;
+  process.env.READER_ARGS_FILE = file;
+  const outcome = await recall({ ...actorWired, actorMaxRecords: 0 }, actorTurn);
+  delete process.env.READER_ARGS_FILE;
+  return { outcome, asked: (await import("node:fs")).readFileSync(file, "utf8").trim().split("\n") };
+})();
+if (noneAsked.asked.length !== 1 || noneAsked.asked[0].includes("--actor")) {
+  problems.push(`actorMaxRecords: 0 still read the actor's page: ${noneAsked.asked.join(" | ")}`);
+}
+if (noneAsked.outcome.background !== undefined) problems.push("a background page arrived with the allowance at zero");
+// And a page the entities filled leaves nothing to spend, so the read is not made either.
+const fullPage = await (async () => {
+  const file = `${binDir}/../full-page-args`;
+  process.env.READER_ARGS_FILE = file;
+  const outcome = await recall({ ...actorWired, maxRecords: 2 }, actorTurn);
+  delete process.env.READER_ARGS_FILE;
+  return { outcome, asked: (await import("node:fs")).readFileSync(file, "utf8").trim().split("\n") };
+})();
+if (fullPage.asked.length !== 1) problems.push(`a full page still read the actor: ${fullPage.asked.join(" | ")}`);
 
 const missFile = `${binDir}/../unmapped-args`;
 process.env.READER_ARGS_FILE = missFile;
@@ -1357,7 +1543,7 @@ const unasked = await spawned({ threadEntity: "chat_thread", read: reader("diges
 if (injectionFrom(unasked.outcome) !== undefined) problems.push("a digest was injected with no digestDays configured");
 if (unasked.asked.some((line) => line.startsWith("records"))) problems.push(`an unconfigured digest still read the window: ${unasked.asked.join(" | ")}`);
 
-// **A bundle takes the turn.** It is the composed answer to the question that was asked, so the
+// **An entity hit takes the turn.** It is the composed answer to the question that was asked, so the
 // window is not even read and nothing unasked-for is appended to it.
 SEEN_SESSIONS.clear();
 const answered = await spawned({ ...digested, read: reader("records") }, digestTurn("s-hit", []));
@@ -1366,6 +1552,27 @@ if (injectionFrom(answered.outcome)?.prependContext?.includes(DIGEST_HEADING)) {
   problems.push("a digest was injected beside a bundle that answered");
 }
 if (answered.asked.some((line) => line.startsWith("records"))) problems.push(`a bundle that answered still spent a window read: ${answered.asked.join(" | ")}`);
+
+// **A page of the actor does not.** This is the regression the allowance exists to end, and it is the
+// one with no symptom: the rule read "a bundle takes the turn", and it was written when a bundle
+// meant an answer. The moment the actor half began to match, every turn came back with a full bundle
+// of the asking agent's own week, so the digest -- shipped the day before -- had no turn left to fire
+// on. Measured on the live deployment: with `actors` set, no digest on any of four probe turns; with
+// it unset, the greeting produced one. The mechanism was intact the whole time.
+SEEN_SESSIONS.clear();
+const keyless = await spawned(
+  { ...digested, read: reader("background"), actors: { main: "main_bot" } },
+  digestTurn("s-keyless", []),
+);
+if (keyless.asked.some((line) => line.includes("--actor"))) {
+  problems.push(`a turn with no answer under it still read the actor's page: ${keyless.asked.join(" | ")}`);
+}
+if (keyless.outcome.kind !== "empty") {
+  problems.push(`a mapped actor answered a turn whose keys matched nothing: ${keyless.outcome.kind}`);
+}
+if (!injectionFrom(keyless.outcome)?.prependContext?.includes(DIGEST_HEADING)) {
+  problems.push(`a mapped actor took the opening turn from the digest: ${JSON.stringify(keyless.outcome)}`);
+}
 
 // **A ranked search does not.** The fallback's own heading concedes its records may not be about the
 // message, so a turn holding only that has been handed a rank rather than an answer. Measured rather
@@ -1531,6 +1738,35 @@ garbage and no answer; and an empty match reads differently"
   # And the silence itself: the omission is correct and invisible unless the log says it happened.
   # Without this line an operator sees `via search` on every turn and no reason anywhere.
   mutate actor-unmapped-unsaid 's|if (plan?.kind !== "unmapped") return;|if (true) return;|'
+
+  # --- the actor is background, and is bounded like one ---
+  # The two regressions a correct fix caused, each restored exactly. Both shipped green: the actor
+  # half matching is what the map was for, and neither of these has a symptom that looks like a bug.
+
+  # **The actor back on the read that answers the turn.** One read with one `--limit` cannot bound two
+  # sources separately -- the service fills entities first and gives the actor the rest -- so this is
+  # the actor taking whatever the keys left, which on a turn naming no key is the whole page. Measured
+  # on the live store: a greeting, a prose question and a generic question returned the same eight
+  # rows, byte for byte, under the heading that says a bundle composed them around the request.
+  mutate actor-fills-the-page \
+    's|    ...inferenceFor(base, settings?.specDir, turn?.text),|    ...inferenceFor(base, settings?.specDir, turn?.text), ...actorFor(base, turn?.agentId, settings?.actors),|'
+  # The same failure by the other route: the allowance stops being an allowance and becomes "whatever
+  # is left", which is the service's own rule restated in this file. It reads as a bound and is not.
+  mutate actor-allowance-unbounded \
+    's|return Math.max(0, Math.min(most, limits.maxRecords - shown));|return Math.max(0, limits.maxRecords - shown);|'
+  # **The actor's overflow setting `degraded` again.** `--limit N` reads N+1 so that "there is more"
+  # is a fact rather than a guess, so an actor with more history than its share is *always* degraded.
+  # Carried onto the answer, that sentence -- the one telling a model what it may act on -- fires on
+  # every turn for ever, and a warning that is always on is a warning nobody reads.
+  mutate background-degrades-the-answer \
+    's|background: { writer: page.writer, shown: added.length, more: page.more === true },|background: { writer: page.writer, shown: added.length, more: page.more === true }, degraded: page.more === true,|'
+  # And the other way to be dishonest about a cut source: drop it silently. `omitted` exists to say
+  # what was left out, so a background page that is bounded without saying so is a page of one agent's
+  # week presented as part of the answer.
+  mutate background-unlabelled 's|if (background \&\& carried > 0) {|if (false) {|'
+  # The bound applied to the read but not to what is kept, which is the same hole one step later: an
+  # operator's own `--limit` in the argv is left alone by `bounds`, so the trim is what actually holds.
+  mutate background-trim-dropped 's|const records = answer.records.slice(0, plan.allowance);|const records = answer.records;|'
 
   # --- the session-opening digest ---
   # The two that matter most, first. This hook fires every turn, so a digest that lost its fence is a

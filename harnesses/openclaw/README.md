@@ -151,14 +151,17 @@ Recall is wired, by a second plugin and a second installer:
 ```sh
 harnesses/openclaw/install-memory.sh --config ~/.openclaw/openclaw.json --agent main \
   --thread-kind chat_thread --spec-dir /srv/memory/spec \
-  --actors main=main_bot,pr=pr_bot,deploy=deploy_bot --digest-days 14
+  --actors main=main_bot,pr=pr_bot,deploy=deploy_bot --actor-rows 2 --digest-days 14
 ```
 
 The middle three are what let a bundle name the turn at all; see *[What a turn can say about
-itself](#what-a-turn-can-say-about-itself)*. The last is the one block here that is not about the turn
-at all; see *[The session-opening
-digest](#the-session-opening-digest-and-why-it-is-third)*. All four are optional and all four are off
-by default — the plugin says at load which of them is unwired.
+itself](#what-a-turn-can-say-about-itself)*. `--actor-rows` is how much of the page the third of those
+may take, and it is a share rather than a switch; see *[The actor is background, and is bounded like
+one](#the-actor-is-background-and-is-bounded-like-one)*. The last is the one block here that is not
+about the turn at all; see *[The session-opening
+digest](#the-session-opening-digest-and-why-it-is-third)*. The four lookups are optional and all four
+are off by default — the plugin says at load which of them is unwired. The allowance is not: it has a
+default because it bounds a source rather than adding one, and a bound with no default is no bound.
 
 Separate from `install.sh` because it is separate work. Everything that script emits is generated from
 `spec/tool-policy.json`; recall is not a tool rule, and a policy generator emitting memory settings
@@ -177,6 +180,7 @@ would put a decision the policy has no opinion on into output the policy owns.
           "read": ["…/yaam-read", "bundle", "--socket", "…/main.read.sock"],
           "threadEntity": "chat_thread", "specDir": "/srv/memory/spec",
           "actors": { "main": "main_bot", "pr": "pr_bot", "deploy": "deploy_bot" },
+          "actorMaxRecords": 2,
           "digestDays": 14, "digestMaxRecords": 12, "digestMaxChars": 1200,
           "timeoutMs": 5000, "maxRecords": 8, "maxChars": 2000
         }
@@ -298,15 +302,20 @@ not decide it —
 - **`degraded`, with `omitted`.** A bundle whose sources ran out of time says so and names them. That
   is the difference between "nothing to recall" and "could not consult", which is exactly the
   distinction the log has to keep; a `records` query that came back short is indistinguishable from
-  one that came back empty.
+  one that came back empty. **What it must never mean is "the actor has been busy"** — that is the
+  normal state of a working agent, and a flag that is always on is a flag nobody reads. Which is the
+  other reason the actor has a read to itself: a source whose overflow is expected cannot share a
+  `degraded` with a source whose overflow is news.
 - **`token_estimate`.** The cost of what is about to go into a prompt, measured over the rows being
   returned. It is logged, so an operator can see what recall charges per turn.
 
 `--actor` is the **writer name** the deployment's `config.actors` gives for the agent the host names
-for the run, appended when the argv does not already name one; the socket decides what that agent is
-allowed to see, so asking about an actor never widens scope. It is not the agent id — see *[An agent
-id is not a writer name](#an-agent-id-is-not-a-writer-name)*, which is where that mistake cost half of
-recall.
+for the run; the socket decides what that agent is allowed to see, so asking about an actor never
+widens scope. It is not the agent id — see *[An agent id is not a writer
+name](#an-agent-id-is-not-a-writer-name)*, which is where that mistake cost half of recall. It does
+not travel on this read: the actor is asked for separately, with a `--limit` of its own, because one
+read with one `--limit` cannot bound two sources apart — see *[The actor is background, and is bounded
+like one](#the-actor-is-background-and-is-bounded-like-one)*.
 `search` was the alternative and needs a needle, which means deriving one from the user's prose.
 This file used to say that had no honest implementation short of putting a model in the path. That
 was too strong, and `search` now runs as a *fallback* — see below. What stands is the ordering:
@@ -383,11 +392,13 @@ of them are values the store can be asked about as they arrive:
 |---|---|---|
 | the conversation | `ctx.channelId` | `--entity <threadEntity>:<conversation>/<thread>` |
 | the message | `event.prompt` | `--infer-entities <specDir> --infer-from <text>` |
-| the agent | `ctx.agentId`, **through `config.actors`** | `--actor <writer>`, or no flag at all |
+| the agent | `ctx.agentId`, **through `config.actors`** | `--actor <writer>` on a *second* read, or no read at all |
 
-The third row is not like the other two, and the difference is the subject of the next section: the
-payload's agent id is not a value the store can be asked about, so it goes through a map the
-deployment states rather than straight into the read.
+The third row is not like the other two, and it differs twice over. The payload's agent id is not a
+value the store can be asked about, so it goes through a map the deployment states rather than
+straight into the read — that is the next section. And what it names is not a question about this
+message at all, so it does not travel on the read that answers one: it is a separate, bounded read
+whose rows arrive behind the answer and labelled as background — that is the section after.
 
 **The thread arrives inside the conversation id, not beside it.** The host builds `ctx.channelId`
 from the session key, and a threaded run's key ends `…:thread:<id>`; splitting on that is the only
@@ -411,7 +422,7 @@ output is a lookup key: it matches records that reference it at full confidence,
 nothing. A wrong guess costs one wasted lookup rather than a permanent falsehood, so this may infer
 where a writer may not — and nothing about what reaches a bundle has been loosened.
 
-All three settings are off unless configured, and none has a default this harness could invent: an
+All three lookups are off unless configured, and none has a default this harness could invent: an
 entity vocabulary, a spec directory and a set of writer names all belong to the deployment. The plugin
 says at load which of them is unwired, at info, because an operator wondering why recall is thin
 should not have to read the source to find out.
@@ -481,12 +492,74 @@ config either way. When an actor *was* asked about, the recall line names it, wh
 sees a page of one agent's week arriving in front of every reply:
 
 ```
-harness-memory: recalled 8 record(s) via bundle, actor main_bot, ~1039 tokens
+harness-memory: recalled 5 record(s) via bundle, actor main_bot, plus 2 background row(s) from actor main_bot, ~510 tokens
 ```
 
 A flag an operator already put in the configured argv is left alone, as the bounds are: `--entity`,
 `--infer-entities` and `--infer-from` in the config are that operator's choice, and this adds none of
-its own beside them.
+its own beside them. `--actor` is the exception, and only half of one: which writer is the operator's
+choice and is kept, while *where* it goes is not — it is moved off the read that answers the turn and
+onto the background read, because the allowance below has to hold for everyone or it holds for nobody.
+
+### The actor is background, and is bounded like one
+
+Making the actor half match was the fix above. What it revealed is that a bundle has no way to give
+its two sources different shares of one page, and that the plugin was relying on one of them matching
+nothing.
+
+**`bundle` fills its entities first and gives the actor whatever is left.** That is the service's rule
+and it is the right one — the keys are the question. But "whatever is left" on a turn that named no
+key is the whole page, so the moment the actor stopped being inert it started answering every turn.
+Measured on the live deployment, through the installed plugin against the real store at 80 records:
+
+| the turn | which half answered | records | block |
+|---|---|---|---|
+| a bare identifier | 3 entity + 5 actor | 8 | ~406 tok |
+| prose naming nothing | 0 entity + 8 actor | 8 | ~297 tok |
+| naming a ticket | 5 entity + 3 actor | 8 | ~359 tok |
+| a greeting | 0 entity + 8 actor | 8 | ~297 tok |
+
+The middle two rows are **the same eight lines, byte for byte** — that agent's last week — under the
+heading that says these records were composed around this request. A third generic question returns
+them again. It is cheaper and more legible than the page the search fallback used to return off the
+calendar, and it is the same kind of thing: an undiscriminating page of the store arriving under a
+heading that claims more than it can.
+
+So the actor gets a **read of its own, and a share of the page rather than the remainder of it**:
+
+- **The answer's read carries the entities and the inferred keys, and no actor.** What comes back is
+  the composed answer to the question, and its `degraded` is about that answer.
+- **The actor's read carries the actor and a `--limit` that is the allowance.** Asking for only the
+  allowance is what makes overflowing the page impossible rather than unlikely; the merge trims to it
+  again, because an operator's own `--limit` in the argv is left alone by the bounds.
+- **The allowance is `min(actorMaxRecords, page − what the entities took)`, and zero where the
+  entities took nothing.** A thin answer is worth supplementing; a full one needs no supplement; and
+  a turn with no answer must not be handed a page that only looks like one.
+
+`actorMaxRecords` defaults to **2**. A fraction of the page was the tidier-looking alternative and it
+tracks the wrong thing: `maxRecords` is raised to hold more of the *answer*, so a deployment that
+doubles it would double its background at the same time. A fixed number states how much continuity is
+worth carrying independently of how big an answer may get, and two rows — about eighty tokens — is
+enough to say what this agent did last and what it did before that, while being unmistakable for an
+answer. `0` turns it off entirely and is read as zero rather than as unset.
+
+**The rows say what they are.** Two claims in one block need a line saying where one ends, or the
+background reads as part of the answer:
+
+```
+The last 2 row(s) are main_bot's own recent activity, carried as background rather than as an
+answer to this message; there is more of it than is shown.
+```
+
+That last clause is `omitted`'s job done for a source whose being cut is not a partial answer.
+**`degraded` is never set by the actor overflowing**, and that is the deliberate half of this. The
+reader asks for one row more than the cap so that "there is more" is a fact rather than a guess, so an
+actor with more history than its share is *always* over it — which on the live deployment meant every
+keyless turn ended `This is partial: actor main_bot: N record(s) over the bundle cap of 8. Safe to
+answer a question from, not safe to act on.` For ever. A warning that always fires is a warning nobody
+reads, and that one is attached to the sentence telling a model what it may act on. Saying it in a
+sentence of its own is honest; saying it as partiality is not, and saying nothing at all would be the
+third failure. Two mutation tests exist for this pair.
 
 ### The session-opening digest, and why it is third
 
@@ -513,7 +586,7 @@ on `before_prompt_build`, behind a fence:
 | `config.digestDays` is set | the config | a deployment paying for a block nobody chose |
 | `event.messages` is empty | the hook payload | every turn after the session's first |
 | the session is unseen | this process | a backend that hands over an empty history each run |
-| the bundle found nothing | this turn's own reads | spending the turn's tokens twice |
+| the turn's own entities found nothing | this turn's own reads | spending the turn's tokens twice |
 | the shared deadline has room | the budget | an unasked-for read extending somebody else's wait |
 
 **The first-turn signal is read off the payload, not guessed.** `event.messages` is the session's
@@ -528,14 +601,24 @@ out by the payload signal, which a restart does not touch. A turn whose payload 
 all is never an opening: a turn this cannot tell apart from the next one is exactly the turn that
 would become every turn.
 
-**A bundle takes the turn; a ranked search does not.** That is the budget rule between the two, and
-it is the one decision here the measurement made rather than the design.
+**An entity hit takes the turn; a ranked search does not, and neither does a page of the actor.**
+That is the budget rule between them, and it is the one decision here the measurement made rather than
+the design.
 
-A bundle is the composed answer to the question actually asked, so where it answers, nothing
-unasked-for goes in beside it and the window is not even read. The fallback is a weaker claim by its
-own heading — records that *mention* the message's words and may not be about them — and a turn
-holding only that has not had its question answered; it has been handed a rank. Background it can act
-on is worth more there, not less.
+The rule used to read *a bundle takes the turn*, and it was written when a bundle meant an answer. It
+stopped meaning that the day the actor half began to match: the bundle then answered every turn, and
+the digest — shipped the day before — had no turn left to fire on. Measured: with `config.actors` set,
+no digest was injected on any of four probe turns; with it unset, the greeting produced one. The
+mechanism was intact the whole time, which is the kind of regression that ships green.
+
+So the test is what *answered*, not what returned rows. A bundle whose entities matched is the composed
+answer to the question actually asked, so where it answers, nothing unasked-for goes in beside it and
+the window is not even read. A bundle that is nothing but the actor's page is not an answer, and the
+allowance is what makes that structural rather than a matter of judgement: on a turn whose entities
+matched nothing, the actor is not read at all. The fallback is a weaker claim by its own heading —
+records that *mention* the message's words and may not be about them — and a turn holding only that
+has not had its question answered; it has been handed a rank. Background it can act on is worth more
+there, not less.
 
 The first version of this yielded to any recall at all, which is the obvious rule and would have
 shipped a feature that never fired once. **This host prefixes a timestamp to `event.prompt`**, so the

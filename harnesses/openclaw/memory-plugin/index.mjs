@@ -45,6 +45,13 @@
 // aimed one layer above where it happened. So `config.actors` is where a deployment states the map,
 // and where it names nothing for an agent this asks no actor at all and says so. See `actorPlan`.
 //
+// **And the actor is background, which is a claim about how much of the page it may have.** A bundle
+// fills its entities first and gives the actor whatever is left, so an actor that matches — which is
+// what the map above finally made it do — takes the whole page on the turn that named no key, and
+// hands the model the same rows whatever the question was. It is asked for separately now, bounded to
+// a small allowance out of what the entities left, and not asked for at all where the entities found
+// nothing. See `actorAllowance` for the number and `answerFor` for the two reads.
+//
 // # And one thing that is not about the turn at all
 //
 // A third read runs on the turn that opens a session, and only there: a date-grouped digest of what
@@ -89,6 +96,45 @@ const DEFAULT_MAX_RECORDS = 8;
 
 /** Ceiling on the rendered block. */
 const DEFAULT_MAX_CHARS = 2000;
+
+/**
+ * Most of one page the actor's own activity may take, on a turn that had an answer to supplement.
+ *
+ * **The actor is a background source and this is the number that makes that true rather than said.**
+ * A bundle composes out of entities and an actor, the service fills entities first and lets the actor
+ * have the rest of the page, and for as long as the actor half matched nothing that was a rule with
+ * no consequences. The moment it matched, it took whatever the keys left — which on a turn that named
+ * no key at all is the whole page. Measured on the live deployment at 80 records: a greeting, a
+ * generic prose question and a third generic question each came back with the same eight rows, byte
+ * for byte, of the asking agent's last week, under the heading that says the records were composed
+ * around this request.
+ *
+ * Three ways to size the share were available and this is the argument for the one taken:
+ *
+ *   - **A fraction of the page** tracks the page rather than the question. `maxRecords` is bought to
+ *     hold more of the *answer*, so a deployment that raises it to sixteen because its entities have
+ *     long histories would double its background at the same time, which is the wrong direction.
+ *   - **A fixed number with no way to change it** decides for a deployment whose store this file has
+ *     never seen — the same objection that keeps `digestDays` unset by default.
+ *   - **A small fixed default an operator can move**, which is this. Two rows is enough to say what
+ *     this agent did last and what it did before that; it is about eighty tokens against a page of
+ *     around three hundred; and it cannot be mistaken for an answer at that size.
+ *
+ * The other half of the rule is not a number: the allowance is **zero on a turn whose entities
+ * matched nothing**, because there is then no answer for background to be background *to*. That is
+ * what keeps a page of the actor from arriving under a heading claiming it was composed around the
+ * message, and it is what gives the ranked search and the session-opening digest their turns back.
+ * See `actorAllowance`.
+ */
+const DEFAULT_ACTOR_MAX_RECORDS = 2;
+
+/**
+ * How little of the budget is still worth a background read.
+ *
+ * The same floor the fallback and the digest have, for the same reason: every read here shares one
+ * deadline, and the one thing nobody asked for must not extend a wait somebody else is spending.
+ */
+const MIN_BACKGROUND_MS = 600;
 
 /** Cap on what is read from the reader's streams, so a wedged reader cannot grow this process. */
 const STDOUT_CAP = 262_144;
@@ -302,8 +348,10 @@ function bounds(argv, budgetMs, maxRecords) {
  * Returns which of four things the actor of this turn is, so the caller can say which happened rather
  * than leave a reader to infer it from an empty page:
  *
- *   - `configured` — the read argv already names `--actor`. An operator's choice is theirs.
- *   - `named` — the map names a usable writer for this agent. The only plan that reaches the reader.
+ *   - `configured` — the read argv already names `--actor`. An operator's choice of *writer* is
+ *     theirs, and the plan carries the name so the background read can be built from it; how much of
+ *     the page that writer gets is this file's, and is bounded the same way for everyone.
+ *   - `named` — the map names a usable writer for this agent. The only plan that adds a flag.
  *   - `unmapped` — this turn has an agent id and the config names no usable writer for it. **No
  *     `--actor` is passed.** Passing the agent id is what asked about a writer that never existed,
  *     and the empty set that comes back is indistinguishable from a quiet store; asking about the
@@ -313,7 +361,9 @@ function bounds(argv, budgetMs, maxRecords) {
  *   - `unnamed` — the turn carries no agent id at all, so there is nothing to look up.
  */
 function actorPlan(argv, agentId, actors) {
-  if (Array.isArray(argv) && argv.includes("--actor")) return { kind: "configured" };
+  if (Array.isArray(argv) && argv.some(namesActor)) {
+    return { kind: "configured", writer: actorWriterIn(argv) };
+  }
   if (typeof agentId !== "string" || !agentId.trim()) return { kind: "unnamed" };
   const id = agentId.trim();
   const writer = actors && typeof actors === "object" ? actors[id] : undefined;
@@ -323,10 +373,92 @@ function actorPlan(argv, agentId, actors) {
   return { kind: "named", writer: trimmed };
 }
 
-/** The plan above as the argv it contributes. Nothing but a `named` plan reaches the reader. */
+/** Whether one argument is the actor flag, in either of the two spellings an argv may use. */
+function namesActor(arg) {
+  return arg === "--actor" || (typeof arg === "string" && arg.startsWith("--actor="));
+}
+
+/**
+ * The writer an operator wrote into the reader argv, or nothing when what they wrote is not one.
+ *
+ * Read rather than merely detected, because the actor now has a read of its own: the flag has to be
+ * taken *off* the read that answers the turn and put *on* the read that carries the background, and
+ * both halves need the name. A `--actor` with no value after it, or one whose value would be read as
+ * another flag, yields nothing — and `withoutActor` then leaves the argv alone, so the reader refuses
+ * the malformed config exactly as it does today rather than having it quietly repaired here.
+ */
+function actorWriterIn(argv) {
+  for (let at = 0; at < argv.length; at += 1) {
+    const arg = argv[at];
+    if (arg === "--actor") {
+      const next = argv[at + 1];
+      return typeof next === "string" && next.trim() && !next.startsWith("-") ? next.trim() : undefined;
+    }
+    if (typeof arg === "string" && arg.startsWith("--actor=")) {
+      const value = arg.slice("--actor=".length).trim();
+      return value && !value.startsWith("-") ? value : undefined;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * The configured argv with the actor flag taken off it.
+ *
+ * What is left is the read that answers the turn: entities, and the keys inferred from the message.
+ * The actor is asked separately and bounded separately, because a source that fills whatever the
+ * others left is a source with no bound at all on the turn where the others found nothing.
+ */
+function withoutActor(argv) {
+  const kept = [];
+  for (let at = 0; at < argv.length; at += 1) {
+    const arg = argv[at];
+    if (arg === "--actor") {
+      at += 1;
+      continue;
+    }
+    if (typeof arg === "string" && arg.startsWith("--actor=")) continue;
+    kept.push(arg);
+  }
+  return kept;
+}
+
+/**
+ * The plan above as the argv the *background* read contributes.
+ *
+ * Nothing but a `named` plan adds a flag, and the reason a `configured` one does not is that its
+ * argv already carries the operator's own — the background read is built from the configured argv
+ * unchanged, and adding a second `--actor` would ask about two writers or be refused for asking
+ * twice. Neither plan puts an actor on the read that answers the turn any more; see `answerFor`.
+ */
 function actorFor(argv, agentId, actors) {
   const plan = actorPlan(argv, agentId, actors);
   return plan.kind === "named" ? ["--actor", plan.writer] : [];
+}
+
+/**
+ * How many rows of the page the actor may have on this turn, given what the entities took.
+ *
+ * Two rules, and the first is the one that matters. **Zero where the entities matched nothing.** The
+ * actor is background to an answer, so a turn with no answer has nothing for it to be background to,
+ * and a page of the asking agent's week is not made into a reply by arriving under a heading that
+ * says a bundle composed it. That is also what hands the turn back to the two reads that exist for
+ * exactly this case: the ranked search, whose heading concedes what it is, and the session-opening
+ * digest, whose heading concedes more.
+ *
+ * Then a bound: at most `actorMaxRecords`, and never more than the page has left. So a turn naming
+ * three entities whose histories fill the page gets no background at all — it did not need any — a
+ * turn whose one entity answered thinly gets the full allowance, and a turn naming nothing gets none.
+ * The middle case is the one the allowance is for, which is the right shape: a thin answer is worth
+ * supplementing, a full one is not, and no answer must not be dressed as one.
+ *
+ * Zero is a legitimate setting and is therefore read as one — a deployment that wants no background
+ * page at all sets `actorMaxRecords` to 0 rather than having it silently mean "use the default".
+ */
+function actorAllowance(settings, limits, shown) {
+  if (!Number.isFinite(shown) || shown <= 0) return 0;
+  const most = whole(settings?.actorMaxRecords, DEFAULT_ACTOR_MAX_RECORDS);
+  return Math.max(0, Math.min(most, limits.maxRecords - shown));
 }
 
 /**
@@ -539,6 +671,18 @@ function positive(value, fallback) {
 }
 
 /**
+ * A whole-number setting whose zero means zero, or the default when the config says nothing usable.
+ *
+ * Separate from `positive` because the two kinds of setting differ in what a `0` is. A page of zero
+ * records or a budget of zero milliseconds is a mistake, so `positive` reads those as "unset". An
+ * allowance of zero is a deployment saying it wants no background page, which is a decision this file
+ * must not overrule by handing back a default.
+ */
+function whole(value, fallback) {
+  return Number.isInteger(value) && value >= 0 ? value : fallback;
+}
+
+/**
  * Renders one record's structure as a single line.
  *
  * Field order is fixed rather than whatever the JSON iterated: two turns recalling the same record
@@ -567,6 +711,12 @@ function line(record) {
  *
  * Whatever is cut is counted. A capped list that reads as the whole truth is the failure this is
  * guarding against: the model would treat "eight records" as "everything there is", and act on it.
+ *
+ * **The rows are two claims and the block says where one ends.** Everything the entities composed
+ * comes first; whatever the actor's allowance carried is appended, and `answer.background` names how
+ * many of the rows those are. Without that sentence the two are one undifferentiated list under a
+ * heading that says all of it was gathered around this request, and only one half was. That the
+ * background is bounded is why it is *worth* labelling rather than dropping — see `actorAllowance`.
  */
 function renderContext(answer, limits, heading = HEADING) {
   const records = Array.isArray(answer?.records) ? answer.records : [];
@@ -583,9 +733,28 @@ function renderContext(answer, limits, heading = HEADING) {
   }
   if (lines.length === 0) return "";
 
-  const dropped = records.length - lines.length;
+  // Told apart by position rather than by inspecting the rows: the background is appended, so the
+  // rows the entities answered with are the ones before it. A character ceiling cuts from the end,
+  // which takes the background first — the cheaper thing to lose, and counted either way.
+  const background = answer?.background;
+  const answered = background ? records.length - background.shown : records.length;
+  const answeredShown = Math.min(lines.length, answered);
+  const carried = lines.length - answeredShown;
+
   const notes = [];
+  const dropped = answered - answeredShown;
   if (dropped > 0) notes.push(`${dropped} further record(s) matched and are not shown.`);
+  if (background && carried > 0) {
+    // Stated as what it is rather than counted into the answer. This is `omitted`'s job done for a
+    // source whose being cut is not a partial answer: there is always more of an agent's own
+    // history, and saying so is honest where warning about it would be noise.
+    const more = background.more === true || background.shown > carried;
+    notes.push(
+      `The last ${carried} row(s) are ${background.writer}'s own recent activity, carried as ` +
+        `background rather than as an answer to this message` +
+        `${more ? "; there is more of it than is shown" : ""}.`,
+    );
+  }
   if (answer?.degraded === true) {
     const omitted = Array.isArray(answer.omitted) ? answer.omitted.filter((entry) => typeof entry === "string") : [];
     notes.push(
@@ -843,10 +1012,20 @@ function unusable(argv) {
  * which happened from an absent result.
  *
  * The digest is a *field* on those outcomes rather than a fourth one, and the budget rule between them
- * is written down here: **a bundle takes the turn, a ranked search does not.**
+ * is written down here: **an entity hit takes the turn; a ranked search and a page of the actor do
+ * not.**
  *
- * A bundle is the composed answer to the question actually asked, so when it answers, nothing
- * unasked-for goes in beside it and no second read is spent finding out what one would have said.
+ * The rule used to read "a bundle takes the turn", and it was written when a bundle meant an answer.
+ * It stopped meaning that the day the actor half began to match: the service fills entities first and
+ * gives the actor the rest of the page, so a turn naming no key came back with a full bundle of the
+ * asking agent's own week and the digest had no turn left to fire on. Measured on the live
+ * deployment: with `config.actors` set, no digest was injected on any of four probe turns; with it
+ * unset, the greeting produced one. The mechanism was intact the whole time.
+ *
+ * So the test is what *answered*, not what returned rows. A bundle whose entities matched is the
+ * composed answer to the question actually asked, and nothing unasked-for goes in beside it. A bundle
+ * that is nothing but the actor's page is not an answer — it is the same rows on every turn, and the
+ * bounded version of it that `actorAllowance` allows is not even offered on a turn with no keys.
  * The fallback is a weaker claim by its own heading — records that *mention* the message's words and
  * may not be about them — and a turn holding only that has not had its question answered; it has been
  * handed a rank. Background it can act on is worth more there, not less.
@@ -888,8 +1067,9 @@ async function recall(settings, turn) {
   const deadline = Date.now() + budgetMs;
 
   const outcome = await answerFor(settings, argv, turn, named, limits, budgetMs, deadline);
-  // The bundle answered the question. Nothing unasked-for goes in beside it, and no second read is
-  // spent finding out what one would have said. A ranked hit does not clear that bar — see above.
+  // The entities answered the question. Nothing unasked-for goes in beside it, and no second read is
+  // spent finding out what one would have said. A ranked hit does not clear that bar, and neither
+  // does the actor's own page, which is why it is never asked for alone — see above.
   if (outcome.kind === "recalled" && outcome.via === READ_SHAPE) return outcome;
   return withDigest(outcome, settings, argv, turn, deadline);
 }
@@ -924,26 +1104,37 @@ async function answerFor(settings, argv, turn, named, limits, budgetMs, deadline
   // outcome below rather than recomputed by the log: "no actor was asked about" is a fact about the
   // read that happened, and a reader of the log must not have to re-derive it from the config.
   const actor = actorPlan(argv, turn?.agentId, settings?.actors);
+  // **The actor is not on this read.** It used to be, and one flag on one read is why a bundle could
+  // not tell a caller which of its two sources filled the page: the service fills entities first and
+  // gives the actor the rest, so on a turn naming no key the actor got all of it, reported the excess
+  // as an omission, and set `degraded` for ever. Asked separately, it is bounded separately — and the
+  // question this read answers is the one the heading claims it answered.
+  const base = actor.kind === "configured" && actor.writer ? withoutActor(argv) : argv;
   const args = [
-    ...argv.slice(1),
-    ...entitiesFor(argv, named),
-    ...inferenceFor(argv, settings?.specDir, turn?.text),
-    ...actorFor(argv, turn?.agentId, settings?.actors),
-    ...bounds(argv, budgetMs, limits.maxRecords),
+    ...base.slice(1),
+    ...entitiesFor(base, named),
+    ...inferenceFor(base, settings?.specDir, turn?.text),
+    ...bounds(base, budgetMs, limits.maxRecords),
   ];
 
-  const first = await once(argv[0], args, budgetMs);
+  const first = await once(base[0], args, budgetMs);
   if (first.kind === "failed") return { kind: "unavailable", why: first.why, asked: named, actor };
   if (first.records.length > 0) {
-    return composed(first, limits, HEADING, { asked: named, via: READ_SHAPE, actor });
+    const page = await backgroundOf(settings, argv, turn, first.records.length, limits, deadline);
+    const extra = { asked: named, via: READ_SHAPE, actor };
+    if (page?.why) extra.backgroundFailed = page.why;
+    return composed(withActorPage(first, page), limits, HEADING, extra);
   }
 
   // The bundle answered and matched nothing. Everything below is the second question, and it is a
   // different question: not "what is filed under these keys" but "what mentions these words".
-  const fallback = fallbackFor(settings, argv, turn, deadline);
+  // Built from the read without the actor on it, for the same reason: a ranked search is a question
+  // about the message's words, and an actor flag would narrow it to one writer's records without the
+  // heading saying so — where the `search` read accepts the flag at all.
+  const fallback = fallbackFor(settings, base, turn, deadline);
   if (!fallback) return { kind: "empty", asked: named, actor };
 
-  const second = await once(argv[0], fallback.args, fallback.budgetMs);
+  const second = await once(base[0], fallback.args, fallback.budgetMs);
   // A failed fallback is still an empty bundle, not an outage: the precise read succeeded and found
   // nothing, which is an answer. Reporting it as unavailable would call a working store broken.
   if (second.kind === "failed") {
@@ -978,6 +1169,91 @@ function fallbackFor(settings, argv, turn, deadline) {
   };
 }
 
+/**
+ * The background read, or nothing when there is no actor, no room, or no time.
+ *
+ * The same reader and the same socket asked the same `bundle` shape, with the actor and nothing else:
+ * no entity, no inference, and a `--limit` that is the allowance rather than the page. **Asking for
+ * only the allowance is what makes overflowing the page impossible** rather than merely unlikely, and
+ * the merge trims to it a second time so that an operator who pinned their own `--limit` in the argv
+ * — which `bounds` leaves alone, because a bound in the config was chosen for a reason — cannot buy
+ * the actor a bigger share of somebody else's page by accident.
+ */
+function backgroundPlan(settings, argv, turn, shown, limits, deadline) {
+  const plan = actorPlan(argv, turn?.agentId, settings?.actors);
+  const writer = plan.writer;
+  if (typeof writer !== "string" || !writer) return undefined;
+  const allowance = actorAllowance(settings, limits, shown);
+  if (allowance <= 0) return undefined;
+  const left = deadline - Date.now();
+  if (left < MIN_BACKGROUND_MS) return undefined;
+  return {
+    writer,
+    allowance,
+    args: [
+      ...argv.slice(1),
+      ...actorFor(argv, turn?.agentId, settings?.actors),
+      ...bounds(argv, left, allowance),
+    ],
+    budgetMs: left,
+  };
+}
+
+/**
+ * The actor's page, read and bounded, or nothing when it declined — or `{writer, why}` when it failed.
+ *
+ * **A background read that fails costs the turn nothing**, exactly as a digest that fails does. The
+ * answer this supplements has already been composed; reporting a failure to fetch a supplement as a
+ * partial answer would put the words "not safe to act on" on a bundle that is complete.
+ */
+async function backgroundOf(settings, argv, turn, shown, limits, deadline) {
+  const plan = backgroundPlan(settings, argv, turn, shown, limits, deadline);
+  if (!plan) return undefined;
+  const answer = await once(argv[0], plan.args, plan.budgetMs);
+  if (answer.kind === "failed") return { writer: plan.writer, why: answer.why };
+  const records = answer.records.slice(0, plan.allowance);
+  return {
+    writer: plan.writer,
+    records,
+    // **This is the flag that must not become the answer's.** `degraded` here says the actor has more
+    // history than its allowance, which is the normal state of any agent that has been running, and
+    // it is reported as a sentence about the background rather than as a warning about the bundle.
+    // See `withActorPage`, where it is deliberately not carried across.
+    more: answer.degraded === true || answer.records.length > records.length,
+    token_estimate: answer.token_estimate,
+  };
+}
+
+/**
+ * The answer with the actor's page appended, and the actor's own bounds left where they belong.
+ *
+ * Three things are carried across and one is not:
+ *
+ *   - **the rows**, minus anything the answer already had. One record can be both an entity's history
+ *     and the actor's, and a page that showed it twice would spend the allowance saying nothing.
+ *   - **how many rows they are**, so the block can say where the answer stops. See `renderContext`.
+ *   - **whether there is more of them**, which is `omitted`'s job for this source.
+ *   - **not `degraded`.** The answer's partiality is the answer's read's to report. An actor with
+ *     more history than its allowance is not a partial answer, it is an agent that has been working,
+ *     and a sentence that fires on every turn stops being read on the turn it matters.
+ */
+function withActorPage(answer, page) {
+  const records = Array.isArray(page?.records) ? page.records : [];
+  if (records.length === 0) return answer;
+  const seen = new Set(answer.records.map((record) => record?.record_id).filter(Boolean));
+  const added = records.filter((record) => !record?.record_id || !seen.has(record.record_id));
+  if (added.length === 0) return answer;
+  const tokens = Number.isFinite(answer.token_estimate) && Number.isFinite(page.token_estimate)
+    ? answer.token_estimate + page.token_estimate
+    : answer.token_estimate;
+  return {
+    ...answer,
+    records: [...answer.records, ...added],
+    token_estimate: tokens,
+    background: { writer: page.writer, shown: added.length, more: page.more === true },
+  };
+}
+
 /** An answer with records in it, rendered — or the failure that none of them fit. */
 function composed(answer, limits, heading, extra) {
   const context = renderContext(answer, limits, heading);
@@ -994,8 +1270,10 @@ function composed(answer, limits, heading, extra) {
     kind: "recalled",
     context,
     count: answer.records.length,
+    // The answer's own read decides this, and the actor's page is not part of it. See `withActorPage`.
     degraded: answer.degraded === true,
     tokenEstimate: Number.isFinite(answer.token_estimate) ? answer.token_estimate : undefined,
+    background: answer.background,
     ...extra,
   };
 }
@@ -1089,6 +1367,7 @@ function injectionFrom(outcome) {
  */
 function report(outcome, logger) {
   reportDigest(outcome, logger);
+  reportBackground(outcome, logger);
   reportActor(outcome, logger);
   if (outcome?.kind === "recalled") {
     const cost = outcome.tokenEstimate === undefined ? "" : `, ~${outcome.tokenEstimate} tokens`;
@@ -1096,10 +1375,14 @@ function report(outcome, logger) {
     // finds out which one this deployment is actually living on. A store whose every turn is
     // answered by the fallback is not recalling what it was asked about; it is ranking words.
     const via = outcome.via ? ` via ${outcome.via}` : "";
-    // And whose activity went into it, when an actor did. A bundle asks "what has this writer been
-    // doing" alongside the keys, so on a store one agent wrote most of, this clause is how an
-    // operator sees a page of that agent's week arriving in front of every reply.
-    const whose = outcome.actor?.kind === "named" ? `, actor ${outcome.actor.writer}` : "";
+    // And how much of it was the actor's own activity rather than the answer. A bundle used to ask
+    // "what has this writer been doing" alongside the keys and let it have whatever the keys left, so
+    // on a store one agent wrote most of, a whole page of that agent's week arrived in front of every
+    // reply. It is now a bounded tail, and this clause is where an operator sees how long it is.
+    const background = outcome.background;
+    const whose = background
+      ? `, plus ${background.shown} background row(s) from actor ${background.writer}`
+      : "";
     logger?.info?.(
       `${PLUGIN_ID}: recalled ${outcome.count} record(s)${via}${whose}${outcome.degraded ? " (partial)" : ""}${cost}`,
     );
@@ -1110,9 +1393,11 @@ function report(outcome, logger) {
     // name no entity at all reads as `about nothing in particular`, and that is a different problem
     // from a store with nothing in it — the fix for one is the wiring, for the other is time.
     const about = outcome.asked?.length ? outcome.asked.join(", ") : "nothing in particular";
-    const whose = outcome.actor?.kind === "named" ? `, and the activity of ${outcome.actor.writer}` : "";
+    // The actor is not named here, and its absence from this line is the point: a turn whose keys
+    // matched nothing does not ask about the actor at all, because a page of the asking agent's own
+    // week is background to an answer and there is no answer here for it to be background to.
     logger?.info?.(
-      `${PLUGIN_ID}: the memory service matched nothing (asked about ${about}${whose}); the turn proceeds with no recalled context`,
+      `${PLUGIN_ID}: the memory service matched nothing (asked about ${about}); the turn proceeds with no recalled context`,
     );
     return;
   }
@@ -1143,6 +1428,20 @@ function reportActor(outcome, logger) {
       `"${plan.agentId}", so this turn asked only about what it could name. An agent id is not a ` +
       `writer name — a record carries the caller its socket signed as, and only this deployment's ` +
       `keyring knows which that is`,
+  );
+}
+
+/**
+ * The background read's own line, said only when it failed.
+ *
+ * Said at info and never as a warning, for the same reason the digest's failure is: the turn carries
+ * the answer it composed, and a supplement that could not be fetched changes nothing a reader of that
+ * answer would do. A success needs no line of its own — the recall line names the rows.
+ */
+function reportBackground(outcome, logger) {
+  if (!outcome?.backgroundFailed) return;
+  logger?.info?.(
+    `${PLUGIN_ID}: no background page for the actor, and the answer is unaffected: ${outcome.backgroundFailed}`,
   );
 }
 
@@ -1257,6 +1556,16 @@ export default {
 export {
   recall,
   once,
+  actorAllowance,
+  actorWriterIn,
+  withoutActor,
+  backgroundPlan,
+  backgroundOf,
+  withActorPage,
+  reportBackground,
+  whole,
+  DEFAULT_ACTOR_MAX_RECORDS,
+  MIN_BACKGROUND_MS,
   searchBounds,
   composed,
   fallbackFor,
