@@ -90,7 +90,7 @@ is on before anything is configured, and replaceable per deployment with `egress
 crates/
   harness-agent      the Agent trait, Task, Outcome, Context — what an agent codes against
   harness-envelope   source-neutral inbound message and outbound egress
-  harness-dispatch   normalise, route, guard, deliver
+  harness-dispatch   normalise, route, guard, deliver; the route decision and the worker
   harness-memory     client for the memory service; bundles in, records out
   harness-screen     the egress screen: credential shapes out of a rendered message
   harness-cli        run a dispatcher, or run a single agent for development

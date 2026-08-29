@@ -4,11 +4,12 @@ use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
-use harness_agent::{ActionDraft, Actor, Context, MemoryHandle, Status, Task, TaskId};
+use harness_agent::{ActionDraft, Actor, Context, Health, MemoryHandle, Status, Task, TaskId};
 use harness_envelope::{Delivery, Envelope};
 use harness_memory::Bundle;
 
 use crate::egress::{Courier, Masking};
+use crate::worker::{Handing, Handout, Route};
 
 /// Deadline handed to an agent when the source does not name one.
 const DEFAULT_DEADLINE_MS: u64 = 5_000;
@@ -41,6 +42,13 @@ pub struct Dispatched {
     /// naming one for a dispatch that ran nothing would be inventing it — and the earlier verdict
     /// is not ours to repeat either, since the ledger remembers only that the envelope finished.
     pub status: Option<Status>,
+    /// The decision this dispatch took, or `None` when nothing was decided.
+    ///
+    /// `None` for a duplicate, by the same rule as `status`: a redelivery decides nothing, and
+    /// minting a route id for it would put a second decision in the audit trail where the
+    /// dispatcher took one. Reported for an agent as well as a worker — an agent is routed to by
+    /// the same decision, and an id nobody can see is not an audit trail.
+    pub route: Option<Route>,
 }
 
 /// The memory operations dispatch depends on.
@@ -121,15 +129,20 @@ impl Seen {
     }
 }
 
-/// A running dispatcher: the agents it can route to, the store it reads, the only way it can post,
+/// A running dispatcher: the handlers it can route to, the store it reads, the only way it can post,
 /// and what it has already done.
 ///
 /// Assembled once and then asked to handle envelopes. Holding the two ledgers here is what makes a
 /// redelivery cheap; holding them in a struct rather than threading them through every call is what
 /// keeps the relationship between them stated in one place. Two dispatchers can share a process
 /// without sharing either ledger, which a process-global would have made impossible.
+///
+/// Agents and workers share every ledger, because the thing being deduplicated is the *envelope*: a
+/// message answered by an agent must not be answered again by a worker, and a separate dispatcher
+/// per handler kind would have made that impossible to state.
 pub struct Dispatcher {
     registry: crate::Registry,
+    workers: crate::Workers,
     store: Arc<dyn ContextStore>,
     courier: Courier,
     seen: Seen,
@@ -144,10 +157,21 @@ impl Dispatcher {
     pub fn new(registry: crate::Registry, store: Arc<dyn ContextStore>, courier: Courier) -> Self {
         Self {
             registry,
+            workers: crate::Workers::new(),
             store,
             courier,
             seen: Seen::default(),
         }
+    }
+
+    /// Adds the workers this dispatcher may hand off to.
+    ///
+    /// Separate from [`Dispatcher::new`] so that a deployment with no workers yet says nothing
+    /// about them, rather than passing an empty registry that reads as a decision.
+    #[must_use]
+    pub fn with_workers(mut self, workers: crate::Workers) -> Self {
+        self.workers = workers;
+        self
     }
 
     /// The agents this dispatcher can route to.
@@ -156,7 +180,13 @@ impl Dispatcher {
         &self.registry
     }
 
-    /// Handles one envelope end to end.
+    /// The workers this dispatcher can hand off to.
+    #[must_use]
+    pub fn workers(&self) -> &crate::Workers {
+        &self.workers
+    }
+
+    /// Handles one envelope end to end, routing it to an agent.
     ///
     /// Order matters: classify, dedupe, load context, decide whether a mutating task may proceed on
     /// what was loaded, and only then invoke the agent. Checking safety after invoking would mean
@@ -167,6 +197,26 @@ impl Dispatcher {
     /// The returned deliveries are what the agent asked to send; what the adapter received is that
     /// text with every filter applied.
     pub async fn dispatch(&self, envelope: Envelope) -> crate::Result<Dispatched> {
+        self.handle(envelope, Callee::Agent).await
+    }
+
+    /// Handles one envelope end to end, handing it to a worker.
+    ///
+    /// The same order, the same ledgers, the same egress. What differs is what the handler is given:
+    /// an agent receives a context that can read the store, and a worker receives the [`Handout`]
+    /// this dispatcher composed and nothing else. Everything §5.5 asks a worker to be handed —
+    /// `route_id`, `envelope_id`, `bundle_id`, `args` — reaches it through [`crate::Handed::route`], and
+    /// the bundle those ids name travels with them.
+    pub async fn hand_off(&self, envelope: Envelope) -> crate::Result<Dispatched> {
+        self.handle(envelope, Callee::Worker).await
+    }
+
+    /// The one path both entry points take.
+    ///
+    /// Written once rather than twice: dedupe, the refusal rule, delivery and the record submission
+    /// are the dispatcher's reason for existing, and a second copy of them for workers would be a
+    /// second set of answers to the questions this module exists to answer once.
+    async fn handle(&self, envelope: Envelope, callee: Callee) -> crate::Result<Dispatched> {
         let memory: &dyn ContextStore = self.store.as_ref();
         let Request {
             intent,
@@ -189,50 +239,72 @@ impl Dispatcher {
                 duplicate: true,
                 degraded: false,
                 status: None,
+                route: None,
             });
         }
 
-        let agent = self.registry.resolve(&intent)?;
-        let mutating = agent
-            .capabilities()
-            .iter()
-            .find(|c| c.intent == intent)
-            .is_some_and(|c| c.mutating);
+        let chosen = match callee {
+            Callee::Agent => Chosen::Agent(self.registry.resolve(&intent)?),
+            Callee::Worker => Chosen::Worker(self.workers.resolve(&intent)?),
+        };
+        let mutating = chosen.mutating(&intent);
+
+        refuse_early(&chosen, &intent, &args, &envelope.envelope_id).await?;
 
         let deadline_ms = deadline_ms(&envelope);
         let bundle = load(memory, &entities, deadline_ms).await?;
+        // Composed and addressed before anything runs, so what a worker was given is named by the
+        // decision that gave it rather than described afterwards by whoever ran it.
+        let handout = Handout::compose(&envelope.envelope_id, &entities, bundle);
+        let degraded = handout.degraded;
+        let route = Route::decide(&handout, chosen.id(), &intent, args, deadline_ms, mutating);
 
-        if mutating && bundle.degraded {
-            // Before the agent runs, not after: a refusal that arrives once the side effect has
+        if mutating && degraded {
+            // Before the handler runs, not after: a refusal that arrives once the side effect has
             // happened is not a refusal.
             tracing::warn!(
                 envelope_id = %envelope.envelope_id,
                 %intent,
-                omitted = ?bundle.omitted,
+                route_id = %route.route_id,
+                omitted = ?handout.omitted,
                 "refusing a mutating task on partial context"
             );
             return Err(crate::Error::RefusedDegraded {
                 intent,
-                omitted: bundle.omitted,
+                omitted: handout.omitted,
             });
         }
-        let degraded = bundle.degraded;
 
-        let task = Task {
-            // One envelope is one task: a retry must not mint a second identity, or the audit trail
-            // shows two actions where the source sent one message.
-            task_id: TaskId(envelope.envelope_id.clone()),
-            correlation_id: envelope.envelope_id.clone(),
-            intent: intent.clone(),
-            args,
-            mutating,
-            actor: envelope.actor.as_ref().map(|id| Actor {
-                id: id.clone(),
-                source: envelope.source.clone(),
-            }),
+        let (outcome, queued, route) = match chosen {
+            Chosen::Agent(agent) => {
+                let task = Task {
+                    // One envelope is one task: a retry must not mint a second identity, or the
+                    // audit trail shows two actions where the source sent one message.
+                    task_id: TaskId(envelope.envelope_id.clone()),
+                    correlation_id: envelope.envelope_id.clone(),
+                    intent: intent.clone(),
+                    args: route.args.clone(),
+                    mutating,
+                    actor: envelope.actor.as_ref().map(|id| Actor {
+                        id: id.clone(),
+                        source: envelope.source.clone(),
+                    }),
+                };
+                let context =
+                    Dispatching::new(memory, &envelope.envelope_id, deadline_ms, degraded);
+                let outcome = agent.handle(task, &context).await?;
+                (outcome, context.into_drafts(), route)
+            }
+            Chosen::Worker(worker) => {
+                // The pair is checked here rather than where it was composed: in this process they
+                // were composed together and cannot disagree, and this is the call an out-of-process
+                // host reproduces.
+                let given = Handing::new(route, handout)?;
+                let outcome = worker.run(&given).await?;
+                let (route, queued) = given.finish();
+                (outcome, queued, route)
+            }
         };
-        let context = Dispatching::new(memory, &envelope.envelope_id, deadline_ms, degraded);
-        let outcome = agent.handle(task, &context).await?;
         let status = outcome.status;
 
         let deliveries = deliveries(&envelope, outcome.egress);
@@ -241,7 +313,7 @@ impl Dispatcher {
         // Delivery is idempotent, so a record that fails to submit can be retried by replaying the
         // whole envelope without the reply going out twice.
         let mut drafts = outcome.records;
-        drafts.extend(context.into_drafts());
+        drafts.extend(queued);
         let mut records_written = 0;
         for draft in &drafts {
             // The envelope id is the interaction, so every record written for this task can be
@@ -262,7 +334,107 @@ impl Dispatcher {
             duplicate: false,
             degraded,
             status: Some(status),
+            route: Some(route),
         })
+    }
+}
+
+/// The refusals that must land before anything has been composed or invoked.
+///
+/// Both are the caller's to fix rather than something to retry into, and both are cheaper to answer
+/// than the composition they precede — so a handler that cannot work, or a route missing an argument
+/// that handler declared, is answered with what is wrong rather than with a timeout.
+async fn refuse_early(
+    chosen: &Chosen<'_>,
+    intent: &str,
+    args: &BTreeMap<String, serde_json::Value>,
+    envelope_id: &str,
+) -> crate::Result<()> {
+    if let Health::Unavailable(reason) = chosen.health().await {
+        tracing::warn!(
+            %envelope_id,
+            %intent,
+            worker = %chosen.id().0,
+            %reason,
+            "refusing: the handler reports it cannot work"
+        );
+        return Err(crate::Error::Unreachable {
+            intent: intent.to_owned(),
+            worker: chosen.id().0.clone(),
+            reason,
+        });
+    }
+    let missing: Vec<String> = chosen
+        .requires(intent)
+        .iter()
+        .filter(|key| !args.contains_key(**key))
+        .map(|key| (*key).to_string())
+        .collect();
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(crate::Error::Underspecified {
+            intent: intent.to_owned(),
+            worker: chosen.id().0.clone(),
+            missing,
+        })
+    }
+}
+
+/// Which registry an envelope is routed through.
+#[derive(Debug, Clone, Copy)]
+enum Callee {
+    /// An agent, which holds a context that can read the store.
+    Agent,
+    /// A worker, which holds only what was composed for it.
+    Worker,
+}
+
+/// The handler an envelope resolved to.
+///
+/// The two interfaces differ in what they are given, not in how they are found, so everything the
+/// dispatcher needs before invoking is asked of them identically here.
+enum Chosen<'a> {
+    Agent(&'a Arc<dyn harness_agent::Agent>),
+    Worker(&'a Arc<dyn crate::Worker>),
+}
+
+impl Chosen<'_> {
+    /// Who this is, for attribution and for the route decision.
+    fn id(&self) -> &harness_agent::AgentId {
+        match self {
+            Self::Agent(agent) => agent.id(),
+            Self::Worker(worker) => worker.id(),
+        }
+    }
+
+    /// Whether the matched capability declares that it changes state.
+    fn mutating(&self, intent: &str) -> bool {
+        let claimed = match self {
+            Self::Agent(agent) => agent.capabilities(),
+            Self::Worker(worker) => worker.capabilities(),
+        };
+        claimed.iter().any(|c| c.intent == intent && c.mutating)
+    }
+
+    /// Argument keys the handler will not run without.
+    ///
+    /// Empty for an agent, and that asymmetry is the point rather than an omission: an agent's
+    /// arguments are whatever it and its adapter agreed between themselves, which is the hole a
+    /// worker's declaration closes.
+    fn requires(&self, intent: &str) -> &[&str] {
+        match self {
+            Self::Agent(_) => &[],
+            Self::Worker(worker) => worker.requires(intent),
+        }
+    }
+
+    /// What the handler says about its own readiness.
+    async fn health(&self) -> Health {
+        match self {
+            Self::Agent(agent) => agent.health().await,
+            Self::Worker(worker) => worker.health().await,
+        }
     }
 }
 
@@ -526,12 +698,13 @@ impl MemoryHandle for Queued<'_> {
 mod tests {
     use std::sync::Arc;
 
-    use harness_agent::{Egress, Status};
+    use harness_agent::{AgentId, Egress, Status};
 
     use crate::egress::Courier;
     use crate::fixtures::{
-        FakeStore, RecordingAdapter, RecordingAgent, Render, Suffix, dispatcher, draft, envelope,
-        filters, plain_courier,
+        FakeStore, RecordingAdapter, RecordingAgent, RecordingWorker, Render, Suffix, dispatcher,
+        draft, envelope, envelope_about, filters, plain_courier, registry, worker_dispatcher,
+        workers,
     };
 
     #[tokio::test]
@@ -1250,6 +1423,387 @@ mod tests {
             dispatcher.registry().ids(),
             vec![harness_agent::AgentId("reader".into())]
         );
+    }
+
+    #[tokio::test]
+    async fn a_worker_runs_from_the_bundle_the_dispatcher_composed() {
+        // The §5.5 property, stated as an assertion: everything the worker read, the dispatcher
+        // handed it, and the ids it holds name exactly that.
+        let worker = Arc::new(RecordingWorker::new("lookup", &[("summarise", false)]));
+        let store = Arc::new(FakeStore::healthy());
+        let dispatcher = worker_dispatcher(
+            std::slice::from_ref(&worker),
+            store.clone(),
+            plain_courier(),
+        );
+
+        let handled = dispatcher
+            .hand_off(envelope_about("summarise ord-1", "order_ref", "ord-1"))
+            .await
+            .expect("hand off");
+
+        let route = handled.route.expect("a decision was taken");
+        let given = worker.handout().expect("the worker was handed a bundle");
+        assert_eq!(route.worker, AgentId("lookup".into()));
+        assert_eq!(route.intent, "summarise");
+        assert_eq!(route.envelope_id, "cli-1");
+        assert_eq!(route.bundle_id, given.bundle_id);
+        assert_eq!(given.for_envelope, "cli-1");
+        assert_eq!(given.covers, vec![("order_ref".into(), "ord-1".into())]);
+        assert_eq!(given.records, store.records());
+        assert!(given.is_intact());
+        assert_eq!(
+            worker.route().expect("the decision").route_id,
+            route.route_id
+        );
+    }
+
+    #[tokio::test]
+    async fn a_worker_is_told_which_arguments_the_envelope_carried() {
+        // `args` is the one part of a decision with no schema behind it, so what stands behind it
+        // is that it is addressed: a worker that ran different arguments ran a different route.
+        let worker = Arc::new(RecordingWorker::new("lookup", &[("summarise", false)]));
+        let dispatcher = worker_dispatcher(
+            std::slice::from_ref(&worker),
+            Arc::new(FakeStore::healthy()),
+            plain_courier(),
+        );
+
+        dispatcher
+            .hand_off(envelope("summarise ord-1"))
+            .await
+            .expect("hand off");
+
+        let route = worker.route().expect("the decision");
+        assert_eq!(
+            route.args.get("text").and_then(serde_json::Value::as_str),
+            Some("summarise ord-1")
+        );
+        assert!(route.is_intact());
+    }
+
+    #[tokio::test]
+    async fn a_worker_missing_a_declared_argument_is_refused_before_it_runs() {
+        // The composer's mistake, named where it happened rather than arriving later as a worker
+        // failure that names nothing.
+        let worker =
+            Arc::new(RecordingWorker::new("lookup", &[("summarise", false)]).needing("reference"));
+        let store = Arc::new(FakeStore::healthy());
+        let dispatcher = worker_dispatcher(
+            std::slice::from_ref(&worker),
+            store.clone(),
+            plain_courier(),
+        );
+
+        let error = dispatcher
+            .hand_off(envelope("summarise ord-1"))
+            .await
+            .expect_err("an argument the worker declared it needs");
+
+        assert!(
+            matches!(error, crate::Error::Underspecified { ref missing, .. }
+            if missing == &vec!["reference".to_string()])
+        );
+        assert_eq!(
+            error.to_string(),
+            "refused `summarise`: worker `lookup` needs reference, which the route did not carry"
+        );
+        assert_eq!(worker.calls(), 0);
+        assert!(
+            store.requested().is_empty(),
+            "a refusal must not cost a composition"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_worker_that_cannot_work_is_refused_rather_than_run_degraded() {
+        // Context that arrives incomplete still yields an answer that says what it could not see. A
+        // worker that cannot be reached yields silence or somebody else's answer under its name, and
+        // afterwards the second is indistinguishable from a real one.
+        let worker = Arc::new(
+            RecordingWorker::new("lookup", &[("summarise", false)]).unavailable("no backend"),
+        );
+        let store = Arc::new(FakeStore::healthy());
+        let dispatcher = worker_dispatcher(
+            std::slice::from_ref(&worker),
+            store.clone(),
+            plain_courier(),
+        );
+
+        let error = dispatcher
+            .hand_off(envelope("summarise ord-1"))
+            .await
+            .expect_err("a worker that says it cannot work");
+
+        assert_eq!(
+            error.to_string(),
+            "refused `summarise`: worker `lookup` is unavailable: no backend"
+        );
+        assert_eq!(worker.calls(), 0);
+        assert!(store.requested().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_worker_that_is_merely_degraded_still_runs() {
+        // The distinction the refusal above rests on: "working badly" is not "not working", and a
+        // dispatcher that refused both would take a whole worker out over a slow dependency.
+        let worker = Arc::new(
+            RecordingWorker::new("lookup", &[("summarise", false)])
+                .health_degraded("one source is slow")
+                .replying("answered anyway"),
+        );
+        let adapter = Arc::new(RecordingAdapter::working());
+        let dispatcher = worker_dispatcher(
+            std::slice::from_ref(&worker),
+            Arc::new(FakeStore::healthy()),
+            Courier::new(filters(vec![]), Box::new(adapter.clone())),
+        );
+
+        let handled = dispatcher
+            .hand_off(envelope("summarise ord-1"))
+            .await
+            .expect("hand off");
+
+        assert_eq!(worker.calls(), 1);
+        assert_eq!(handled.status, Some(Status::Succeeded));
+        assert_eq!(adapter.texts(), vec!["answered anyway".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_mutating_worker_on_partial_context_is_refused_before_it_runs() {
+        // The same rule agents are held to, applied at the same point. A refusal that arrives once
+        // the side effect has happened is not a refusal.
+        let worker = Arc::new(RecordingWorker::new("writer", &[("apply", true)]));
+        let dispatcher = worker_dispatcher(
+            std::slice::from_ref(&worker),
+            Arc::new(FakeStore::degraded()),
+            plain_courier(),
+        );
+
+        let error = dispatcher
+            .hand_off(envelope("apply the change"))
+            .await
+            .expect_err("a mutating intent on a degraded bundle");
+
+        assert!(
+            matches!(error, crate::Error::RefusedDegraded { ref intent, .. }
+            if intent == "apply")
+        );
+        assert_eq!(worker.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_worker_reply_leaves_only_through_the_courier() {
+        // A worker has no channel of its own, which is what keeps the egress screen a property of
+        // the system rather than a habit each worker has to keep.
+        let worker =
+            Arc::new(RecordingWorker::new("lookup", &[("summarise", false)]).replying("one event"));
+        let adapter = Arc::new(RecordingAdapter::working());
+        let courier = Courier::new(
+            filters(vec![Box::new(Suffix(" ·"))]),
+            Box::new(adapter.clone()),
+        );
+        let dispatcher = worker_dispatcher(
+            std::slice::from_ref(&worker),
+            Arc::new(FakeStore::healthy()),
+            courier,
+        );
+
+        let handled = dispatcher
+            .hand_off(envelope("summarise ord-1"))
+            .await
+            .expect("hand off");
+
+        assert_eq!(
+            handled
+                .deliveries
+                .iter()
+                .map(|d| d.text.clone())
+                .collect::<Vec<_>>(),
+            vec!["one event".to_string()],
+            "what the worker asked to send"
+        );
+        assert_eq!(
+            adapter.texts(),
+            vec!["one event ·".to_string()],
+            "what the adapter received"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_record_a_worker_queued_is_submitted_under_the_envelope_that_caused_it() {
+        let worker = Arc::new(
+            RecordingWorker::new("lookup", &[("summarise", false)])
+                .queueing_record(draft("review"))
+                .returning_record(draft("note")),
+        );
+        let store = Arc::new(FakeStore::healthy());
+        let dispatcher = worker_dispatcher(
+            std::slice::from_ref(&worker),
+            store.clone(),
+            plain_courier(),
+        );
+
+        let handled = dispatcher
+            .hand_off(envelope("summarise ord-1"))
+            .await
+            .expect("hand off");
+
+        assert_eq!(handled.records_written, 2);
+        assert_eq!(
+            store.submitted(),
+            vec!["note".to_string(), "review".to_string()]
+        );
+        for (_, correlation_id) in store.submissions() {
+            assert_eq!(correlation_id, "cli-1");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_intent_no_worker_claims_is_unroutable() {
+        let worker = Arc::new(RecordingWorker::new("lookup", &[("summarise", false)]));
+        let dispatcher = worker_dispatcher(
+            std::slice::from_ref(&worker),
+            Arc::new(FakeStore::healthy()),
+            plain_courier(),
+        );
+
+        let error = dispatcher
+            .hand_off(envelope("explain everything"))
+            .await
+            .expect_err("nothing claims `explain`");
+
+        assert!(matches!(error, crate::Error::Unroutable(ref intent) if intent == "explain"));
+    }
+
+    #[tokio::test]
+    async fn a_redelivery_takes_no_second_decision() {
+        // A duplicate decides nothing, so it mints no route id. A second id in the audit trail
+        // would say the dispatcher decided twice about one message.
+        let worker = Arc::new(RecordingWorker::new("lookup", &[("summarise", false)]));
+        let dispatcher = worker_dispatcher(
+            std::slice::from_ref(&worker),
+            Arc::new(FakeStore::healthy()),
+            plain_courier(),
+        );
+
+        let first = dispatcher
+            .hand_off(envelope("summarise ord-1"))
+            .await
+            .expect("first");
+        let retry = dispatcher
+            .hand_off(envelope("summarise ord-1"))
+            .await
+            .expect("redelivery");
+
+        assert!(first.route.is_some());
+        assert!(retry.duplicate);
+        assert!(retry.route.is_none());
+        assert_eq!(worker.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn one_envelope_is_answered_once_whichever_handler_takes_it() {
+        // Agents and workers share the ledger on purpose: during a migration both claim the same
+        // intent, and a message answered by one must not be answered again by the other.
+        let agent =
+            Arc::new(RecordingAgent::new("reader", &[("summarise", false)]).replying("from agent"));
+        let worker = Arc::new(
+            RecordingWorker::new("lookup", &[("summarise", false)]).replying("from worker"),
+        );
+        let dispatcher = super::Dispatcher::new(
+            registry(std::slice::from_ref(&agent)),
+            Arc::new(FakeStore::healthy()),
+            plain_courier(),
+        )
+        .with_workers(workers(std::slice::from_ref(&worker)));
+
+        let first = dispatcher
+            .dispatch(envelope("summarise ord-1"))
+            .await
+            .expect("agent");
+        let second = dispatcher
+            .hand_off(envelope("summarise ord-1"))
+            .await
+            .expect("worker");
+
+        assert!(!first.duplicate);
+        assert!(second.duplicate);
+        assert_eq!(worker.calls(), 0);
+        assert_eq!(dispatcher.workers().ids(), vec![AgentId("lookup".into())]);
+    }
+
+    #[tokio::test]
+    async fn an_agent_dispatch_reports_the_decision_it_took() {
+        // The ids are worth having on the path that already runs: an agent is routed to by the same
+        // decision, and a decision nobody can see is not an audit trail.
+        let agent = Arc::new(RecordingAgent::new("reader", &[("summarise", false)]));
+        let dispatcher = dispatcher(
+            std::slice::from_ref(&agent),
+            Arc::new(FakeStore::healthy()),
+            plain_courier(),
+        );
+
+        let handled = dispatcher
+            .dispatch(envelope_about("summarise ord-1", "order_ref", "ord-1"))
+            .await
+            .expect("dispatch");
+
+        let route = handled.route.expect("a decision was taken");
+        assert_eq!(route.worker, AgentId("reader".into()));
+        assert_eq!(route.envelope_id, "cli-1");
+        assert!(route.is_intact());
+        assert!(route.bundle_id.starts_with("b-"));
+    }
+
+    #[tokio::test]
+    async fn a_decision_names_the_deadline_the_source_asked_for() {
+        let worker = Arc::new(RecordingWorker::new("lookup", &[("summarise", false)]));
+        let dispatcher = worker_dispatcher(
+            std::slice::from_ref(&worker),
+            Arc::new(FakeStore::healthy()),
+            plain_courier(),
+        );
+        let mut envelope = envelope("summarise ord-1");
+        envelope
+            .extra
+            .insert("deadline_ms".into(), serde_json::json!(20_000));
+
+        dispatcher.hand_off(envelope).await.expect("hand off");
+
+        let route = worker.route().expect("the decision");
+        assert_eq!(route.deadline_ms, 20_000);
+        assert!(worker.remaining_ms().expect("a budget") <= 20_000);
+    }
+
+    #[tokio::test]
+    async fn a_worker_that_could_not_attempt_the_run_leaves_the_envelope_unhandled() {
+        // The ledger remembers an envelope only once everything it implied has happened. A run that
+        // never started is worth retrying, and remembering it here would make the retry a no-op.
+        let worker = Arc::new(
+            RecordingWorker::new("lookup", &[("summarise", false)]).failing("backend refused"),
+        );
+        let adapter = Arc::new(RecordingAdapter::working());
+        let store = Arc::new(FakeStore::healthy());
+        let dispatcher = worker_dispatcher(
+            std::slice::from_ref(&worker),
+            store.clone(),
+            Courier::new(filters(vec![]), Box::new(adapter.clone())),
+        );
+
+        let error = dispatcher
+            .hand_off(envelope("summarise ord-1"))
+            .await
+            .expect_err("the worker could not attempt it");
+        assert!(matches!(error, crate::Error::Agent(_)));
+        assert!(adapter.texts().is_empty());
+        assert!(store.submitted().is_empty());
+
+        dispatcher
+            .hand_off(envelope("summarise ord-1"))
+            .await
+            .expect_err("still failing");
+        assert_eq!(worker.calls(), 2, "a failed run must be retryable");
     }
 }
 

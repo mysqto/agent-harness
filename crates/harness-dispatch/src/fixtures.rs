@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use harness_agent::{
-    ActionDraft, Agent, AgentId, Capability, Context, Egress, Outcome, Status, Task,
+    ActionDraft, Agent, AgentId, Capability, Context, Egress, Health, Outcome, Status, Task,
 };
 use harness_envelope::{Delivery, Envelope};
 use harness_memory::Bundle;
@@ -22,6 +22,7 @@ use harness_memory::Bundle;
 use crate::egress::{Adapter, Courier, Filter};
 use crate::registry::Registry;
 use crate::route::{ContextStore, Dispatcher};
+use crate::worker::{Handed, Handout, Route, Worker, Workers};
 
 fn guard<T>(lock: &Mutex<T>) -> MutexGuard<'_, T> {
     lock.lock().unwrap_or_else(PoisonError::into_inner)
@@ -93,7 +94,7 @@ pub fn envelope_about(body: &str, kind: &str, id: &str) -> Envelope {
 
 /// A registry holding `agents`, which must claim disjoint intents.
 pub fn registry(agents: &[Arc<RecordingAgent>]) -> Registry {
-    let mut registry = Registry::new();
+    let mut registry: Registry = Registry::new();
     for agent in agents {
         registry.register(agent.clone()).expect("register");
     }
@@ -305,6 +306,11 @@ impl FakeStore {
             .iter()
             .map(|(draft, _)| draft.action.clone())
             .collect()
+    }
+
+    /// The records this store answers a bundle with.
+    pub fn records(&self) -> Vec<serde_json::Value> {
+        self.records.clone()
     }
 
     /// Every record written, with the interaction id it was submitted under.
@@ -634,4 +640,173 @@ pub fn client(base_url: &str) -> harness_memory::Client {
         sidecar_socket: None,
         agent: "summariser".into(),
     })
+}
+
+/// A worker that records what it was handed, and whether it ran at all.
+///
+/// The counterpart of [`RecordingAgent`]: what is worth asserting about a worker is not what it
+/// answered but what it was given, since being given everything is the whole contract.
+pub struct RecordingWorker {
+    id: AgentId,
+    capabilities: Vec<Capability>,
+    requires: Vec<&'static str>,
+    status: Status,
+    egress: Vec<Egress>,
+    records: Vec<ActionDraft>,
+    queued: Vec<ActionDraft>,
+    health: Option<Health>,
+    fail: Option<String>,
+    calls: AtomicUsize,
+    route: Mutex<Option<Route>>,
+    handout: Mutex<Option<Handout>>,
+    remaining_ms: Mutex<Option<u64>>,
+}
+
+impl RecordingWorker {
+    /// A worker claiming `capabilities`, given as `(intent, mutating)`.
+    pub fn new(id: &str, capabilities: &[(&str, bool)]) -> Self {
+        Self {
+            id: AgentId(id.into()),
+            capabilities: capabilities
+                .iter()
+                .map(|(intent, mutating)| Capability {
+                    intent: (*intent).into(),
+                    mutating: *mutating,
+                })
+                .collect(),
+            requires: Vec::new(),
+            status: Status::Succeeded,
+            egress: Vec::new(),
+            records: Vec::new(),
+            queued: Vec::new(),
+            health: None,
+            fail: None,
+            calls: AtomicUsize::new(0),
+            route: Mutex::new(None),
+            handout: Mutex::new(None),
+            remaining_ms: Mutex::new(None),
+        }
+    }
+
+    /// Declares an argument key it will not run without.
+    pub fn needing(mut self, key: &'static str) -> Self {
+        self.requires.push(key);
+        self
+    }
+
+    /// Replies with `text`, addressed wherever the envelope came from.
+    pub fn replying(mut self, text: &str) -> Self {
+        self.egress.push(Egress {
+            target: String::new(),
+            text: text.into(),
+            thread: None,
+        });
+        self
+    }
+
+    /// Queues `draft` through the handout while it runs.
+    pub fn queueing_record(mut self, draft: ActionDraft) -> Self {
+        self.queued.push(draft);
+        self
+    }
+
+    /// Returns `draft` in its outcome.
+    pub fn returning_record(mut self, draft: ActionDraft) -> Self {
+        self.records.push(draft);
+        self
+    }
+
+    /// Reports itself unable to work.
+    pub fn unavailable(mut self, reason: &str) -> Self {
+        self.health = Some(Health::Unavailable(reason.into()));
+        self
+    }
+
+    /// Reports itself working, but not well.
+    pub fn health_degraded(mut self, reason: &str) -> Self {
+        self.health = Some(Health::Degraded(reason.into()));
+        self
+    }
+
+    /// Cannot attempt the run at all.
+    pub fn failing(mut self, reason: &str) -> Self {
+        self.fail = Some(reason.into());
+        self
+    }
+
+    /// How many times this worker was invoked.
+    pub fn calls(&self) -> usize {
+        self.calls.load(Ordering::Relaxed)
+    }
+
+    /// The decision it was last handed.
+    pub fn route(&self) -> Option<Route> {
+        guard(&self.route).clone()
+    }
+
+    /// The context it was last handed.
+    pub fn handout(&self) -> Option<Handout> {
+        guard(&self.handout).clone()
+    }
+
+    /// The budget it reported having left.
+    pub fn remaining_ms(&self) -> Option<u64> {
+        *guard(&self.remaining_ms)
+    }
+}
+
+#[async_trait::async_trait]
+impl Worker for RecordingWorker {
+    fn id(&self) -> &AgentId {
+        &self.id
+    }
+
+    fn capabilities(&self) -> &[Capability] {
+        &self.capabilities
+    }
+
+    fn requires(&self, _intent: &str) -> &[&str] {
+        &self.requires
+    }
+
+    async fn run(&self, given: &dyn Handed) -> harness_agent::Result<Outcome> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        *guard(&self.route) = Some(given.route().clone());
+        *guard(&self.handout) = Some(given.bundle().clone());
+        *guard(&self.remaining_ms) = Some(given.remaining_ms());
+
+        if let Some(reason) = &self.fail {
+            return Err(harness_agent::Error::Unavailable(reason.clone()));
+        }
+        for draft in &self.queued {
+            given.record(draft.clone()).await?;
+        }
+        Ok(Outcome {
+            status: self.status,
+            egress: self.egress.clone(),
+            records: self.records.clone(),
+        })
+    }
+
+    async fn health(&self) -> Health {
+        self.health.clone().unwrap_or(Health::Ready)
+    }
+}
+
+/// A registry holding `workers`, which must claim disjoint intents.
+pub fn workers(workers: &[Arc<RecordingWorker>]) -> Workers {
+    let mut registry = Workers::new();
+    for worker in workers {
+        registry.register(worker.clone()).expect("register");
+    }
+    registry
+}
+
+/// A dispatcher over `workers`, `store` and `courier`, with no agents at all.
+pub fn worker_dispatcher(
+    handlers: &[Arc<RecordingWorker>],
+    store: Arc<dyn ContextStore>,
+    courier: Courier,
+) -> Dispatcher {
+    Dispatcher::new(Registry::default(), store, courier).with_workers(workers(handlers))
 }

@@ -20,7 +20,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use harness_agent::{ActionDraft, Status};
 use harness_dispatch::egress::{Adapter, Courier, Masking};
-use harness_dispatch::{Dispatcher, Registry};
+use harness_dispatch::{Dispatcher, Registry, Route};
 use harness_envelope::{Delivery, Envelope};
 use harness_memory::Bundle;
 
@@ -43,6 +43,12 @@ pub struct Report {
     pub omitted: Vec<String>,
     /// Entities the dispatcher asked for context on.
     pub entities: Vec<(String, String)>,
+    /// The decision the dispatcher took, or `None` when it took none.
+    ///
+    /// Reported because this is where a person looks before there is a deployment to look at: the
+    /// route and bundle ids are addresses, so the same envelope against the same context prints the
+    /// same pair, and a change in either says which half of the decision moved.
+    pub route: Option<Route>,
     /// What would have been delivered, and where — as the agent asked for it.
     pub deliveries: Vec<Delivery>,
     /// What the egress screen would have taken out of those messages.
@@ -92,6 +98,23 @@ impl Report {
                     .collect::<Vec<_>>()
                     .join(", ")
             },
+        );
+
+        field(
+            &mut out,
+            "route",
+            &self.route.as_ref().map_or_else(
+                || "none — nothing was decided".to_string(),
+                |route| format!("{} → {}", route.route_id, route.worker.0),
+            ),
+        );
+        field(
+            &mut out,
+            "bundle",
+            &self.route.as_ref().map_or_else(
+                || "none composed".to_string(),
+                |route| route.bundle_id.clone(),
+            ),
         );
 
         field(&mut out, "deliveries", &count(self.deliveries.len()));
@@ -171,6 +194,7 @@ pub async fn once(registry: Registry, envelope: Envelope, degraded: bool) -> Res
                 degraded: handled.degraded,
                 omitted: store.omitted(),
                 entities: store.requested(),
+                route: handled.route,
                 deliveries: handled.deliveries,
                 masked: handled.masked,
                 records: store.written(),
@@ -422,7 +446,7 @@ mod tests {
     }
 
     fn only(agent: Configured) -> Registry {
-        let mut registry = Registry::new();
+        let mut registry: Registry = Registry::new();
         registry.register(Arc::new(agent)).expect("register");
         registry
     }
@@ -454,6 +478,8 @@ mod tests {
             "mutating   no",
             "deliveries 1",
             "→ stdout: hello",
+            "route      r-",
+            "bundle     b-",
             "records    none",
         ] {
             assert!(
@@ -518,16 +544,23 @@ mod tests {
             degraded: false,
             omitted: Vec::new(),
             entities: Vec::new(),
+            route: None,
             deliveries: Vec::new(),
             masked: Vec::new(),
             records: Vec::new(),
         };
 
         let rendered = report.render();
-        assert!(
-            rendered.contains("status     not reported — nothing ran"),
-            "{rendered}"
-        );
+        for expected in [
+            "status     not reported — nothing ran",
+            "route      none — nothing was decided",
+            "bundle     none composed",
+        ] {
+            assert!(
+                rendered.contains(expected),
+                "missing `{expected}`:\n{rendered}"
+            );
+        }
     }
 
     #[tokio::test]
