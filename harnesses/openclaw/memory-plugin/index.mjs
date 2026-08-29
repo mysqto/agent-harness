@@ -1518,8 +1518,14 @@ export default {
           `name asks about no actor rather than about a writer that may not exist`,
       );
     } else {
+      // The allowance is said beside the map, because the map alone reads as "the actor half is on"
+      // and the number is what decides whether that means a supplement or a page. Zero is a
+      // deployment saying it wants no background at all, and it is said as such rather than omitted.
+      const allowance = whole(settings.actorMaxRecords, DEFAULT_ACTOR_MAX_RECORDS);
       api?.logger?.info?.(
-        `${PLUGIN_ID}: actors: ${mapped.map(([id, writer]) => `${id} records as ${writer.trim()}`).join(", ")}`,
+        `${PLUGIN_ID}: actors: ${mapped.map(([id, writer]) => `${id} records as ${writer.trim()}`).join(", ")}` +
+          `; each may carry ${allowance} background row(s) of its own activity behind an answer, ` +
+          `and none on a turn whose entities matched nothing`,
       );
     }
 
