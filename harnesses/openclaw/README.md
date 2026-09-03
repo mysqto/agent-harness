@@ -669,15 +669,16 @@ message at all, so it says that first, and then says the thing this deployment h
 ```
 Recent activity in this deployment's memory, grouped by date. This is background, not an answer:
 nobody asked for it and none of it is necessarily about this message. Record structure only — who
-acted, when, and what they referenced. It does not say what any of it was about, and this store
-holds no prose that could.
+acted, when, and what they referenced. It does not say what any of it was about: records have
+bodies, and by design no read here returns one.
 ```
 
-That last clause is the honest limit, and it is not a gap waiting to be filled. Every read here
-returns frontmatter, deliberately and at every layer, so a digest can say that `deploy_bot` deployed
-`example/service@1a2b3c4` successfully on the 28th. It cannot say what the deploy was for, what broke, or
-what anyone concluded. A digest built over a store that holds prose reads like a briefing; this one
-reads like a table of contents.
+That last clause is the honest limit, and it is a limit on the read rather than on the store. Records
+have bodies; every read here returns frontmatter, deliberately and at every layer. So a digest can say
+that `deploy_bot` deployed `example/service@1a2b3c4` successfully on the 28th. It cannot say what the
+deploy was for, what broke, or what anyone concluded — and it does not claim nothing was written down,
+which leaves an agent free to name the record and go and ask for it. A digest carrying prose would read
+like a briefing; this one reads like a table of contents.
 
 **Which is both the reason to inject it and the reason it is off by default.** A table of contents is
 worth its tokens where the reader can act on it, and here the agent can: it has a read of its own, and

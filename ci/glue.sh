@@ -1622,8 +1622,12 @@ if (block.includes(HEADING) || block.includes(SEARCH_HEADING)) problems.push("th
 for (const expected of ["\n2026-08-28\n", "\n2026-08-26\n", "agent=deploy_bot", "entities=ticket:PROJ-42", "last 14 day(s)"]) {
   if (!block.includes(expected)) problems.push(`the digest dropped ${JSON.stringify(expected)}: ${block}`);
 }
-// Structure and nothing else: the honest limit of every read here, and the heading says so.
-if (!/Record structure only/.test(block)) problems.push("the digest did not say it carries no prose");
+// Structure and nothing else: the honest limit of every read here, and the heading says so -- as a
+// limit on the read, because the bodies it does not carry do exist.
+if (!/Record structure only/.test(block)) problems.push("the digest did not say it carries structure only");
+if (!/records have bodies, and by design no read here returns one/.test(block)) {
+  problems.push(`the digest misdescribed the limit as an empty store: ${block.slice(0, 200)}`);
+}
 SEEN_SESSIONS.clear();
 const cappedDigest = injectionFrom(
   (await spawned({ ...digested, digestMaxRecords: 1, read: reader("digest") }, digestTurn("s-capped", []))).outcome,
@@ -1802,6 +1806,11 @@ garbage and no answer; and an empty match reads differently"
   # And the window read bounded as though it were a bundle, which is the same usage error by the
   # other route.
   mutate digest-bundle-bounds 's|digestBounds(argvDigest, left|bounds(argvDigest, left|'
+  # The heading telling the model the store holds nothing more, restored exactly. Every read here
+  # returns structure by design and record bodies exist, so this one is false rather than merely
+  # blunt: it talks an agent out of naming the record whose body it could have asked for.
+  mutate digest-denies-the-bodies \
+    's|was about: records have " +|was about, and this " +|; s|"bodies, and by design no read here returns one.";|"store holds no prose that could.";|'
   [ "$survived" -eq 0 ] || fail "the fail-open path is asserted rather than exercised"
 else
   fail "node is not installed, so the recall plugin's outcome path went untested"

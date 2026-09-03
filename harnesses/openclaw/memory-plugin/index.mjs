@@ -291,12 +291,16 @@ const SEARCH_HEADING =
  * which commit it named. It cannot say what the deploy was for, what went wrong, or what anyone
  * concluded. A model that treats these lines as a summary of recent events will overstate them, and
  * the only defence against that is the heading saying what they are.
+ *
+ * And it is a limit on the read, not on the store: records have bodies, and every layer here returns
+ * structure only, deliberately. Saying the store holds nothing more would be false, and it would stop
+ * an agent even naming the record whose body it could go and ask for.
  */
 const DIGEST_HEADING =
   "Recent activity in this deployment's memory, grouped by date. This is background, not an answer: " +
   "nobody asked for it and none of it is necessarily about this message. Record structure only — " +
-  "who acted, when, and what they referenced. It does not say what any of it was about, and this " +
-  "store holds no prose that could.";
+  "who acted, when, and what they referenced. It does not say what any of it was about: records have " +
+  "bodies, and by design no read here returns one.";
 
 /**
  * The bounds this plugin adds to the configured argv.
@@ -803,7 +807,7 @@ function digestLine(record) {
  * A window of records as a date-grouped block, or nothing.
  *
  * Grouped by date because that is the axis a person scanning "what has been happening" reads on, and
- * because it is the one axis this store can render without a body: the date is stamped, the actor is
+ * because it is the one axis this path can render without a body: the date is stamped, the actor is
  * signed for, and the reference was stated. Nothing here is derived.
  *
  * Whatever is cut is counted, exactly as `renderContext` counts it. A digest is more likely to be cut

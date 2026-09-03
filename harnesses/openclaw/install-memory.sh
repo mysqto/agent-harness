@@ -371,9 +371,9 @@ And one setting that is not about the turn at all:
   does the actor's background page, which is why it is never read on a turn with no answer under it.
 
 A digest says who acted, when, and what they referenced. It cannot say what any of it was about:
-every read here returns frontmatter and this store holds no prose that could. Turn it on where that
-is a table of contents an agent can follow up with a read of its own, and leave it off where the
-records are all one shape and the block would read as noise.
+records have bodies, and by design no read here returns one. Turn it on where that is a table of
+contents an agent can follow up with a read of its own, and leave it off where the records are all
+one shape and the block would read as noise.
 
 The second needs the reader to support \`--infer-entities\`; check with:
 
