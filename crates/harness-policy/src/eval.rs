@@ -774,6 +774,26 @@ mod tests {
     }
 
     #[test]
+    fn a_directory_change_earlier_in_the_line_does_not_move_the_working_directory() {
+        // The guard is not the shell: a relative candidate resolves against the working directory
+        // it was handed, and the `cd` beside it has not happened. So a rule anchored to an absolute
+        // prefix is reachable by a chdir and a relative name — for an argument and for a value
+        // inside a token alike, which is why closing the assignment shape did not close this one.
+        // Asserted rather than left to be found, so following a `cd` is a decision somebody makes.
+        allowed(&Intent::Command(
+            "cd /home/a/.aws && cat credentials".into(),
+        ));
+        allowed(&Intent::Command(
+            "cd /home/a && STORE_ROOT=.aws/credentials app run".into(),
+        ));
+        // Naming the file is caught wherever the line names it, which is the common shape.
+        denied(
+            &Intent::Command("cat /home/a/.aws/credentials".into()),
+            "credential-stores",
+        );
+    }
+
+    #[test]
     fn an_ordinary_assignment_argument_is_not_a_refusal() {
         // What the rule above costs. Every `name=value` token now offers its value as a candidate
         // path, and an attached flag value offers its tail; the ordinary ones must stay ordinary.

@@ -81,6 +81,10 @@ Two are **not** covered, and are named here rather than left to be found:
   of translating it.
 - **Anything a shell would expand.** `$HOME/…`, `${VAR}/…`, `*` and `{a,b}` name paths this parser
   cannot know, because the expansion happens in a shell that has not run yet.
+- **A `cd` earlier in the same line.** A relative candidate resolves against the working directory
+  the guard was handed, so `cd <parent> && cat <name>` reaches a rule anchored to an absolute prefix
+  that `cat <parent>/<name>` would not. Older than the two above and unrelated to how the path is
+  spelled — it is the same answer for an argument, a redirection and an assignment.
 
 Both are layer 4's ground (§10.2) for the same reason the recursive read above is: they are where a
 string comparison over a command line stops being able to see what the command will do. A deployment
