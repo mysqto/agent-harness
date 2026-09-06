@@ -103,32 +103,47 @@ throws is caught and turned into a blocked call, not a permitted one. The budget
 host is twice the one it enforces on itself, so the plugin's own refusal — which carries a reason
 naming the policy rule — always lands before a host-side hook timeout could answer with a generic one.
 
-### The hook sees the harness's own tools, not the model's
+### What the hook reaches, and the version that changed it
 
-`before_tool_call` fires for calls this harness dispatches. It does **not** fire for the tools an
-agent's own runtime provides. Where agents run through the Claude CLI backend, the model reaches the
-shell through that runtime's native `Bash`, and the host's relay carries an adapter for the `codex`
-CLI's tool events and none for the `claude` one — so those calls never become a hook event and the
-guard never sees them. Measured, not reasoned about: the guard blocks `cat ~/.ssh/known_hosts` as an
-`exec` tool call, and the same command through native `Bash` runs to completion with this plugin
-loaded and enabled.
+**Measured on openclaw 2026.8.1, 2026-09-06: `before_tool_call` does see the model's native
+`Bash`.** With the exec gate open — `tools.exec.mode: "full"`, so no exec-policy refusal standing in
+front of the hook — an agent's `cat`, `grep -r` and `find` against a protected path were each
+refused through native `Bash`, each naming the policy rule that refused it, while `date` in the same
+session ran to completion. A blanket deny cannot produce that: the refusals were per command, so
+they came from the guard.
 
-So, plainly: **on a `claude` backend the shell is not covered here.** Not by layer 2, which is not
-called; and not by layer 1 either, for the separate reason below. An operator who reads "a hook at
-the tool-call boundary" as covering tool calls generally has a hole, and its shape is the bad one —
-nothing fails, nothing is logged, and the refusal that never happened looks exactly like a policy
-with nothing to refuse.
+**An earlier revision of this section said the opposite, and the reasoning is the part worth
+correcting.** It read *"the host's relay carries an adapter for the `codex` CLI's tool events and
+none for the `claude` one — so those calls never become a hook event and the guard never sees
+them"*, and concluded *"on a `claude` backend the shell is not covered here"*. The relay adapter was
+the wrong mechanism to reason from. Native tool calls do not arrive by being projected through a
+relay: the CLI runner installs a `canUseTool` callback and routes every call the model makes into
+the host's own tool-permission path — the same path `before_tool_call` sits on. So the plugin is
+handed native `Bash` directly, and an adapter that was never written never had a say either way.
 
-What the guard does still cover is every call the harness dispatches itself: its own `exec`, `read`,
-`write`, `web_fetch`, `apply_patch`, and whatever a later release adds, since intents come from the
-fields present rather than from a table of known tools. That is worth having and it is not the same
-as covering the shell.
+That conclusion was plausibly true of an earlier release, which is why the correction carries a
+version and a date rather than replacing one flat claim with another. `canUseTool` is what 2026.8.1
+does. On a different version, measure it again.
 
-Closing the rest means wiring the guard into the other runtime as well, which is what
-`harnesses/claude-code/` generates from this same policy: a `PreToolUse` hook that sees native
-`Bash`. Two installs, one policy, two runtimes handing the same guard their calls. Whether a CLI the
-harness spawns reads a particular settings file is a deployment question — check it rather than
-assume it, the same way a load path pointing at nothing is worth checking.
+**One thing does stand in front of the hook, and it is not this policy.** The backend admits native
+tool use at all only when the exec gate reads `security: "full"` with `ask: "off"` — see *[The exec
+gate is emitted with its pre-approvals, or not at
+all](#the-exec-gate-is-emitted-with-its-pre-approvals-or-not-at-all)*. Any other shape refuses every
+native tool call before the guard is consulted at all. That is a stopped agent rather than an
+enforced policy, and it is why a host that looks maximally locked down can be a host on which layer
+2 has never decided anything. Measure with the gate open, or a clean result says only that nothing
+ran.
+
+The guard covers the calls the harness dispatches itself as well — its own `exec`, `read`, `write`,
+`web_fetch`, `apply_patch`, and whatever a later release adds, since intents come from the fields
+present rather than from a table of known tools.
+
+`harnesses/claude-code/` generates a `PreToolUse` hook over this same policy, and it still has a
+use: it reaches that CLI's own sessions, which this harness never dispatches for. What it is no
+longer is the missing half of the shell — on 2026.8.1 it would be a second gate over a surface layer
+2 already reaches. Whether a CLI the harness spawns reads a particular settings file is a deployment
+question — check it rather than assume it, the same way a load path pointing at nothing is worth
+checking.
 
 ## The write path needs nothing new
 
@@ -803,13 +818,14 @@ default: no gate, the deployment's existing exec posture left alone, layer 2 doi
 generator that emits less is a smaller thing to read than one whose output cannot be applied without
 disarming the agents.
 
-Read that together with *[The hook sees the harness's own tools, not the
-model's](#the-hook-sees-the-harnesss-own-tools-not-the-models)* and the shape of the gap is clear. On
-a `claude` backend, `ask: on-miss` never reaches a person: the pinning is the whole of what may run,
-and anything it does not name is refused where the request would have been raised. Layer 2 is not
-called for the shell at all. So the shell there is gated by a list of pre-approved commands and by
-nothing at all that reads the policy — which is what installing the `claude-code` harness beside this
-one is for. On a host whose agents work through this harness's own `exec` tool, both layers apply as
+Read that together with *[What the hook reaches, and the version that changed
+it](#what-the-hook-reaches-and-the-version-that-changed-it)*. On a `claude` backend, `ask: on-miss`
+never reaches a person: the pinning is the whole of what may run, and anything it does not name is
+refused where the request would have been raised. What that costs is not layer 2's reach — on
+2026.8.1 the guard does see native `Bash` — it is that the refusal lands *ahead* of the guard, so
+the policy decides nothing about the commands the pinning turns away. Whether a pre-approved command
+then reaches the guard has not been measured here; the measurement above was taken with the gate
+open. On a host whose agents work through this harness's own `exec` tool, both layers apply as
 written.
 
 ### Code mode is refused, not screened

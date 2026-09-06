@@ -8,10 +8,13 @@
 //! the generated config wires *where the guard lives* instead of a command line. What the harness
 //! cannot express is left to the guard rather than approximated — see [`config`].
 //!
-//! What arrives at [`translate`] is the harness's *own* tool calls. Its relay has no adapter for the
-//! `claude` CLI's tool events, so an agent shelling through that runtime's native tools never reaches
-//! this translator at all, and no reading of the payload can widen that — a translator only sees what
-//! it is handed. `harnesses/openclaw/README.md` says where that leaves the shell, and what covers it.
+//! What arrives at [`translate`] is whatever the host hands the `before_tool_call` hook, and on
+//! openclaw 2026.8.1 that includes the model's own native tools: the CLI runner routes them through
+//! the host's tool-permission path, which is the path this hook sits on, so a shell command the model
+//! runs directly is translated and screened here. An earlier revision said the reverse, reasoning
+//! from a relay with no adapter for the `claude` CLI's tool events; that was the wrong mechanism, and
+//! the reach is a property of the host version rather than of this translator.
+//! `harnesses/openclaw/README.md` carries the measurement and its date.
 
 use serde_json::{Map, Value, json};
 
