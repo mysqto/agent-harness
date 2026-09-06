@@ -2,9 +2,10 @@
 //!
 //! A command string is not one command. `ls && sudo rm -rf ~` is two, one of them wrapped, and a
 //! guard that inspects only the first word of the line has already lost. So the line is split on the
-//! operators a shell splits on, quoting is respected, wrappers are seen through, and redirections
-//! are recovered as writes — `echo x > ~/.bashrc` writes to a startup file with no write tool in
-//! sight.
+//! operators a shell splits on, quoting is respected, wrappers are seen through, redirections are
+//! recovered as writes — `echo x > ~/.bashrc` writes to a startup file with no write tool in sight —
+//! and a value assigned inside a token is recovered too, because `ROOT=/store app` names a path that
+//! is never an argv word.
 //!
 //! This is not a shell parser and does not try to be. It is deliberately over-eager: an
 //! unrecognised construct yields extra fragments rather than fewer, and extra fragments can only
@@ -22,6 +23,14 @@ pub struct Invocation {
     pub args: Vec<String>,
     /// Paths this invocation redirects output into.
     pub writes: Vec<String>,
+    /// Values carried inside a token rather than as a token of their own.
+    ///
+    /// An environment assignment before the program (`ROOT=/store app`) and a flag with its value
+    /// attached (`--root=/store`, `-r/store`) both hand a program a path that never appears as an
+    /// argument, so nothing here would otherwise offer it to a rule. Kept apart from
+    /// [`Self::args`] because these are candidates for the path rules only: they are not argv, and
+    /// reading them as argv would let a `name=value` word answer a question about hosts.
+    pub assigned: Vec<String>,
 }
 
 /// Splits a command line into its invocations.
@@ -33,7 +42,9 @@ pub fn parse(line: &str, wrappers: &[String]) -> Vec<Invocation> {
     fragments(line)
         .into_iter()
         .map(|tokens| invocation(tokens, wrappers))
-        .filter(|found| !(found.programs.is_empty() && found.writes.is_empty()))
+        .filter(|found| {
+            !(found.programs.is_empty() && found.writes.is_empty() && found.assigned.is_empty())
+        })
         .collect()
 }
 
@@ -43,11 +54,14 @@ fn fragments(line: &str) -> Vec<Vec<String>> {
     let mut tokens: Vec<String> = Vec::new();
     let mut token = String::new();
     let mut quote: Option<char> = None;
-    let mut chars = line.chars();
+    let mut chars = line.chars().peekable();
 
     while let Some(c) = chars.next() {
         match (quote, c) {
             (Some(open), c) if c == open => quote = None,
+            // `$'…'` and `$"…"` quote their contents like any other quote. Left attached, the `$`
+            // made the token a filename no rule names.
+            (None, '$') if matches!(chars.peek(), Some('\'' | '"')) => quote = chars.next(),
             (None, '\'' | '"') => quote = Some(c),
             // A backslash hides the next character from the splitter, whatever it is.
             (None, '\\') => {
@@ -86,6 +100,9 @@ fn push_fragment(fragments: &mut Vec<Vec<String>>, tokens: &mut Vec<String>) {
 /// Turns one fragment's tokens into an invocation.
 fn invocation(tokens: Vec<String>, wrappers: &[String]) -> Invocation {
     let (plain, writes) = split_redirections(tokens);
+    // Every token, not just the ones that end up as arguments: the value may be in the prelude the
+    // program search skips over, or in the token the search settles on as the program.
+    let assigned = assigned_values(&plain);
     let mut programs = Vec::new();
     let mut rest = plain.as_slice();
 
@@ -102,6 +119,7 @@ fn invocation(tokens: Vec<String>, wrappers: &[String]) -> Invocation {
                     programs,
                     args: tail.to_vec(),
                     writes,
+                    assigned,
                 };
             }
             None => {
@@ -109,6 +127,7 @@ fn invocation(tokens: Vec<String>, wrappers: &[String]) -> Invocation {
                     programs,
                     args: Vec::new(),
                     writes,
+                    assigned,
                 };
             }
         }
@@ -136,6 +155,33 @@ fn is_assignment(token: &str) -> bool {
         }
         None => false,
     }
+}
+
+/// Recovers the values tokens carry inside themselves.
+///
+/// Two shapes, both of which hand a program a path with no argument to match on: `NAME=value`, and a
+/// flag whose value is attached to it. Deliberately loose in the same way as the rest of this
+/// module — a value that is not a path resolves to a harmless name in the working directory, and an
+/// extra candidate can only add a refusal.
+fn assigned_values(tokens: &[String]) -> Vec<String> {
+    let mut values = Vec::new();
+    for token in tokens {
+        match token.split_once('=') {
+            // Any `=`, not only the assignments `skip_prelude` recognises: `NAME+=/store` is not
+            // one of those and carries the path just the same.
+            Some((_, value)) if !value.is_empty() => values.push(value.to_string()),
+            // A short flag with its value attached has no `=` to split on: `-r/store`. Only a
+            // path-like tail is taken, because a flag's other values are not paths and guessing
+            // that they are is how a rule starts refusing `-rf`.
+            _ if token.starts_with('-') => {
+                if let Some(at) = token.find(['/', '~']) {
+                    values.push(token[at..].to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    values
 }
 
 fn is_wrapper(token: &str, wrappers: &[String]) -> bool {
@@ -245,6 +291,39 @@ mod tests {
     fn leading_assignments_are_not_mistaken_for_the_program() {
         let found = parsed("TOKEN=abc curl http://example.test");
         assert_eq!(found[0].programs, vec!["curl"]);
+    }
+
+    #[test]
+    fn a_value_assigned_inside_a_token_is_recovered() {
+        // The token is still not the program and still not an argument; what it carries is.
+        let found = parsed("TOKEN=/tmp/store curl http://example.test");
+        assert_eq!(found[0].programs, vec!["curl"]);
+        assert_eq!(found[0].assigned, vec!["/tmp/store"]);
+
+        // A flag parsing its own value, with and without the `=`.
+        assert_eq!(parsed("app --config=/tmp/x")[0].assigned, vec!["/tmp/x"]);
+        assert_eq!(parsed("app -c/tmp/x")[0].assigned, vec!["/tmp/x"]);
+
+        // Shapes that are not assignments to `skip_prelude` but still carry a value.
+        assert_eq!(parsed("TOKEN+=/tmp/x app")[0].assigned, vec!["/tmp/x"]);
+        assert_eq!(parsed("export TOKEN=/tmp/x")[0].assigned, vec!["/tmp/x"]);
+    }
+
+    #[test]
+    fn an_assignment_alone_is_still_an_invocation() {
+        // It has no program and writes nothing, and dropping it would drop the path it names.
+        let found = parsed("TOKEN=/tmp/store");
+        assert_eq!(found.len(), 1);
+        assert!(found[0].programs.is_empty());
+        assert_eq!(found[0].assigned, vec!["/tmp/store"]);
+    }
+
+    #[test]
+    fn a_dollar_before_a_quote_opens_it_rather_than_joining_the_word() {
+        assert_eq!(parsed("cat $'/tmp/x'")[0].args, vec!["/tmp/x"]);
+        assert_eq!(parsed("cat $\"/tmp/x\"")[0].args, vec!["/tmp/x"]);
+        // A `$` anywhere else is an ordinary character; this is not variable expansion.
+        assert_eq!(parsed("echo $HOME")[0].args, vec!["$HOME"]);
     }
 
     #[test]

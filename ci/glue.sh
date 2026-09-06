@@ -187,6 +187,38 @@ policy_mutant role-word-alone-refuses-source widen:key-material='**/*keystore*' 
 policy_mutant role-word-alone-refuses-a-search widen:key-material='**/*passphrase*' \
   cmd:'grep -rn passphrase .' 2
 
+## A path that is never an argument ############################################
+# A rule can only fire on a path the command parser found, and for a while it did not find one handed
+# to a program *inside* a token. `ROOT=<store> app` was admitted where `app --root <store>` was
+# refused, and so was `app --root=<store>`: the value never became a candidate, so no pattern could
+# match it. Asserted here as well as in the cargo tests because a real deployment was measured this
+# way -- a store refused by argument and admitted by environment is a gate that only reads as closed.
+echo "→ a path reaching a program inside a token is a candidate, not decoration"
+for line in "STORE_ROOT=$keys/keyring.json tool run" \
+            "STORE_ROOT+=$keys/keyring.json tool run" \
+            "env STORE_ROOT=$keys/keyring.json tool run" \
+            "STORE_ROOT=$keys/keyring.json" \
+            "tool --store=$keys/keyring.json run" \
+            "tool -s$keys/keyring.json run"; do
+  [ "$(keycmd "$line" "$policy")" = 2 ] \
+    || fail "\`$line\` was admitted: the value inside the token never became a candidate path"
+done
+note "an environment prefix and an attached flag value are read like an argument"
+
+# What that costs, on the same real filesystem: every `name=value` token now offers its value up. A
+# build variable is not a secret read, and a guard that refuses one is a guard people switch off.
+for line in "make PREFIX=/usr/local install" "cargo build --features a=b" "tool -rf build"; do
+  [ "$(keycmd "$line" "$policy")" = 0 ] \
+    || fail "\`$line\` was refused: an ordinary assignment is not a path rule"
+done
+note "an ordinary assignment stays ordinary"
+
+# The mutant behind the claim: with the one pattern that names this file gone, the environment prefix
+# has to go green again. Without it the assertion above could be resting on something else entirely
+# -- a guard that refused every command line would satisfy it just as happily.
+policy_mutant assignment-value-unmatched drop-pattern:'**/*keyring*.json*' \
+  cmd:"STORE_ROOT=$keys/keyring.json tool run" 0
+
 echo "→ installing into a scratch project"
 HARNESS_PROJECT_DIR="$work" harnesses/claude-code/install.sh \
   --guard "$guard" --policy "$PWD/spec/tool-policy.json" >/dev/null

@@ -62,6 +62,30 @@ true of `~/.aws/credentials` and `~/.kube/config`. That is layer 4's ground (§1
 asserted in the test suite so that closing it by denying the tree is a decision somebody makes on
 purpose rather than a tightening that quietly takes the readable files with it.
 
+### What a command line can still hide
+
+A path rule can only fire on a path the command parser found, so the parser's reach *is* the rule's
+reach. It now finds a value assigned inside a token — `ROOT=<store> app` and `--root=<store>` alike,
+which hand a program a path that is never an argument — and `$'…'` no longer leaves a `$` glued to
+the front of a filename. Redirections in both directions, `$(…)`, backticks, process substitution,
+quoting, escaping and the wrapper list were already covered, and every one of those shapes is
+asserted rather than assumed.
+
+Two are **not** covered, and are named here rather than left to be found:
+
+- **A program whose argument is itself a command or a program.** `sh -c 'cat <secret>'` and
+  `python -c '…'` pass, because the path sits inside an argument this parser reads as one opaque
+  word. Recursing into it means deciding which programs take a command line and which take a
+  program, and reading a program as a command line gets the answer wrong in the permissive
+  direction — the same reason the openclaw translator refuses a code-mode payload outright instead
+  of translating it.
+- **Anything a shell would expand.** `$HOME/…`, `${VAR}/…`, `*` and `{a,b}` name paths this parser
+  cannot know, because the expansion happens in a shell that has not run yet.
+
+Both are layer 4's ground (§10.2) for the same reason the recursive read above is: they are where a
+string comparison over a command line stops being able to see what the command will do. A deployment
+that needs either closed needs confinement, not a longer parser.
+
 ## Why an agent does not post its own replies
 
 It is the difference between a rule and a habit. If every agent can reach the channel, "redact

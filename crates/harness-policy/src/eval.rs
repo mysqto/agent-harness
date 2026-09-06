@@ -202,6 +202,16 @@ impl Guard {
                 return decision;
             }
         }
+        // A value assigned inside a token reaches the program without ever being an argument, so it
+        // gets the same read check an argument would. A read and not a write: this is what the
+        // secret list gates, and nothing here can tell whether the program will read the path or
+        // write it — guessing "write" would refuse `EDITOR=~/.zshrc app` and everything like it.
+        for value in &found.assigned {
+            let decision = self.read(value);
+            if decision.is_deny() {
+                return decision;
+            }
+        }
         for target in &found.writes {
             let decision = self.write(target);
             if decision.is_deny() {
@@ -698,6 +708,81 @@ mod tests {
             &Intent::Command("grep -r token ~/.aws/credentials".into()),
             "credential-stores",
         );
+    }
+
+    #[test]
+    fn a_secret_reached_only_through_an_assignment_is_still_blocked() {
+        // A path that never becomes an argv word of its own. The program reads it out of the
+        // environment, or out of a flag it parses itself, and the rule that names it must still
+        // fire — otherwise the path is not a candidate and no rule can match it.
+        denied(
+            &Intent::Command("STORE_ROOT=~/.ssh/id_rsa app run".into()),
+            "private-keys",
+        );
+        denied(
+            &Intent::Command("app --config=/srv/work/.env run".into()),
+            "environment-files",
+        );
+        denied(
+            &Intent::Command("app -c/srv/work/.env run".into()),
+            "environment-files",
+        );
+        // The same value, arriving in the shapes that also hid it from the splitter.
+        denied(
+            &Intent::Command("A=1 STORE_ROOT=~/.ssh/id_rsa app run".into()),
+            "private-keys",
+        );
+        denied(
+            &Intent::Command("env STORE_ROOT=~/.ssh/id_rsa app run".into()),
+            "private-keys",
+        );
+        denied(
+            &Intent::Command("STORE_ROOT+=~/.ssh/id_rsa app run".into()),
+            "private-keys",
+        );
+        denied(
+            &Intent::Command("true && STORE_ROOT=~/.ssh/id_rsa app run".into()),
+            "private-keys",
+        );
+        denied(
+            &Intent::Command("export STORE_ROOT=~/.ssh/id_rsa".into()),
+            "private-keys",
+        );
+        // An assignment with no program at all is still a line that names the path.
+        denied(
+            &Intent::Command("STORE_ROOT=~/.ssh/id_rsa".into()),
+            "private-keys",
+        );
+    }
+
+    #[test]
+    fn a_dollar_quoted_path_is_read_as_the_path_it_names() {
+        // `$'…'` and `$"…"` quote their contents; the `$` is not part of the word. Left attached it
+        // made the token resolve to a file in the working directory that no rule names.
+        denied(
+            &Intent::Command("cat $'~/.ssh/id_rsa'".into()),
+            "private-keys",
+        );
+        denied(
+            &Intent::Command("cat $\"/srv/work/.env\"".into()),
+            "environment-files",
+        );
+        denied(
+            &Intent::Command("STORE_ROOT=$'~/.ssh/id_rsa' app run".into()),
+            "private-keys",
+        );
+    }
+
+    #[test]
+    fn an_ordinary_assignment_argument_is_not_a_refusal() {
+        // What the rule above costs. Every `name=value` token now offers its value as a candidate
+        // path, and an attached flag value offers its tail; the ordinary ones must stay ordinary.
+        allowed(&Intent::Command("make PREFIX=/usr/local install".into()));
+        allowed(&Intent::Command("cargo build --features a=b".into()));
+        allowed(&Intent::Command("git config user.name=someone".into()));
+        allowed(&Intent::Command("awk -v n=1 '{print}' /srv/work/f".into()));
+        allowed(&Intent::Command("date -u +%Y%m%dT%H%M%SZ".into()));
+        allowed(&Intent::Command("cc -I/usr/include -o out main.c".into()));
     }
 
     #[test]
