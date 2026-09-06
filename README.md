@@ -65,30 +65,51 @@ purpose rather than a tightening that quietly takes the readable files with it.
 ### What a command line can still hide
 
 A path rule can only fire on a path the command parser found, so the parser's reach *is* the rule's
-reach. It now finds a value assigned inside a token — `ROOT=<store> app` and `--root=<store>` alike,
+reach. It finds a value assigned inside a token — `ROOT=<store> app` and `--root=<store>` alike,
 which hand a program a path that is never an argument — and `$'…'` no longer leaves a `$` glued to
 the front of a filename. Redirections in both directions, `$(…)`, backticks, process substitution,
 quoting, escaping and the wrapper list were already covered, and every one of those shapes is
 asserted rather than assumed.
 
-Two are **not** covered, and are named here rather than left to be found:
+**A program handed to an interpreter is refused rather than read.** `sh -c '<line>'`,
+`python3 -c '<program>'` and `perl -e '…'` put the whole call inside one opaque word, so no rule in
+this policy could see any of it and every one of them was admitted. The alternative was to recurse —
+read that word as another command line — and that means ruling on which programs take a command
+*line* and which take a *program*. The two are not the same language: `python3 -c 'open(p)'` names a
+path no shell parser would find, so reading a program as a command line gets the answer wrong in the
+permissive direction, which is the one direction this guard does not err in. The shape is therefore
+refused and nothing at all is claimed about its contents — in every spelling, including a clustered
+flag (`-lc`), a value attached to it (`-c…`), a long form, a program arriving on standard input, and
+an interpreter reached through a wrapper or through `find -exec`. The surface is declared in
+`spec/tool-policy.json`; a policy document written before the rule gets the built-in list rather than
+an empty one, because a rule that can be *declared* and not *had* is the failure this one was built
+from.
 
-- **A program whose argument is itself a command or a program.** `sh -c 'cat <secret>'` and
-  `python -c '…'` pass, because the path sits inside an argument this parser reads as one opaque
-  word. Recursing into it means deciding which programs take a command line and which take a
-  program, and reading a program as a command line gets the answer wrong in the permissive
-  direction — the same reason the openclaw translator refuses a code-mode payload outright instead
-  of translating it.
+It is drawn narrowly on purpose. An interpreter handed a **script file** is not refused: the file is
+at a path the path rules already read, it got there through a write gate of its own, and a `#!` line
+runs it as `./script` with no interpreter in the command at all — so refusing that spelling would buy
+no property while breaking every installer here. Inline eval has no second spelling, which is exactly
+why it is the shape that is refused.
+
+Three things this does **not** cover, named here rather than left to be found. They are not a
+complete list, and nothing here could be: this is a string comparison over a command line, and the
+shell has not run yet.
+
 - **Anything a shell would expand.** `$HOME/…`, `${VAR}/…`, `*` and `{a,b}` name paths this parser
-  cannot know, because the expansion happens in a shell that has not run yet.
+  cannot know, because the expansion happens in a shell that has not started.
 - **A `cd` earlier in the same line.** A relative candidate resolves against the working directory
   the guard was handed, so `cd <parent> && cat <name>` reaches a rule anchored to an absolute prefix
-  that `cat <parent>/<name>` would not. Older than the two above and unrelated to how the path is
-  spelled — it is the same answer for an argument, a redirection and an assignment.
+  that `cat <parent>/<name>` would not. It is the same answer for an argument, a redirection and an
+  assignment.
+- **An interpreter nobody listed.** The interpreter surface is a list, and a list is what somebody
+  thought of. `awk`, `sed` and `jq` are off it deliberately — their program *is* their first operand,
+  so refusing "an inline program" for them refuses the tool outright, and their input arrives as
+  ordinary path arguments the path rules already read. What that leaves open is a program naming a
+  path inside itself, as `awk 'BEGIN{getline < "<store>"}'` does.
 
-Both are layer 4's ground (§10.2) for the same reason the recursive read above is: they are where a
+These are layer 4's ground (§10.2), for the same reason the recursive read above is: they are where a
 string comparison over a command line stops being able to see what the command will do. A deployment
-that needs either closed needs confinement, not a longer parser.
+that needs them closed needs confinement, not a longer parser.
 
 ## Why an agent does not post its own replies
 

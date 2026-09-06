@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use crate::call::{Intent, ToolCall};
 use crate::command::{self, Invocation};
 use crate::policy::{CommandRule, PathRule, Policy};
-use crate::{fspath, glob};
+use crate::{fspath, glob, inline};
 
 /// What the guard decided.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,6 +54,13 @@ impl std::fmt::Display for Denial {
 /// Not a policy rule with patterns of its own: the workspace is where the agent may work, so
 /// "outside it" is the complement of a list rather than another list.
 pub const OUTSIDE_WORKSPACE: &str = "outside-workspace";
+
+/// The rule id reported when an interpreter is handed a program as an argument.
+///
+/// A code constant for the same reason as [`OUTSIDE_WORKSPACE`]: it is not a rule with patterns of
+/// its own. The policy supplies the surface and the wording; that the shape is refused at all is a
+/// property of this build — see [`crate::policy::InlinePrograms`].
+pub const INLINE_PROGRAM: &str = "inline-program";
 
 /// A policy bound to the filesystem context it will be evaluated in.
 #[derive(Debug, Clone)]
@@ -185,6 +192,19 @@ impl Guard {
     }
 
     fn invocation(&self, found: &Invocation) -> Decision {
+        // First, because every check after this one would be an answer about a command line this
+        // guard never read. The program sits inside one quoted word, so no path, host or program
+        // rule can reach it, and saying "allowed" would be reporting that nothing matched a string
+        // nothing looked at.
+        if let Some(interpreter) =
+            inline::handed_a_program(&self.policy.inline_programs.interpreters, found)
+        {
+            return Decision::Deny(Denial {
+                rule: INLINE_PROGRAM.to_string(),
+                reason: self.policy.inline_programs.reason.clone(),
+                detail: interpreter,
+            });
+        }
         for rule in &self.policy.commands {
             if matches_rule(rule, found) {
                 return Decision::Deny(Denial {
@@ -388,7 +408,7 @@ fn bare_host(token: &str) -> Option<String> {
 mod tests {
     use std::path::Path;
 
-    use super::{Decision, Guard, OUTSIDE_WORKSPACE};
+    use super::{Decision, Guard, INLINE_PROGRAM, OUTSIDE_WORKSPACE};
     use crate::call::{Intent, ToolCall};
     use crate::policy::Policy;
 
@@ -770,6 +790,204 @@ mod tests {
         denied(
             &Intent::Command("STORE_ROOT=$'~/.ssh/id_rsa' app run".into()),
             "private-keys",
+        );
+    }
+
+    /// A program handed to an interpreter is refused as a shape, whatever the program says.
+    ///
+    /// The hole, measured on a deployment: `sh -c '<line>'` was admitted while the same line typed
+    /// directly was refused. Whatever the line names — a path, a host, a denied program — sits
+    /// inside one quoted word, and every rule in this policy can only fire on something the parser
+    /// found.
+    ///
+    /// The alternative was to recurse: read that word as another command line. That means ruling on
+    /// which programs take a command *line* and which take a *program*, and the two are not the same
+    /// language — `python3 -c 'open(p)'` names a path no shell parser would find. Reading a program
+    /// as a command line gets the answer wrong in the permissive direction, which is the one
+    /// direction this guard does not err in. So the shape is refused and nothing at all is claimed
+    /// about what the program would have done.
+    #[test]
+    fn a_program_handed_to_an_interpreter_is_refused_whatever_it_says() {
+        for line in [
+            // Shells: the four that were measured, and the rest of the family, which spell the flag
+            // the same way and mean the same thing by it.
+            "sh -c 'cat /etc/hosts'",
+            "bash -c true",
+            "zsh -c true",
+            "dash -c true",
+            "ash -c true",
+            "ksh -c true",
+            "mksh -c true",
+            "fish -c true",
+            "csh -c true",
+            "tcsh -c true",
+            // A program rather than a command line, which is the half a shell parser could not read
+            // even if it recursed.
+            "python -c pass",
+            "python3 -c 'print(1)'",
+            "python3.13 -c 'print(1)'",
+            "perl -e 1",
+            "perl -E 1",
+            "ruby -e 1",
+            "node -e 1",
+            "nodejs -e 1",
+            "deno -e 1",
+            "bun -e 1",
+            "php -r 1",
+            "lua -e 1",
+            "luajit -e 1",
+            "Rscript -e 1",
+            // On a macOS host this one reaches a shell by another road.
+            "osascript -e 'do shell script \"id\"'",
+        ] {
+            denied(&Intent::Command(line.into()), INLINE_PROGRAM);
+        }
+
+        // Refused before anything else is decided, because everything after it would be an answer
+        // about a command line this guard did not read. A harmless program and a denied one get the
+        // same refusal, and it names the shape rather than pretending to have looked inside.
+        denied(&Intent::Command("sh -c 'passwd'".into()), INLINE_PROGRAM);
+        let Decision::Deny(denial) = guard().check(&ToolCall::new(
+            "bash",
+            Intent::Command("bash -c true".into()),
+        )) else {
+            panic!("must deny");
+        };
+        assert_eq!(denial.detail, "bash");
+    }
+
+    /// Fail closed on the spelling. A token this parser cannot rule *out* as an inline-program flag
+    /// is treated as one, and every road to the interpreter is the same road.
+    #[test]
+    fn every_spelling_of_the_flag_is_refused_including_the_ones_that_hide_it() {
+        for line in [
+            // The flag clustered with others, and not first in the cluster.
+            "bash -lc true",
+            "sh -ec true",
+            // Its value attached to it, so there is no second token to look at.
+            "sh -cecho hi",
+            // A long form, whether or not this particular shell has one: a guard that admits the
+            // spellings it has not heard of is a guard that admits the next one.
+            "sh --command=true",
+            "node --eval 1",
+            // The program on standard input. There is no artefact and no argument either way, and
+            // the token that says so is the only thing there is to see.
+            "sh -",
+            "sh -s",
+            // And with no token at all: an interpreter this line runs and hands nothing reads its
+            // program from standard input, which is the same program with the same reach and
+            // nothing anywhere in the line that names it.
+            "sh",
+            "echo hi | bash",
+            "python3",
+            "bash /dev/stdin",
+            "python3 /dev/fd/0",
+            // Reached by path, and through every wrapper the policy already lists.
+            "/bin/sh -c true",
+            "/usr/bin/env python3 -c pass",
+            "env sh -c true",
+            "sudo -n bash -c true",
+            "xargs sh -c true",
+            "command sh -c true",
+            "nohup zsh -c true",
+            "setsid dash -c true",
+            // A wrapper carrying an operand of its own leaves the interpreter in the argument list
+            // rather than in the program list, and `find -exec` puts it there on purpose.
+            "timeout 5 sh -c true",
+            "find . -exec sh -c true ;",
+        ] {
+            denied(&Intent::Command(line.into()), INLINE_PROGRAM);
+        }
+    }
+
+    /// An interpreter given a script *file* is not refused, and that is a decision rather than a gap.
+    ///
+    /// A file differs from an inline program in three ways that decide it. It exists at a path, so
+    /// the path rules see it and a person can read it. It reached that path through a write, which
+    /// is a gate of its own. And refusing this shape would buy no property at all: a script with a
+    /// `#!` line runs as `./script` with no interpreter anywhere in the command, so `bash script.sh`
+    /// is a spelling rather than a capability. Inline eval has no second spelling — it is the only
+    /// way to hand over a program that never becomes a file — which is why it is the shape refused
+    /// and this one is not.
+    #[test]
+    fn an_interpreter_given_a_script_file_or_an_ordinary_flag_is_not_refused() {
+        allowed(&Intent::Command("sh script.sh".into()));
+        allowed(&Intent::Command("bash setup/install.sh --dry-run".into()));
+        allowed(&Intent::Command("bash -n setup/install.sh".into()));
+        allowed(&Intent::Command("python3 tool.py --verbose".into()));
+        allowed(&Intent::Command("node server.js".into()));
+        allowed(&Intent::Command("ruby app.rb".into()));
+        allowed(&Intent::Command("perl -i.bak script.pl".into()));
+        // Asking an interpreter about itself names no program.
+        allowed(&Intent::Command("bash --version".into()));
+        allowed(&Intent::Command("python3 --version".into()));
+        allowed(&Intent::Command("node --version".into()));
+        // The interpreter named as data rather than run. What carries the refusal is the flag that
+        // follows it, so a mention with no flag after it stays a mention.
+        // Named rather than run. An interpreter with nothing after it is a word here, where the
+        // same emptiness in the program position means "the program is on standard input".
+        allowed(&Intent::Command("which bash".into()));
+        allowed(&Intent::Command("ls -la /bin/sh".into()));
+        allowed(&Intent::Command("grep -c sh /srv/work/notes".into()));
+        allowed(&Intent::Command("git commit -m 'ran sh -c by hand'".into()));
+    }
+
+    /// A program whose inline program *is* its ordinary positional argument is left alone, and this
+    /// says which ones and why.
+    ///
+    /// `awk`, `sed` and `jq` take a program too, and it is their first operand rather than a flag —
+    /// so refusing "an inline program" for them is refusing the tool. That trade is not worth making
+    /// here: their input arrives as ordinary path arguments, which the path rules already read, so
+    /// the route this gate closes is not open through them in the shape that matters. What is left
+    /// open is a program that names a path *inside itself* — `awk 'BEGIN{getline < "…"}'` — and that
+    /// is recorded in the README rather than closed, because closing it costs `awk` entirely.
+    #[test]
+    fn a_program_whose_program_is_its_first_operand_is_not_an_interpreter_here() {
+        allowed(&Intent::Command("awk -v n=1 '{print}' /srv/work/f".into()));
+        allowed(&Intent::Command("awk '{print $1}' /srv/work/f".into()));
+        allowed(&Intent::Command("sed -e 's/a/b/' /srv/work/f".into()));
+        allowed(&Intent::Command("jq -r '.a' /srv/work/f".into()));
+        // And the half of that claim the path rules are carrying: named as an argument, a secret is
+        // still refused whichever of them names it.
+        denied(
+            &Intent::Command("awk '{print}' /srv/work/.env".into()),
+            "environment-files",
+        );
+    }
+
+    /// What failing closed costs, stated rather than left to be discovered.
+    #[test]
+    fn an_interpreter_name_followed_by_the_flag_is_refused_even_when_nothing_runs_it() {
+        // `sh` is a word here and `-c` is an argument of `echo`, and this refuses anyway. Telling
+        // the two apart means deciding which token positions hold a program, which is the recursion
+        // this gate declined — and `find … -exec sh -c …` above is the same shape with a real
+        // interpreter in it, so the permissive reading loses more than the strict one.
+        denied(&Intent::Command("echo sh -c".into()), INLINE_PROGRAM);
+    }
+
+    /// A policy document that never heard of this rule still gets it.
+    ///
+    /// This is the failure the gate was built for, seen from the other side: a deployment declared a
+    /// setting meaning exactly "refuse inline eval" and nothing enforced it, because the mechanism
+    /// named lived somewhere that did not exist. An absent group here therefore means the built-in
+    /// surface, not an empty one — a policy file older than this build must not be a second way to
+    /// declare the rule and not have it. Declaring it empty is still possible, and is a decision
+    /// somebody makes in writing.
+    #[test]
+    fn a_policy_that_never_heard_of_this_rule_still_refuses_the_shape() {
+        let bound = |text: &str| {
+            Guard::new(
+                Policy::parse(text, "test").expect("parse"),
+                Path::new("/home/a"),
+                Path::new("/srv/work"),
+                Path::new("/srv/work"),
+            )
+        };
+        let call = ToolCall::new("bash", Intent::Command("sh -c true".into()));
+        assert!(bound(r#"{"version":1}"#).check(&call).is_deny());
+        assert_eq!(
+            bound(r#"{"version":1,"inline_programs":{"interpreters":[]}}"#).check(&call),
+            Decision::Allow
         );
     }
 

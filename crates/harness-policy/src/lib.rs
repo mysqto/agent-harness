@@ -28,6 +28,7 @@ pub mod eval;
 pub mod fspath;
 pub mod glob;
 pub mod harness;
+pub mod inline;
 pub mod policy;
 
 pub use call::{Intent, ToolCall};

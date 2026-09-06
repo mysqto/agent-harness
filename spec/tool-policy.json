@@ -142,6 +142,32 @@
       "args": ["push", "--force"]
     }
   ],
+  "inline_programs": {
+    "reason": "a program handed to an interpreter, which this guard reads as one opaque word",
+    "interpreters": [
+      {
+        "programs": [
+          "sh", "bash", "zsh", "dash", "ash", "ksh", "ksh93", "mksh", "fish", "csh", "tcsh"
+        ],
+        "flags": "cs",
+        "options": ["command", "eval"]
+      },
+      {
+        "programs": [
+          "python", "python2", "python3", "python2.*", "python3.*", "pypy", "pypy3"
+        ],
+        "flags": "c",
+        "options": ["command"]
+      },
+      { "programs": ["perl", "perl5.*"], "flags": "eE", "options": ["eval"] },
+      { "programs": ["ruby"], "flags": "e", "options": ["eval"] },
+      { "programs": ["node", "nodejs", "deno", "bun"], "flags": "ep", "options": ["eval", "print"] },
+      { "programs": ["php"], "flags": "r", "options": ["run"] },
+      { "programs": ["lua", "lua5.*", "luajit"], "flags": "e", "options": ["eval"] },
+      { "programs": ["osascript"], "flags": "e", "options": ["eval"] },
+      { "programs": ["Rscript", "R"], "flags": "e", "options": ["expression"] }
+    ]
+  },
   "network": {
     "reason": "egress to a host outside the allowlist",
     "allow_hosts": ["127.0.0.1", "localhost", "::1", "0.0.0.0"],

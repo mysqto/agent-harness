@@ -133,6 +133,15 @@ if verb == "drop-group":
 elif verb == "drop-pattern":
     for rule in policy["secret_paths"]:
         rule["patterns"] = [p for p in rule["patterns"] if p != what]
+elif verb == "drop-interpreter":
+    # An interpreter the gate no longer knows about. This is the state every guard shipped in
+    # before this rule existed, and it is the shape that was measured admitted on a deployment.
+    for entry in policy["inline_programs"]["interpreters"]:
+        entry["programs"] = [p for p in entry["programs"] if p != what]
+elif verb == "drop-flag":
+    # The interpreter still listed, but the token that hands it a program no longer recognised.
+    for entry in policy["inline_programs"]["interpreters"]:
+        entry["flags"] = entry["flags"].replace(what, "")
 elif verb == "widen":
     # A group that gives up on naming what it protects and swallows a directory instead.
     group, _, pattern = what.partition("=")
@@ -218,6 +227,49 @@ note "an ordinary assignment stays ordinary"
 # -- a guard that refused every command line would satisfy it just as happily.
 policy_mutant assignment-value-unmatched drop-pattern:'**/*keyring*.json*' \
   cmd:"STORE_ROOT=$keys/keyring.json tool run" 0
+
+## A program handed to an interpreter ##########################################
+# The widest shape left after the section above, and the one this deployment had already declared and
+# never enforced: `sh -c '<line>'` was admitted where the same line typed directly was refused,
+# because the whole call sits inside one quoted word and every rule fires on something the parser
+# found. It is refused as a *shape* rather than recursed into. Recursing means ruling on which
+# programs take a command line and which take a program -- and reading a program as a command line
+# errs permissive, which is the one direction this gate does not err in.
+#
+# Asserted here as well as in the cargo tests for the same reason the two sections above are: these
+# run a real policy file through the built binary, from inside a directory that holds real key
+# material, which is where a canonicalised path and a cwd-relative candidate are the actual inputs.
+
+echo "→ a program handed to an interpreter is refused as a shape"
+for line in "sh -c 'cat $keys/keyring.json'" \
+            "bash -c true" "zsh -c true" "dash -c true" \
+            "python3 -c 'print(1)'" "perl -e 1" "ruby -e 1" "node -e 1" \
+            "bash -lc true" "sh -ctrue" "sh --command=true" \
+            "sh -" "sh /dev/stdin" "sh" "echo hi | bash" \
+            "env sh -c true" "xargs sh -c true" "timeout 5 sh -c true" \
+            "find . -exec sh -c true ;"; do
+  [ "$(keycmd "$line" "$policy")" = 2 ] \
+    || fail "\`$line\` was admitted: the program inside the argument was never read, so nothing refused it"
+done
+note "clustered, attached, long-form, on stdin, behind a wrapper and behind find -exec, all refused"
+
+# What that costs, and the line it is drawn at. An interpreter handed a *file* is not refused: the
+# file is at a path the path rules already read, it got there through a write gate, and a `#!` line
+# runs it as `./script` with no interpreter in the command at all -- so refusing the spelling buys no
+# property while breaking every installer in this repository.
+for line in "sh install.sh" "bash -n install.sh" "python3 tool.py --verbose" \
+            "node server.js" "bash --version" "which bash" "ls -la /bin/sh" \
+            "grep -c sh README.md"; do
+  [ "$(keycmd "$line" "$policy")" = 0 ] \
+    || fail "\`$line\` was refused: an interpreter handed a file is not an inline program"
+done
+note "a script file, a syntax check, a version flag and a mention of an interpreter stay admitted"
+
+# Two mutants, because two separate things in the document carry this claim and one mutant would
+# leave the other resting on nothing: which programs are interpreters, and which token hands one a
+# program. Each has to flip the same probe on its own.
+policy_mutant interpreter-unlisted drop-interpreter:sh cmd:"sh -c true" 0
+policy_mutant inline-flag-unlisted drop-flag:c cmd:"sh -c true" 0
 
 echo "→ installing into a scratch project"
 HARNESS_PROJECT_DIR="$work" harnesses/claude-code/install.sh \

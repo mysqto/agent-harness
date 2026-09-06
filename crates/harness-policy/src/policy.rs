@@ -45,9 +45,93 @@ pub struct Policy {
     /// Commands refused by program name, optionally narrowed by argument.
     #[serde(default)]
     pub commands: Vec<CommandRule>,
+    /// Interpreters that take a program as an argument, and the tokens that hand them one.
+    ///
+    /// Absent from a document means the built-in surface rather than an empty one — see
+    /// [`InlinePrograms`].
+    #[serde(default)]
+    pub inline_programs: InlinePrograms,
     /// Which hosts the agent may reach.
     #[serde(default)]
     pub network: Network,
+}
+
+/// The refusal of a program handed to an interpreter as an argument.
+///
+/// Not a list of what is protected, which is what every other group here is: it is a statement about
+/// what a command line can be *read* as. `sh -c '<line>'` and `python3 -c '<program>'` put the whole
+/// call inside one quoted word, so no rule in this document can see any of it, and the guard refuses
+/// the shape rather than guessing at the contents.
+///
+/// **An absent group means the built-in surface, not an empty one.** That asymmetry is deliberate and
+/// it is the lesson this rule was built from: a deployment had declared a setting meaning exactly
+/// this, and nothing enforced it, because the mechanism it named was not present. A policy file older
+/// than this build must not become a second way to declare the rule and not have it. Declaring
+/// `interpreters: []` still turns it off, and is a decision somebody makes in writing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InlinePrograms {
+    /// Why this is refused, in words a person reads in a refusal message.
+    #[serde(default = "InlinePrograms::default_reason")]
+    pub reason: String,
+    /// The interpreters, and what each one's "here is a program" token looks like.
+    #[serde(default = "InlinePrograms::builtin")]
+    pub interpreters: Vec<Interpreter>,
+}
+
+impl Default for InlinePrograms {
+    fn default() -> Self {
+        Self {
+            reason: Self::default_reason(),
+            interpreters: Self::builtin(),
+        }
+    }
+}
+
+/// One interpreter family: the programs, and the tokens that hand them a program.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Interpreter {
+    /// Program names, matched against the command's basename as globs.
+    pub programs: Vec<String>,
+    /// Single-dash option *letters* that introduce a program.
+    ///
+    /// A set of characters rather than a list of tokens because clustering is a character question:
+    /// `-lc` and `-cSOMETHING` both carry `c`, and a rule written in whole tokens misses both.
+    #[serde(default)]
+    pub flags: String,
+    /// Long option names with the same meaning, without their dashes.
+    ///
+    /// Matched as a substring of the option's name, so a spelling nobody listed (`--commands`) is
+    /// refused with the one that was.
+    #[serde(default)]
+    pub options: Vec<String>,
+}
+
+impl InlinePrograms {
+    /// The group as `spec/tool-policy.json` declares it, or `None` if it does not.
+    ///
+    /// Read back out of the shipped document rather than written a second time in Rust. That
+    /// document is the only place a rule is declared (AGENTS.md §6), and a hand-copied list here
+    /// would be a second policy nobody reads and nothing keeps in step. Parsed as a plain JSON value
+    /// on purpose: deserialising it as [`InlinePrograms`] would call the very defaults this supplies.
+    fn shipped() -> Option<serde_json::Value> {
+        serde_json::from_str::<serde_json::Value>(BASELINE)
+            .ok()?
+            .get("inline_programs")
+            .cloned()
+    }
+
+    fn default_reason() -> String {
+        Self::shipped()
+            .and_then(|group| Some(group.get("reason")?.as_str()?.to_string()))
+            .unwrap_or_default()
+    }
+
+    /// The surface used when a policy document does not name one.
+    fn builtin() -> Vec<Interpreter> {
+        Self::shipped()
+            .and_then(|group| serde_json::from_value(group.get("interpreters")?.clone()).ok())
+            .unwrap_or_default()
+    }
 }
 
 /// A named set of path patterns.
@@ -151,6 +235,40 @@ mod tests {
         assert!(!policy.writing_programs.is_empty());
         assert!(!policy.network.allow_hosts.is_empty());
         assert!(!policy.workspace_roots.is_empty());
+    }
+
+    /// There is one declaration of this rule, and the fallback is a read of it.
+    ///
+    /// A rule is declared in `spec/tool-policy.json` and nowhere else. The constant this build falls
+    /// back to when a document does not name the group is that same document, read back — so the two
+    /// cannot drift, and removing the group from the document fails here rather than leaving a gate
+    /// quietly falling back to itself.
+    #[test]
+    fn the_built_in_surface_is_the_shipped_document_rather_than_a_second_copy_of_it() {
+        let shipped = Policy::baseline().expect("baseline").inline_programs;
+        assert!(!shipped.interpreters.is_empty());
+        assert!(!shipped.reason.is_empty());
+
+        let silent = Policy::parse(r#"{"version":1}"#, "test").expect("parse");
+        assert_eq!(silent.inline_programs.interpreters, shipped.interpreters);
+        assert_eq!(silent.inline_programs.reason, shipped.reason);
+    }
+
+    /// An absent group is the built-in surface; an empty one is a decision.
+    #[test]
+    fn a_document_that_does_not_name_the_interpreters_still_gets_them() {
+        let silent = Policy::parse(r#"{"version":1}"#, "test").expect("parse");
+        assert!(!silent.inline_programs.interpreters.is_empty());
+
+        let off = Policy::parse(
+            r#"{"version":1,"inline_programs":{"interpreters":[]}}"#,
+            "test",
+        )
+        .expect("parse");
+        assert!(off.inline_programs.interpreters.is_empty());
+        // The wording still comes from somewhere, so a refusal from a partial document reads as a
+        // sentence rather than as an empty string.
+        assert!(!off.inline_programs.reason.is_empty());
     }
 
     #[test]

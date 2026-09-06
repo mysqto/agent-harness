@@ -190,7 +190,8 @@ fn is_wrapper(token: &str, wrappers: &[String]) -> bool {
 }
 
 /// The last path component of a program token, so `/usr/bin/rm` matches a rule naming `rm`.
-fn basename(token: &str) -> &str {
+#[must_use]
+pub fn basename(token: &str) -> &str {
     token.rsplit('/').next().unwrap_or(token)
 }
 
