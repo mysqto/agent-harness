@@ -39,6 +39,22 @@ const STDIN_OPERANDS: [&str; 2] = ["/dev/stdin", "/dev/fd/0"];
 /// `echo '…' | sh` — the program is real and there is no token anywhere that names it. An
 /// interpreter merely *named* with nothing after it is a word: `which bash` and `ls -la /bin/sh` say
 /// nothing about running anything, and refusing them would be reading a mention as an execution.
+///
+/// That asymmetry had a gap in it, because the two positions are not as far apart as they look.
+/// [`crate::command::parse`] finds the program by skipping a run of flags and assignments and taking
+/// the next token, so a wrapper that spends that position on a *separated positional operand* —
+/// `timeout 5`, `nice -n 5` — leaves the interpreter behind it in the arguments. `timeout 5 sh -c …`
+/// still refuses, on the `-c`. `timeout 5 sh` did not: the program is on standard input, so there is
+/// no token after the interpreter for the argument scan to find, and it read the empty tail as a
+/// mention.
+///
+/// So the empty tail is a mention only while the program position is legible, and it stops being
+/// legible the moment a wrapper has been walked. Once one has, this parse has already settled on a
+/// token it cannot tell from an operand, and what sits between that token and the interpreter is
+/// unread either way — `-k 1 5`, or a second wrapper carrying an operand of its own. Behind a
+/// wrapper, therefore, an interpreter that *ends the line* is refused wherever it sits, and
+/// `timeout 5 which bash` is refused with it. Counting a wrapper's operands would be the narrower
+/// answer and it is not available: a parse that could count them would not have had the gap.
 #[must_use]
 pub fn handed_a_program(interpreters: &[Interpreter], found: &Invocation) -> Option<String> {
     for entry in interpreters {
@@ -52,14 +68,26 @@ pub fn handed_a_program(interpreters: &[Interpreter], found: &Invocation) -> Opt
         }
         for (at, token) in found.args.iter().enumerate() {
             let name = basename(token);
+            let tail = &found.args[at + 1..];
             if glob::any(&entry.programs, name)
-                && introduces_a_program(entry, &found.args[at + 1..])
+                && (introduces_a_program(entry, tail)
+                    || (tail.is_empty() && behind_a_wrapper(found)))
             {
                 return Some(name.to_string());
             }
         }
     }
     None
+}
+
+/// Whether the program position of this invocation was decided after walking a wrapper.
+///
+/// `programs` collects one entry per wrapper and one for the token the walk finally settled on, so
+/// more than one entry means a wrapper was passed — and that the token it settled on may be that
+/// wrapper's operand rather than a program. This is what the argument scan reads to know whether an
+/// empty tail is a mention or the standard input of an interpreter the line runs.
+fn behind_a_wrapper(found: &Invocation) -> bool {
+    found.programs.len() > 1
 }
 
 /// Whether any of `tokens` says a program follows, is attached, or is on standard input.
@@ -145,6 +173,19 @@ mod tests {
         assert_eq!(matched("echo hi | bash").as_deref(), Some("bash"));
         assert_eq!(matched("which bash"), None);
         assert_eq!(matched("ls -la /bin/sh"), None);
+    }
+
+    #[test]
+    fn a_wrappers_operand_does_not_hide_the_interpreter_that_ends_the_line() {
+        // The operand takes the program position, so the interpreter is read by the argument scan,
+        // where the tail is empty because the program is on standard input.
+        assert_eq!(matched("timeout 5 sh").as_deref(), Some("sh"));
+        assert_eq!(matched("timeout 5 timeout 3 bash").as_deref(), Some("bash"));
+        // Still a mention where no wrapper was walked, which is the whole of what this spends.
+        assert_eq!(matched("which bash"), None);
+        assert_eq!(matched("ls -la /bin/sh"), None);
+        // And still not inline eval when the interpreter is given a file to run.
+        assert_eq!(matched("timeout 5 sh script.sh"), None);
     }
 
     #[test]

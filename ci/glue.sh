@@ -138,6 +138,11 @@ elif verb == "drop-interpreter":
     # before this rule existed, and it is the shape that was measured admitted on a deployment.
     for entry in policy["inline_programs"]["interpreters"]:
         entry["programs"] = [p for p in entry["programs"] if p != what]
+elif verb == "drop-wrapper":
+    # The wrapper still there in the line but no longer one the parser walks. What decides the
+    # empty-tail case is that a wrapper was walked at all, so this is the half of the claim the
+    # interpreter list cannot carry.
+    policy["command_wrappers"] = [w for w in policy["command_wrappers"] if w != what]
 elif verb == "drop-flag":
     # The interpreter still listed, but the token that hands it a program no longer recognised.
     for entry in policy["inline_programs"]["interpreters"]:
@@ -253,13 +258,27 @@ for line in "sh -c 'cat $keys/keyring.json'" \
 done
 note "clustered, attached, long-form, on stdin, behind a wrapper and behind find -exec, all refused"
 
+# The shape the section above reported still open, and it is not about `timeout`. The program search
+# skips flags and assignments and takes the next token, so a wrapper spending that position on a
+# separated operand -- `timeout 5`, `nice -n 5` -- leaves the interpreter in the arguments, where the
+# empty tail of an interpreter reading standard input looked like a mention. Every wrapper whose
+# operand is attached or absent was already refused above, which is why this went unseen.
+for line in "timeout 5 sh" "nice -n 5 sh" "timeout 5 bash" "timeout 5 python3" \
+            "timeout 5 /bin/sh" "timeout -k 1 5 sh" "sudo timeout 5 sh" \
+            "timeout 5 timeout 3 sh"; do
+  [ "$(keycmd "$line" "$policy")" = 2 ] \
+    || fail "\`$line\` was admitted: a wrapper's operand hid the interpreter that ends the line"
+done
+note "an interpreter ending the line behind a wrapper's operand is refused, nested and multi-operand alike"
+
 # What that costs, and the line it is drawn at. An interpreter handed a *file* is not refused: the
 # file is at a path the path rules already read, it got there through a write gate, and a `#!` line
 # runs it as `./script` with no interpreter in the command at all -- so refusing the spelling buys no
 # property while breaking every installer in this repository.
 for line in "sh install.sh" "bash -n install.sh" "python3 tool.py --verbose" \
             "node server.js" "bash --version" "which bash" "ls -la /bin/sh" \
-            "grep -c sh README.md"; do
+            "grep -c sh README.md" \
+            "timeout 5 sh install.sh" "timeout 5 bash --version"; do
   [ "$(keycmd "$line" "$policy")" = 0 ] \
     || fail "\`$line\` was refused: an interpreter handed a file is not an inline program"
 done
@@ -270,6 +289,13 @@ note "a script file, a syntax check, a version flag and a mention of an interpre
 # program. Each has to flip the same probe on its own.
 policy_mutant interpreter-unlisted drop-interpreter:sh cmd:"sh -c true" 0
 policy_mutant inline-flag-unlisted drop-flag:c cmd:"sh -c true" 0
+
+# And two for the shape behind a wrapper's operand, which rests on a third thing in the document
+# neither mutant above can reach: the wrapper list. Drop `timeout` from it and the line stops being
+# read as a wrapper at all, so the interpreter is a mention again and the refusal goes away -- which
+# is the state this gate was in before today.
+policy_mutant wrapper-unlisted drop-wrapper:timeout cmd:"timeout 5 sh" 0
+policy_mutant wrapped-interpreter-unlisted drop-interpreter:sh cmd:"timeout 5 sh" 0
 
 echo "→ installing into a scratch project"
 HARNESS_PROJECT_DIR="$work" harnesses/claude-code/install.sh \

@@ -955,6 +955,86 @@ mod tests {
         );
     }
 
+    /// A wrapper's own operand hid the interpreter behind it, and the line still ran it.
+    ///
+    /// The gap this closes, and it is not about `timeout`. The wrapper walk in `command::parse`
+    /// skips a run of flags and assignments, then declares the next token the program. A wrapper
+    /// that carries a *separated positional operand* — `timeout 5`, `nice -n 5` — spends that
+    /// position on the operand, so the interpreter after it is demoted into the arguments. There
+    /// the argument scan reads it, and the argument scan requires a token after it that hands over
+    /// a program. `timeout 5 sh -c …` therefore refuses on the `-c`, and `timeout 5 sh` — where the
+    /// program arrives on standard input and no token names it — was admitted.
+    ///
+    /// So the shape is an interpreter that *ends the line* behind a wrapper. Every wrapper whose
+    /// operand is attached or absent already refuses (`env sh`, `stdbuf -o0 sh`, `timeout sh`),
+    /// because there the interpreter stays in the wrapper chain and the head scan reads it.
+    ///
+    /// What decides it is that a wrapper was walked at all. Once one has been, this parse has
+    /// admitted it cannot tell an operand from a program, and the tokens between the wrapper and
+    /// the interpreter are unread either way — `-k 1 5`, or a second wrapper and its own operand.
+    /// So behind a wrapper an interpreter with nothing after it is refused, and the position it sits
+    /// in is not what decides.
+    #[test]
+    fn an_interpreter_a_wrapper_reached_is_refused_even_when_it_ends_the_line() {
+        for line in [
+            // The measured shape, and it is not one wrapper: `nice` spends the position on the
+            // value of its own flag, which is the same mistake one token further along.
+            "timeout 5 sh",
+            "nice -n 5 sh",
+            // Nor one interpreter. The rule is about the position, not about the shell.
+            "timeout 5 bash",
+            "timeout 5 zsh",
+            "timeout 5 python3",
+            "timeout 5 node",
+            // Nor one spelling of it: the argument scan reads a basename.
+            "timeout 5 /bin/sh",
+            // More than one operand, and more than one wrapper — the tokens in between are exactly
+            // what this parse cannot read, so counting them is not the fix.
+            "timeout -k 1 5 sh",
+            "sudo timeout 5 sh",
+            "timeout 5 timeout 3 sh",
+        ] {
+            denied(&Intent::Command(line.into()), INLINE_PROGRAM);
+        }
+    }
+
+    /// The mention stays a mention, which is the half a wider rule would have taken.
+    #[test]
+    fn an_interpreter_a_wrapper_only_named_is_still_not_refused() {
+        // No wrapper, so the program position is not in doubt and these are words. This is the
+        // asymmetry the closure above must not spend: it buys the empty tail only where a wrapper
+        // has already made the program position unreadable.
+        allowed(&Intent::Command("which bash".into()));
+        allowed(&Intent::Command("ls -la /bin/sh".into()));
+        // Behind a wrapper an interpreter that is given a script file is still not inline eval,
+        // for the reason `sh script.sh` is not: the file is at a path the path rules read.
+        allowed(&Intent::Command("timeout 5 sh script.sh".into()));
+        allowed(&Intent::Command(
+            "timeout 5 bash setup/install.sh --dry-run".into(),
+        ));
+        allowed(&Intent::Command(
+            "timeout 5 python3 tool.py --verbose".into(),
+        ));
+        allowed(&Intent::Command("timeout 5 bash --version".into()));
+    }
+
+    /// What the closure costs, stated in the same register as the cost above it.
+    #[test]
+    fn behind_a_wrapper_a_named_interpreter_that_ends_the_line_is_refused_too() {
+        // `bash` is a word here and `sh` is a path, and both refuse now. Telling them from
+        // `timeout 5 sh` means knowing which of the tokens before them were operands, and a parse
+        // that knew that would not have had the gap. The cheaper reading is the permissive one and
+        // it is the one this guard does not take.
+        denied(
+            &Intent::Command("timeout 5 which bash".into()),
+            INLINE_PROGRAM,
+        );
+        denied(
+            &Intent::Command("timeout 5 ls /bin/sh".into()),
+            INLINE_PROGRAM,
+        );
+    }
+
     /// What failing closed costs, stated rather than left to be discovered.
     #[test]
     fn an_interpreter_name_followed_by_the_flag_is_refused_even_when_nothing_runs_it() {

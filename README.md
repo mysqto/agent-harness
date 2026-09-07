@@ -85,11 +85,31 @@ an interpreter reached through a wrapper or through `find -exec`. The surface is
 an empty one, because a rule that can be *declared* and not *had* is the failure this one was built
 from.
 
+**Through a wrapper includes the wrapper's own operand**, which it did not at first. The program
+search skips a run of flags and assignments and takes the next token, so a wrapper that spends that
+position on a separated operand — `timeout 5`, `nice -n 5` — leaves the interpreter behind it among
+the arguments. `timeout 5 sh -c …` still refused there, on the `-c`; `timeout 5 sh` did not, because
+the program arrives on standard input and no token names it, so the empty tail read as a mention.
+What decides it now is that a wrapper was walked at all: once one has been, the parse has settled on
+a token it cannot tell from an operand, and the tokens between it and the interpreter are unread
+either way. So behind a wrapper an interpreter that **ends the line** is refused wherever it sits,
+which covers a second operand (`timeout -k 1 5 sh`) and a second wrapper (`sudo timeout 5 sh`)
+without counting either. Counting a wrapper's operands would be the narrower answer and it is not
+available: a parse that could count them would not have had the gap.
+
 It is drawn narrowly on purpose. An interpreter handed a **script file** is not refused: the file is
 at a path the path rules already read, it got there through a write gate of its own, and a `#!` line
 runs it as `./script` with no interpreter in the command at all — so refusing that spelling would buy
 no property while breaking every installer here. Inline eval has no second spelling, which is exactly
-why it is the shape that is refused.
+why it is the shape that is refused. `timeout 5 sh install.sh` is admitted for the same reason
+`sh install.sh` is, and a bare mention stays a mention: `which bash` and `ls -la /bin/sh` run
+nothing and are not refused.
+
+What that last closure costs, stated rather than left to be found: behind a wrapper the mention is
+refused too. `timeout 5 which bash` and `timeout 5 ls /bin/sh` name an interpreter at the end of a
+line whose program position is already unreadable, and telling them from `timeout 5 sh` means knowing
+which of the earlier tokens were operands. The cheaper reading is the permissive one, and it is the
+one this guard does not take — the same trade already made for `echo sh -c`.
 
 Three things this does **not** cover, named here rather than left to be found. They are not a
 complete list, and nothing here could be: this is a string comparison over a command line, and the
