@@ -193,22 +193,37 @@ thing, and the body is a fixed sentence saying so. It never reads the turn's pro
 ### Duplication: the hook's row is the complement of the agent's
 
 If the agent records and the hook records too, one event gets two rows. The decision is that it does
-not: the hook stands down when it finds, in the turn's own messages, the name of **the recorder it
-would itself have run**. One name and two uses — the program the hook spawns is the program the agent
-was told to run — so there is no second thing to keep in step with the first, and the question is
-structural rather than hopeful.
+not: before writing anything the hook asks the store whether **this agent's writer filed anything
+while the turn was running** — over the read socket recall already uses, with the turn's own
+`durationMs` as the window. A turn that recorded has a row naming what it did; a turn that did not
+gets a row saying it happened.
 
-A turn that recorded has a row naming what it did; a turn that did not gets a row saying it happened.
-Both ways of being wrong are survivable, and the asymmetry is why this shape was chosen over a
-reserved action name — which the store could not have given us anyway, since every action has to be
-one the deployment declared:
+A reserved action name would have been the other shape and the store cannot give us one: every
+action has to be one the deployment declared in its attribute schema, and a name invented by this
+plugin is a rejected write on every turn.
 
-- **A miss** — the agent recorded, the hook did not see it — costs one extra floor row.
-- **A false positive** — the name appeared, the agent recorded nothing — costs the floor row, which
-  is exactly the state this replaces. It cannot be worse than the instruction it is for.
+**The transcript was tried first and cannot answer.** Scanning the turn's messages for the
+recorder's own name is free, needs no round trip, and works on the embedded backend, whose
+`agent_end` messages carry nested tool activity. On a CLI backend it cannot: measured on 2026.9.3,
+`agent_end` there is handed the session history plus this turn's prompt and last assistant message,
+and the tool calls run in a process the gateway never sees. It shipped that way for exactly one
+deploy, wrote a floor record beside an agent-authored one, and was replaced — a suppression that
+silently cannot fire is worse than none, because it is a rule in the code that the code does not
+apply. One read behind a reply that has already been sent costs a conversation nothing.
 
-So an unreadable, unfamiliar or oversized message array writes the row. Failing toward recording is
-the point of the change.
+The window is the turn and nothing wider, which is what stops one suppression from latching into all
+of them: reach back past the turn and the probe finds the *previous* turn's floor record, stands
+down, and does so for ever after the first row.
+
+Both ways of being wrong are survivable, and the asymmetry is deliberate:
+
+- **A miss** — the agent recorded, the probe did not see it — costs one extra floor row, and the log
+  says the store went unasked and why.
+- **A false positive** — something else was filed in that window — costs the floor row, which is
+  exactly the state this replaces. It cannot be worse than the instruction it is for.
+
+So no writer name, no reader, no duration, or a probe that did not answer all write the row. Failing
+toward recording is the point of the change.
 
 ### Recording fails open, and it is the mirror of recall
 
@@ -929,7 +944,8 @@ Then read the log, which says which of the several things happened to each turn:
 
 ```
 harness-memory: recorded that a turn ran, as main
-harness-memory: no floor record: this turn ran record-main itself, so it already has a record that …
+harness-memory: recorded that a turn ran, as main, without checking whether the turn recorded itself: …
+harness-memory: no floor record: main_bot filed something while this turn ran, so it already has …
 harness-memory: nothing was recorded: config.record names no recorder for agent "pr" …
 harness-memory: the turn could not be recorded, and the turn itself is unaffected: …
 ```

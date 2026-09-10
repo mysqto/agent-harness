@@ -1673,12 +1673,6 @@ const SPOOLED_EXIT = 7;
 /** How long the record write gets. It is behind a reply rather than in front of one, so: generous. */
 const DEFAULT_RECORD_TIMEOUT_MS = 10_000;
 
-/** How much of a turn's messages the suppression scan reads before it stops looking. */
-const MAX_SCAN_CHARS = 262_144;
-
-/** How deep into one message that scan descends. */
-const MAX_SCAN_DEPTH = 8;
-
 /**
  * Whether recall put anything in front of a turn, by run.
  *
@@ -1759,77 +1753,54 @@ function unwritable(argv) {
 }
 
 /**
- * The flags a record cannot be written without.
+ * Whether this turn already recorded itself — asked of the store, not of the transcript.
  *
- * Which is what lets the scan below tell an *invocation* of the recorder from a *mention* of it. The
- * emitter requires both and defaults neither — an outcome it defaulted would file every failure
- * nobody described as a success — so a string that runs the recorder carries both names, and a
- * sentence of prose about the recorder almost never does.
- *
- * **This narrowing is the difference between a feature and a feature that looks wired.** The name of
- * the recorder appears in the instruction that tells an agent to use it, and possibly in whatever
- * documents a turn happens to read. A scan matching the bare name would stand down on every turn on
- * a deployment where that text reaches the message array, recording nothing and saying, once per
- * turn, that it had nothing to add.
- */
-const RECORD_REQUIRED_FLAGS = ["--action", "--outcome"];
-
-/**
- * Whether any string anywhere in a value looks like the recorder being *run*, bounded in breadth
- * and depth.
- *
- * A walk rather than a `JSON.stringify`, because the thing being walked is whatever the host chose
- * to hand over: serialising it could throw on a cycle, and would build a copy of a whole turn to
- * search it once. Both bounds exist so that a very long turn costs a fixed amount here instead of a
- * growing one — and running out of either yields `false`, which writes the record. See
- * `alreadyRecorded` for why that is the safe direction.
- *
- * One string has to carry all three names, rather than three strings between them carrying one each:
- * a command line is one string, and letting the parts come from anywhere in a turn is how a document
- * and an unrelated flag add up to a recorder nobody ran.
- */
-function mentions(value, needle, budget, depth = 0) {
-  if (budget.left <= 0 || depth > MAX_SCAN_DEPTH) return false;
-  if (typeof value === "string") {
-    budget.left -= value.length;
-    return value.includes(needle) && RECORD_REQUIRED_FLAGS.every((flag) => value.includes(flag));
-  }
-  if (Array.isArray(value)) {
-    for (const item of value) if (mentions(item, needle, budget, depth + 1)) return true;
-    return false;
-  }
-  if (value && typeof value === "object") {
-    for (const item of Object.values(value)) if (mentions(item, needle, budget, depth + 1)) return true;
-    return false;
-  }
-  return false;
-}
-
-/**
- * Whether this turn already recorded itself.
- *
- * **This is the answer to what the hook's row and the agent's row are to each other: complement, not
- * duplicate.** A turn that ran the recorder already has a row naming the action and saying why it
+ * **This is the answer to what the hook's row and the agent's row are to each other: complement,
+ * not duplicate.** A turn that recorded already has a row naming the action and saying why it
  * mattered, which is strictly the better record; a floor beside it would be a second row about one
  * event carrying less, and on a store where every read is already at its cap that is not free.
  *
- * The question is asked structurally rather than hoped about: the hook stands down when it finds, in
- * the turn's own messages, the name of *the recorder it would itself have run*. One name and two
- * uses — the program this hook spawns is the program the agent was told to run — so there is no
- * second thing to keep in step with the first.
+ * The question asked is "did this agent's writer file anything while this turn was running", over
+ * the read socket recall already uses, and the window is the turn: `durationMs` back from now. So a
+ * record the agent wrote *during* the turn is inside it, and the floor record the previous turn's
+ * hook wrote is outside it — which is what stops one suppression from latching into all of them.
  *
- * Both ways of being wrong are survivable, and the asymmetry is the reason this shape was chosen:
+ * **The transcript was tried first and cannot answer.** Scanning `event.messages` for the recorder's
+ * own name is free and needs no round trip, and on the embedded backend the messages do carry nested
+ * tool activity. On this deployment's backend they do not: measured, `agent_end` there is handed the
+ * session history plus this turn's prompt and last assistant message, and the tool calls happen in a
+ * separate process the gateway never sees. A suppression that silently cannot fire is worse than
+ * none — it is a rule in the code that the code does not apply — so it was replaced rather than kept
+ * beside this. One read behind a reply that has already been sent costs a conversation nothing.
  *
- *   - **A miss** — the agent recorded and this did not see it — costs one extra floor row.
- *   - **A false positive** — the name appeared and the agent recorded nothing — costs the floor row,
- *     which is exactly the state this replaces. It cannot be worse than the instruction it is for.
- *
- * So an unreadable, unfamiliar or oversized message array yields `false` and the row is written.
- * Failing toward recording is the whole point of the change.
+ * Every way of not knowing yields `false`, and the row is written: no writer name, no reader, no
+ * duration from the host, or a read that did not answer. Both directions are survivable and the
+ * asymmetry is deliberate — a miss costs one extra floor row, and a false positive costs the floor
+ * row, which is exactly the state this replaces. Failing toward recording is the point.
  */
-function alreadyRecorded(messages, probe) {
-  if (typeof probe !== "string" || !probe) return false;
-  return mentions(messages, probe, { left: MAX_SCAN_CHARS });
+async function recordedDuring(settings, writer, event, budgetMs) {
+  if (typeof writer !== "string" || !writer) return { recorded: false, why: "no writer name for this agent" };
+  const argv = Array.isArray(settings?.read) && settings.read.length > 0 ? withoutActor(settings.read) : undefined;
+  const shaped = argv && argv.length > 0 ? shapeArgv(argv, DIGEST_SHAPE) : undefined;
+  if (!shaped) return { recorded: false, why: "no reader is configured to ask" };
+  // The turn's own span, and nothing wider. A window that reached back past the turn would catch the
+  // previous turn's floor record and stand down for ever after the first one.
+  if (!Number.isFinite(event?.durationMs)) return { recorded: false, why: "the host did not say how long the turn took" };
+  const to = Date.now();
+  const named = (flag) => shaped.includes(flag);
+  const answer = await once(shaped[0], [
+    ...shaped.slice(1),
+    "--agent",
+    writer,
+    ...named("--from-ms") || named("--to-ms")
+      ? []
+      : ["--from-ms", String(to - Math.max(0, Math.floor(event.durationMs))), "--to-ms", String(to)],
+    // One row is the whole question: whether there is any at all.
+    ...named("--limit") ? [] : ["--limit", "1"],
+    ...named("--timeout-ms") ? [] : ["--timeout-ms", String(Math.max(1, Math.floor(budgetMs * 0.8)))],
+  ], budgetMs);
+  if (answer.kind === "failed") return { recorded: false, why: answer.why };
+  return { recorded: answer.records.length > 0, asked: true };
 }
 
 /** The recorder's own name, as it would appear in a command line an agent ran. */
@@ -1942,15 +1913,15 @@ function recordPlan(settings, event, ctx, facts) {
   const outcome = outcomeFor(settings, event?.success !== false);
   if (!outcome) return { kind: "undeclared", agentId, succeeded: event?.success !== false };
 
-  const probe = probeFor(argv);
-  if (alreadyRecorded(event?.messages, probe)) return { kind: "recorded-already", agentId, probe };
-
   const kind = typeof settings?.threadEntity === "string" ? settings.threadEntity.trim() : "";
   const thread = kind ? threadOf(ctx?.channelId ?? ctx?.chatId) : undefined;
   return {
     kind: "write",
     agentId,
     argv,
+    // The writer this agent's records carry, which is what the store is asked about before this
+    // writes anything. The same map, and the same reasoning, as the actor half of recall.
+    writer: actorPlan(settings?.read, agentId, settings?.actors).writer,
     args: recordArgs(settings, argv, action, outcome, facts, thread ? `${kind}:${thread}` : undefined),
     budgetMs: positive(settings?.recordTimeoutMs, DEFAULT_RECORD_TIMEOUT_MS),
   };
@@ -2033,8 +2004,12 @@ function ran(argv0, args, budgetMs) {
 async function recordTurn(settings, event, ctx, facts) {
   const plan = recordPlan(settings, event, ctx, facts);
   if (plan.kind !== "write") return plan;
+  const already = await recordedDuring(settings, plan.writer, event, plan.budgetMs);
+  if (already.recorded) return { kind: "recorded-already", agentId: plan.agentId, writer: plan.writer };
   const outcome = await ran(plan.argv[0], plan.args, plan.budgetMs);
-  return { ...outcome, agentId: plan.agentId };
+  // Why the store was not asked, when it was not. A floor record beside an agent's own is the cost
+  // of not knowing, and an operator seeing it on every turn should be able to see why.
+  return { ...outcome, agentId: plan.agentId, ...already.asked ? {} : { unasked: already.why } };
 }
 
 /**
@@ -2048,7 +2023,10 @@ async function recordTurn(settings, event, ctx, facts) {
 function reportRecord(outcome, logger) {
   if (outcome?.kind === "wrote") {
     const held = outcome.spooled ? ", held by the sidecar and still being delivered" : "";
-    logger?.info?.(`${PLUGIN_ID}: recorded that a turn ran, as ${outcome.agentId}${held}`);
+    // And whether this row might be a second one for the same event, which is the only thing an
+    // operator can act on: the store was not asked, so "the agent recorded too" was not ruled out.
+    const blind = outcome.unasked ? `, without checking whether the turn recorded itself: ${outcome.unasked}` : "";
+    logger?.info?.(`${PLUGIN_ID}: recorded that a turn ran, as ${outcome.agentId}${held}${blind}`);
     return;
   }
   if (outcome?.kind === "failed") {
@@ -2059,8 +2037,8 @@ function reportRecord(outcome, logger) {
   }
   if (outcome?.kind === "recorded-already") {
     logger?.info?.(
-      `${PLUGIN_ID}: no floor record: this turn ran ${outcome.probe} itself, so it already has a ` +
-        `record that names what it did rather than only that it happened`,
+      `${PLUGIN_ID}: no floor record: ${outcome.writer} filed something while this turn ran, so it ` +
+        `already has a record naming what it did rather than only that it happened`,
     );
     return;
   }
@@ -2236,8 +2214,7 @@ export {
   recordArgs,
   reportRecord,
   unwritable,
-  alreadyRecorded,
-  mentions,
+  recordedDuring,
   probeFor,
   outcomeFor,
   attrsFor,
@@ -2249,7 +2226,6 @@ export {
   RECORD_SUMMARY,
   RECORD_ALLOWED_FLAGS,
   RECORD_FACTS,
-  RECORD_REQUIRED_FLAGS,
   DEFAULT_RECORD_OUTCOMES,
   DEFAULT_RECORD_TIMEOUT_MS,
   SKIPPED_TRIGGERS,

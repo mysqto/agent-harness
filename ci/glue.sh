@@ -1437,7 +1437,7 @@ const { recall, renderContext, injectionFrom, report, bounds, actorFor, actorPla
         actorAllowance, withoutActor, actorWriterIn, DEFAULT_ACTOR_MAX_RECORDS,
         claimOpening, DIGEST_HEADING, SEEN_SESSIONS,
         TRUNCATED_NOTE, DIGEST_TRUNCATED_NOTE, OVER_READ,
-        recordTurn, reportRecord, unwritable, alreadyRecorded, RECORD_SUMMARY } = mod;
+        recordTurn, reportRecord, unwritable, recordedDuring, RECORD_SUMMARY } = mod;
 
 const problems = [];
 const reader = (name, ...rest) => [`${binDir}/reader-${name}`, "bundle", ...rest];
@@ -2196,44 +2196,62 @@ if (recorded.argv.length !== 1) problems.push(`a turn produced ${recorded.argv.l
   }
 }
 
-// --- the hook's record is the complement of the agent's, not a duplicate ---------------------------
-// A turn that ran the recorder already has a row that names the action and says why it mattered. A
-// floor beside it would be a second row about one event carrying less, so the hook stands down --
-// and it asks the question structurally, by looking for the name of the recorder it would have run.
-const suppressed = await wrote(recordWired, {
-  ...turnEvent,
-  messages: [{
-    role: "assistant",
-    toolCalls: [{ input: { command: "emitter-ok --action answer --outcome success --summary x" } }],
-  }],
-}, turnCtx, {});
+// --- the hook's record is the complement of the agent's, not a duplicate -------------------------
+// A turn that recorded already has a row naming the action and saying why it mattered, so a floor
+// beside it would be a second row about one event carrying less. The question is asked of the store
+// -- did this agent's writer file anything while the turn was running -- over the read socket recall
+// already uses, and the window is the turn itself.
+//
+// **The transcript was tried first and cannot answer it.** Scanning the turn's messages for the
+// recorder's name is free and works on the embedded backend. On a CLI backend it cannot: measured,
+// `agent_end` there is handed the session history plus this turn's prompt and last assistant
+// message, and the tool calls run in a process the gateway never sees. A suppression that silently
+// cannot fire is worse than none.
+// `reader-digest` answers the window read with rows; `reader-empty` answers it with none.
+const probing = { ...recordWired, read: reader("digest"), actors: { main: "main_bot" } };
+const suppressed = await wrote(probing, turnEvent, turnCtx, {});
 if (suppressed.outcome.kind !== "recorded-already") {
   problems.push(`the hook wrote a second row for a turn that recorded itself: ${JSON.stringify(suppressed.outcome)}`);
 }
 if (suppressed.argv.length !== 0) problems.push("the hook spawned a recorder for a turn that had already recorded");
-if (alreadyRecorded([{ text: "nothing to do with it" }], "emitter-ok") !== false) {
-  problems.push("an unrelated turn was read as having recorded itself");
-}
+// The same probe over a store that filed nothing in that window: the row is written.
+const quiet = await wrote({ ...probing, read: reader("empty") }, turnEvent, turnCtx, {});
+if (quiet.outcome.kind !== "wrote") problems.push(`a turn nobody recorded was not given a floor row: ${quiet.outcome.kind}`);
 
-// --- a mention of the recorder is not a use of it ---------------------------------------------------
-// **This narrowing is the difference between a feature and a feature that looks wired.** The name of
-// the recorder is in the instruction that tells an agent to use it, and in whatever documents a turn
-// reads. A scan matching the bare name would stand down on every turn wherever that text reaches the
-// message array -- recording nothing, and saying once per turn that it had nothing to add. So a
-// string has to carry the name *and* both flags the emitter cannot write a record without.
-for (const [label, said] of [
-  ["the instruction that names it", "record what you did by running emitter-ok afterwards"],
-  ["the wrapper's own text read out of a file", "#!/bin/sh\nexec /opt/yaam-emit --socket /x --agent a"],
-  ["flags belonging to something else", "some-other-tool --action build --outcome ok"],
-]) {
-  if (alreadyRecorded([{ role: "user", content: said }], "emitter-ok") !== false) {
-    problems.push(`${label} was read as the recorder having been run`);
+// It asks about the turn and nothing wider. A window reaching back past the turn would catch the
+// previous turn's own floor record and stand down for ever after the first one.
+{
+  const file = `${binDir}/../probe-args-${Math.random().toString(36).slice(2)}`;
+  process.env.READER_ARGS_FILE = file;
+  await recordedDuring({ read: reader("empty") }, "some_bot", { durationMs: 4321 }, 2000);
+  delete process.env.READER_ARGS_FILE;
+  const asked = (await import("node:fs")).readFileSync(file, "utf8").trim();
+  if (!asked.startsWith("records ")) problems.push(`the probe did not ask the window read: ${asked}`);
+  if (!asked.includes("--agent some_bot")) problems.push(`the probe did not name the writer: ${asked}`);
+  if (!asked.includes("--limit 1")) problems.push(`the probe read more than the one row it needs: ${asked}`);
+  const [, from] = asked.match(/--from-ms (\d+)/) ?? [];
+  const [, to] = asked.match(/--to-ms (\d+)/) ?? [];
+  if (!from || !to || Number(to) - Number(from) !== 4321) {
+    problems.push(`the probe's window was not the turn: ${asked}`);
+  }
+  if (asked.includes("--entity") || asked.includes("--actor")) {
+    problems.push(`the probe was narrowed to something other than the writer: ${asked}`);
   }
 }
-// And the parts must add up inside one string: a command line is one string, and letting them come
-// from anywhere in a turn is how a document plus an unrelated flag becomes a recorder nobody ran.
-if (alreadyRecorded([{ a: "mentions emitter-ok" }, { b: "--action x" }, { c: "--outcome y" }], "emitter-ok") !== false) {
-  problems.push("three unrelated strings between them were read as one invocation");
+// Every way of not knowing writes the row, and says which way it was.
+for (const [label, settings, event] of [
+  ["no writer name for this agent", { ...recordWired, read: reader("digest") }, turnEvent],
+  ["no reader to ask", probing, turnEvent],
+  ["no duration from the host", probing, { ...turnEvent, durationMs: undefined }],
+  ["a probe that was refused", { ...probing, read: reader("refused") }, turnEvent],
+]) {
+  const blind = await wrote(label === "no reader to ask" ? { ...settings, read: undefined } : settings,
+    event, turnCtx, {});
+  if (blind.kind === "recorded-already") problems.push(`${label} was read as the turn having recorded itself`);
+  if (blind.outcome.kind !== "wrote") problems.push(`${label} did not write the floor row: ${blind.outcome.kind}`);
+  if (!/without checking/.test(said(blind.log, "info"))) {
+    problems.push(`${label} did not say the store went unasked: ${said(blind.log, "info")}`);
+  }
 }
 
 // --- a hook must not degrade a turn ----------------------------------------------------------------
@@ -2484,15 +2502,19 @@ garbage and no answer; and an empty match reads differently"
   # line, so a deny list -- or none -- is the shape that ships the hole.
   mutate record-any-flag-allowed 's|if (!RECORD_ALLOWED_FLAGS.has(flag)) {|if (false) {|'
   # Two rows for one event: the hook writing a floor beside the agent's own richer record.
-  mutate record-ignores-suppression 's|if (alreadyRecorded(event?.messages, probe))|if (false)|'
-  # And the other way to get suppression wrong, which is the worse of the two: a scan matching the
-  # bare name stands down wherever the instruction naming the recorder reaches the message array. The
-  # feature then looks wired, records nothing, and says once per turn that it had nothing to add.
-  mutate record-mention-suppresses \
-    's|return value.includes(needle) \&\& RECORD_REQUIRED_FLAGS.every((flag) => value.includes(flag));|return value.includes(needle);|'
-  # And the parts counted across strings rather than within one.
-  mutate record-invocation-split-across-strings \
-    's|budget.left -= value.length;|budget.left -= value.length; if (value.includes(needle)) return true;|'
+  mutate record-ignores-suppression 's|if (already.recorded) return { kind: "recorded-already"|if (false) return { kind: "recorded-already"|'
+  # A probe that cannot answer read as an answer. Every way of not knowing has to write the row: a
+  # miss costs one extra floor record, and this costs the record, which is the state being replaced.
+  mutate record-unknown-is-suppression \
+    's|if (answer.kind === "failed") return { recorded: false, why: answer.why };|if (answer.kind === "failed") return { recorded: true };|'
+  # The window widened past the turn. It would then catch the *previous* turn's own floor record, and
+  # the hook would stand down for ever after the first one -- coverage collapsing to a single row
+  # with nothing in the log looking wrong.
+  mutate record-window-outlives-the-turn \
+    's|String(to - Math.max(0, Math.floor(event.durationMs)))|String(to - 86400000)|'
+  # And the probe not saying it went unasked, which is the only thing an operator can act on when a
+  # second row shows up beside an agent's own.
+  mutate record-blind-write-unsaid 's|const blind = outcome.unasked ?|const blind = false ?|'
   # The spool read as an outage. Exit 7 is the sidecar holding a record and still delivering it, so
   # this reports a failure every time one is ridden out -- and the record lands anyway.
   mutate record-spool-is-a-failure 's|code === 0 \|\| code === SPOOLED_EXIT|code === 0|'
