@@ -233,6 +233,56 @@ note "an ordinary assignment stays ordinary"
 policy_mutant assignment-value-unmatched drop-pattern:'**/*keyring*.json*' \
   cmd:"STORE_ROOT=$keys/keyring.json tool run" 0
 
+## A path that is a wrapper's operand ##########################################
+# The same fault as the section above, one token further along, and it stayed open through it. The
+# program search skips a wrapper's flags and takes the next token as the program -- so a flag
+# spending that position on a *separated* operand hands the path to the search instead of to the
+# rules. `xargs -a <store> cat` was measured admitted on the built binary while `cat <store>` was
+# refused, and so was every other wrapper flag of that shape. The attached spellings were already
+# recovered as values inside a token, which is why only the separated one was left to find.
+#
+# Every wrapper flag, not a list of the ones that take paths: which of a wrapper's flags take one is
+# not something a command line says, so a flag this cannot rule out is read as taking a path.
+echo "→ a path handed to a wrapper as its own flag's operand is a candidate"
+for line in "xargs -a $keys/keyring.json cat" \
+            "xargs --arg-file $keys/keyring.json cat" \
+            "env -C $keys/keyring.json ls" \
+            "env --chdir $keys/keyring.json ls" \
+            "sudo -D $keys/keyring.json ls" \
+            "sudo --chroot $keys/keyring.json ls" \
+            "doas -C $keys/keyring.json ls" \
+            "time -o $keys/keyring.json ls" \
+            "stdbuf -o $keys/keyring.json ls" \
+            "nohup -x $keys/keyring.json ls" \
+            "xargs -0 -a $keys/keyring.json cat" \
+            "sudo -n env -C $keys/keyring.json ls" \
+            "xargs -a$keys/keyring.json cat" \
+            "xargs --arg-file=$keys/keyring.json cat"; do
+  [ "$(keycmd "$line" "$policy")" = 2 ] \
+    || fail "\`$line\` was admitted: a wrapper's flag operand never became a candidate path"
+done
+note "separated, attached, long-form, behind another flag and behind another wrapper, all refused"
+
+# What that costs, on the same real filesystem and from inside the key store, which is the worst
+# place for it: a flag whose operand is a word now offers that word to the path rules. It resolves
+# to a name in the working directory, which is what an ordinary argument already does -- and
+# nothing in this policy matches a bare word, which is the property the role-word section keeps.
+for line in "sudo -u postgres psql" "sudo -n rm -rf build" "env -u EDITOR ls" \
+            "nice -n 5 make" "timeout -k 1 5 cargo build" "stdbuf -oL grep x file" \
+            "xargs -n 1 echo" "make PREFIX=/usr/local install" "awk -v x=1 '{print}'" \
+            "cc -I/usr/include -c a.c" "which bash" "ls -la /bin/sh"; do
+  [ "$(keycmd "$line" "$policy")" = 0 ] \
+    || fail "\`$line\` was refused: a flag's operand that is a word is not a secret read"
+done
+note "a user, a signal, a niceness and a buffer mode stay words rather than becoming paths"
+
+# The mutant behind it. Dropping the wrapper list would not do -- with `xargs` no longer a wrapper
+# the operand is an ordinary argument and stays refused -- so what carries this claim is the one
+# pattern that names the file. Take it away and the operand has to go green again, which is what
+# separates "the path became a candidate" from "the guard refuses command lines".
+policy_mutant wrapper-operand-unmatched drop-pattern:'**/*keyring*.json*' \
+  cmd:"xargs -a $keys/keyring.json cat" 0
+
 ## A program handed to an interpreter ##########################################
 # The widest shape left after the section above, and the one this deployment had already declared and
 # never enforced: `sh -c '<line>'` was admitted where the same line typed directly was refused,

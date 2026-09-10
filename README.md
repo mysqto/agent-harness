@@ -71,6 +71,19 @@ the front of a filename. Redirections in both directions, `$(…)`, backticks, p
 quoting, escaping and the wrapper list were already covered, and every one of those shapes is
 asserted rather than assumed.
 
+**A wrapper's flag operand is a candidate too**, which it was not until measured. The same program
+search that skips a run of flags then takes the next token as the program — so a wrapper flag
+spending that token on a *separated* operand hands the path to the search rather than to the rules.
+`xargs -a <store> cat` was admitted where `cat <store>` was refused, and so was every wrapper flag
+of that shape: `env -C`, `sudo -D`, `sudo --chroot`, `doas -C`, `time -o`. Only the separated
+spelling was open; `-a<store>` and `--arg-file=<store>` were already recovered as values inside a
+token, which is why it went unseen. Every wrapper flag is now read as though its operand were a
+path, rather than the ones anybody can list: which flags take one is not something a command line
+says, a deployment's `sudo` is not the one this was written against, and a flag added next year is
+spelled nothing yet. The cost, stated: a flag whose operand is a *word* offers that word to the path
+rules, where it resolves to a name in the working directory — which is what an ordinary argument
+already does, and why nothing in this policy matches a bare word.
+
 **A program handed to an interpreter is refused rather than read.** `sh -c '<line>'`,
 `python3 -c '<program>'` and `perl -e '…'` put the whole call inside one opaque word, so no rule in
 this policy could see any of it and every one of them was admitted. The alternative was to recurse —
@@ -111,7 +124,7 @@ line whose program position is already unreadable, and telling them from `timeou
 which of the earlier tokens were operands. The cheaper reading is the permissive one, and it is the
 one this guard does not take — the same trade already made for `echo sh -c`.
 
-Three things this does **not** cover, named here rather than left to be found. They are not a
+Four things this does **not** cover, named here rather than left to be found. They are not a
 complete list, and nothing here could be: this is a string comparison over a command line, and the
 shell has not run yet.
 
@@ -121,6 +134,16 @@ shell has not run yet.
   the guard was handed, so `cd <parent> && cat <name>` reaches a rule anchored to an absolute prefix
   that `cat <parent>/<name>` would not. It is the same answer for an argument, a redirection and an
   assignment.
+- **A *program* behind a wrapper's operand, when the rule names the program.** The paragraph above
+  makes a wrapper's operand a candidate *path*; it does not make what follows the operand a
+  candidate *program*. The search still settles on the operand, so `timeout 5 rm -rf /` and
+  `sudo -u root nc -l 1234` are read as programs called `5` and `root` with `rm` and `nc` among
+  their arguments — measured admitted, where `rm -rf /` and `sudo nc -l 1234` are refused. The
+  inline-program gate is unaffected, because it reads the whole tail rather than the program
+  position (`timeout 5 sh` is refused). Closing this for the command, writing and egress rules means
+  either counting a wrapper's operands, which this parse cannot do, or promoting every token behind
+  a wrapper to a program name, which refuses `timeout 30 cargo build --bin ssh`. It is a trade
+  nobody has made yet rather than an oversight, and it is written down here so that it is one.
 - **An interpreter nobody listed.** The interpreter surface is a list, and a list is what somebody
   thought of. `awk`, `sed` and `jq` are off it deliberately — their program *is* their first operand,
   so refusing "an inline program" for them refuses the tool outright, and their input arrives as

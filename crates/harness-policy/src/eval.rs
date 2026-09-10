@@ -775,6 +775,99 @@ mod tests {
         );
     }
 
+    /// A path handed to a wrapper as its own flag's operand is still a path this guard must see.
+    ///
+    /// The hole, measured on the built binary: `xargs -a <file> cat` was admitted while `cat
+    /// <file>` was refused. The program search skips a wrapper's flags and takes the next token as
+    /// the program, so a flag that spends the position on a *separated* operand hands the path to
+    /// the search rather than to the rules — it becomes a program name, and a program name is never
+    /// resolved as a path. The attached spellings (`-a<file>`, `--arg-file=<file>`) were already
+    /// covered, which is why this went unseen: only the separated one has a token of its own to
+    /// lose.
+    ///
+    /// It is not about `xargs`, and it is not about the flags anyone can name. Which wrapper flags
+    /// take a path is not knowable from a command line — a deployment's `sudo` is not the one this
+    /// was written against, and a flag added next year is spelled nothing yet — so every wrapper
+    /// flag is read as though its operand were a path. The cost is a bare word offered to the path
+    /// rules, which is exactly what an ordinary argument already is.
+    #[test]
+    fn a_secret_reached_as_a_wrapper_flags_operand_is_still_blocked() {
+        // The shape that was measured open, and its long spelling.
+        denied(
+            &Intent::Command("xargs -a ~/.ssh/id_rsa cat".into()),
+            "private-keys",
+        );
+        denied(
+            &Intent::Command("xargs --arg-file ~/.ssh/id_rsa cat".into()),
+            "private-keys",
+        );
+        // Every other wrapper in the list that takes a path this way, and one that does not: what
+        // decides the candidate is the shape of the line, not a list of flags.
+        denied(
+            &Intent::Command("env -C /srv/work/.env ls".into()),
+            "environment-files",
+        );
+        denied(
+            &Intent::Command("env --chdir /srv/work/.env ls".into()),
+            "environment-files",
+        );
+        denied(
+            &Intent::Command("sudo -D ~/.ssh/id_rsa ls".into()),
+            "private-keys",
+        );
+        denied(
+            &Intent::Command("sudo --chroot ~/.ssh/id_rsa ls".into()),
+            "private-keys",
+        );
+        denied(
+            &Intent::Command("doas -C ~/.ssh/id_rsa ls".into()),
+            "private-keys",
+        );
+        denied(
+            &Intent::Command("time -o ~/.ssh/id_rsa ls".into()),
+            "private-keys",
+        );
+        denied(
+            &Intent::Command("stdbuf -o ~/.ssh/id_rsa ls".into()),
+            "private-keys",
+        );
+        // Flags before the one carrying it, and a wrapper behind a wrapper.
+        denied(
+            &Intent::Command("xargs -0 -a ~/.ssh/id_rsa cat".into()),
+            "private-keys",
+        );
+        denied(
+            &Intent::Command("sudo -n env -C ~/.ssh/id_rsa ls".into()),
+            "private-keys",
+        );
+        // The attached spellings, which were already closed and stay closed.
+        denied(
+            &Intent::Command("xargs -a~/.ssh/id_rsa cat".into()),
+            "private-keys",
+        );
+        denied(
+            &Intent::Command("xargs --arg-file=~/.ssh/id_rsa cat".into()),
+            "private-keys",
+        );
+    }
+
+    /// What reading every wrapper flag as though it took a path costs, stated rather than found.
+    ///
+    /// The operand of a flag that takes a word rather than a path resolves to a name in the working
+    /// directory, which is what an ordinary argument already does — `grep -rn passphrase .` is the
+    /// same shape and is admitted for the same reason. Nothing in this policy matches a bare word,
+    /// so nothing here is refused.
+    #[test]
+    fn a_wrapper_flag_whose_operand_is_a_word_is_not_a_secret_read() {
+        allowed(&Intent::Command("sudo -u postgres psql".into()));
+        allowed(&Intent::Command("sudo -n rm -rf build".into()));
+        allowed(&Intent::Command("env -u EDITOR ls".into()));
+        allowed(&Intent::Command("nice -n 5 make".into()));
+        allowed(&Intent::Command("timeout -k 1 5 cargo build".into()));
+        allowed(&Intent::Command("stdbuf -oL grep x file".into()));
+        allowed(&Intent::Command("xargs -n 1 echo".into()));
+    }
+
     #[test]
     fn a_dollar_quoted_path_is_read_as_the_path_it_names() {
         // `$'…'` and `$"…"` quote their contents; the `$` is not part of the word. Left attached it

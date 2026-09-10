@@ -102,12 +102,12 @@ fn invocation(tokens: Vec<String>, wrappers: &[String]) -> Invocation {
     let (plain, writes) = split_redirections(tokens);
     // Every token, not just the ones that end up as arguments: the value may be in the prelude the
     // program search skips over, or in the token the search settles on as the program.
-    let assigned = assigned_values(&plain);
+    let mut assigned = assigned_values(&plain);
     let mut programs = Vec::new();
     let mut rest = plain.as_slice();
 
     loop {
-        rest = skip_prelude(rest);
+        rest = skip_prelude(rest, &mut assigned);
         match rest.split_first() {
             Some((first, tail)) if is_wrapper(first, wrappers) => {
                 programs.push(basename(first).to_string());
@@ -134,14 +134,38 @@ fn invocation(tokens: Vec<String>, wrappers: &[String]) -> Invocation {
     }
 }
 
-/// Drops leading environment assignments and a wrapper's own flags.
+/// Drops leading environment assignments and a wrapper's own flags, keeping what a flag's operand
+/// may be.
 ///
 /// `TOKEN=x sudo -n rm` must still be seen as `rm`; without this the program would read as `TOKEN=x`.
-fn skip_prelude(tokens: &[String]) -> &[String] {
+///
+/// A flag that spends the next token on a *separated* operand is why this also collects. The flag
+/// is skipped and the operand is then the token the program search settles on, so `xargs -a <file>
+/// cat` hands the path to the search rather than to the rules: it becomes a program name, and a
+/// program name is never resolved as a path. Measured admitted on the built binary against a store
+/// every path rule names. The attached spellings — `-a<file>`, `--arg-file=<file>` — were already
+/// recovered by [`assigned_values`], which is why only the separated one was left.
+///
+/// Every flag, not the ones anyone can list. Which of a wrapper's flags take a path is not
+/// something a command line says, a deployment's `sudo` is not the one this was written against,
+/// and a flag added next year is spelled nothing yet — so a flag this cannot rule out as taking a
+/// path is read as taking one. The cost is a word offered to the path rules where a flag took a
+/// word instead, and an ordinary argument is already offered to them the same way.
+///
+/// An assignment is not a flag and consumes nothing: the token after `TOKEN=x` is the program, and
+/// naming it a candidate path would say nothing true about the line.
+fn skip_prelude<'a>(tokens: &'a [String], assigned: &mut Vec<String>) -> &'a [String] {
     let skip = tokens
         .iter()
         .take_while(|token| token.starts_with('-') || is_assignment(token))
         .count();
+    if let (Some(last), Some(operand)) = (
+        skip.checked_sub(1).and_then(|i| tokens.get(i)),
+        tokens.get(skip),
+    ) && last.starts_with('-')
+    {
+        assigned.push(operand.clone());
+    }
     &tokens[skip..]
 }
 
@@ -317,6 +341,34 @@ mod tests {
         assert_eq!(found.len(), 1);
         assert!(found[0].programs.is_empty());
         assert_eq!(found[0].assigned, vec!["/tmp/store"]);
+    }
+
+    #[test]
+    fn a_wrapper_flags_separated_operand_is_recovered_as_a_path_candidate() {
+        // The flag is skipped and its operand becomes the program, so the path has no argument to
+        // be matched on and no rule can ever see it. Recovered as a candidate instead — which of a
+        // wrapper's flags take a path is not something a command line says.
+        let found = parsed("xargs -a /tmp/list cat");
+        assert!(found[0].assigned.contains(&"/tmp/list".to_string()));
+        assert_eq!(parsed("env -C /tmp/x ls")[0].assigned, vec!["/tmp/x"]);
+        assert_eq!(parsed("sudo -D /tmp/x ls")[0].assigned, vec!["/tmp/x"]);
+        // The flag need not be the first one, and a wrapper may wrap a wrapper.
+        assert!(
+            parsed("xargs -0 -a /tmp/list cat")[0]
+                .assigned
+                .contains(&"/tmp/list".to_string())
+        );
+        assert!(
+            parsed("sudo -n env -C /tmp/x ls")[0]
+                .assigned
+                .contains(&"/tmp/x".to_string())
+        );
+        // An assignment is not a flag and takes no operand: the token after it is the program, and
+        // reading it as a path would say nothing true about the line.
+        assert_eq!(
+            parsed("TOKEN=abc curl http://example.test")[0].assigned,
+            vec!["abc"]
+        );
     }
 
     #[test]
