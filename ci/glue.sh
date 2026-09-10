@@ -1039,7 +1039,64 @@ cat > "$(reader slow)" <<'STUB'
 #!/usr/bin/env bash
 sleep 30
 STUB
+# The reader for a page that is exactly as long as it was allowed to be. It answers `--limit N` with
+# N rows whatever N is, which is what a store with more rows than the page does -- and what neither
+# the `search` nor the `records` read says anything about. A plugin that asks for only what it will
+# show gets a full page here and cannot tell it from a complete answer.
+#
+# The bundle branch answers empty, so the search fallback is what fires and the digest keeps its turn.
+cat > "$(reader over)" <<'STUB'
+#!/usr/bin/env bash
+[ -n "${READER_ARGS_FILE:-}" ] && printf '%s\n' "$*" >> "$READER_ARGS_FILE"
+if [ "${1:-}" = "bundle" ]; then
+  printf '{"records":[],"degraded":false,"omitted":[],"token_estimate":0}'
+  exit 0
+fi
+limit=1
+prev=""
+for arg in "$@"; do
+  [ "$prev" = "--limit" ] && limit="$arg"
+  prev="$arg"
+done
+rows=""
+i=0
+while [ "$i" -lt "$limit" ]; do
+  [ -n "$rows" ] && rows="$rows,"
+  day=$((i % 2 + 1))
+  rows="$rows{\"record_id\":\"01ROW$i\",\"received_at\":\"2026-08-0${day}T00:00:0${i}Z\",\"action\":\"note\",\"outcome\":\"ok\",\"agent\":\"someone\",\"entities\":[],\"attrs\":{},\"tags\":[]}"
+  i=$((i + 1))
+done
+printf '{"records":[%s],"token_estimate":40}' "$rows"
+STUB
 chmod +x "$memwork"/bin/reader-*
+
+# Stand-ins for the record tool, one per answer it can give. Each records the argv it was handed:
+# what goes on that line -- and what never does -- is the whole subject guarantee.
+emitter() { echo "$memwork/bin/emitter-$1"; }
+cat > "$(emitter ok)" <<'STUB'
+#!/usr/bin/env bash
+[ -n "${EMITTER_ARGS_FILE:-}" ] && printf '%s\n' "$*" >> "$EMITTER_ARGS_FILE"
+exit 0
+STUB
+# Exit 7 is a success: the sidecar holds the record and is still delivering it. A hook that read this
+# as a failure would report an outage every time one was ridden out.
+cat > "$(emitter spooled)" <<'STUB'
+#!/usr/bin/env bash
+[ -n "${EMITTER_ARGS_FILE:-}" ] && printf '%s\n' "$*" >> "$EMITTER_ARGS_FILE"
+echo "the sidecar holds this record and is still delivering it" >&2
+exit 7
+STUB
+cat > "$(emitter refused)" <<'STUB'
+#!/usr/bin/env bash
+[ -n "${EMITTER_ARGS_FILE:-}" ] && printf '%s\n' "$*" >> "$EMITTER_ARGS_FILE"
+echo "the service refused this record (400): action not declared" >&2
+exit 8
+STUB
+cat > "$(emitter slow)" <<'STUB'
+#!/usr/bin/env bash
+sleep 30
+STUB
+chmod +x "$memwork"/bin/emitter-*
 
 echo "→ the recall installer refuses a read tool that is not there"
 set +e
@@ -1118,12 +1175,22 @@ else:
     # an operator who can see the store says otherwise.
     if "digestDays" in entry.get("config", {}):
         problems.append("a session-opening digest was wired that nobody asked for")
+    # And recording, for a third reason again: an action a store never declared is a rejected write
+    # on every turn, and a recorder belonging to one agent signs another agent's turns as it.
+    for key in ("recordAction", "record"):
+        if key in entry.get("config", {}):
+            problems.append(f"turns were wired to be recorded that nobody asked for: {key}")
     budget = entry.get("config", {}).get("timeoutMs")
     host = entry.get("hooks", {}).get("timeouts", {}).get("before_prompt_build")
     if not isinstance(budget, int) or not isinstance(host, int):
         problems.append(f"the lookup is unbounded: plugin={budget!r} host={host!r}")
     elif host <= budget:
         problems.append("the host would time out first, and its message says only that a hook failed")
+    # Both of this plugin's hooks see a turn, which the harness classes as conversation access: a
+    # plugin it did not ship may register one only where this says so. Without it the hooks are
+    # refused at registration and the plugin loads, says nothing, and recalls nothing.
+    if entry.get("hooks", {}).get("allowConversationAccess") is not True:
+        problems.append("the hooks that see a turn are not granted, so the host refuses to register them")
 
 # Two things owning memory is worse than either. The slot disables the built-in backend; the recall
 # sub-agent is a separate plugin and has to be turned off by name.
@@ -1247,6 +1314,87 @@ grep -q '"actorMaxRecords": 0' "$memwork/plug/config-fragment.json" \
 "$ocmem" --config "$memconfig" --plugin-dir "$memwork/plug" --reader "$(reader records)" \
   --socket "$memwork/state/main.read.sock" --agent main >/dev/null
 
+echo "→ the recall installer refuses half a write path, and a recorder that is not there"
+# An action with no recorder writes nowhere and looks wired; recorders with no action would write an
+# action the store never declared, which is a rejected write on every turn rather than a quiet one.
+# And a recorder that is not on disk would be wired anyway and fail on every turn -- quietly enough
+# that a deployment could believe it had write coverage, which is the state this feature exists to end.
+for half in "--record-action answer" "--recorders main=$(emitter ok)"; do
+  set +e
+  # shellcheck disable=SC2086
+  "$ocmem" --config "$memconfig" --plugin-dir "$memwork/plug" --reader "$(reader records)" \
+    $half >/dev/null 2>&1
+  code=$?
+  set -e
+  [ "$code" -ne 0 ] || fail "the recall installer wired half a write path: $half"
+done
+for bad in "main=$memwork/bin/emitter-absent" "main=-x" "=$(emitter ok)" "main" \
+           "main=$(emitter ok),main=$(emitter ok)"; do
+  set +e
+  "$ocmem" --config "$memconfig" --plugin-dir "$memwork/plug" --reader "$(reader records)" \
+    --record-action answer --recorders "$bad" >/dev/null 2>&1
+  code=$?
+  set -e
+  [ "$code" -ne 0 ] || fail "the recall installer wired --recorders $bad"
+done
+# The two maps know their own keys, so a misspelling is refused here rather than ignored by the
+# plugin with nothing saying so.
+for bad in "channel=channel,verdict=v" "recalled=" "channel"; do
+  set +e
+  "$ocmem" --config "$memconfig" --plugin-dir "$memwork/plug" --reader "$(reader records)" \
+    --record-action answer --recorders "main=$(emitter ok)" --record-attrs "$bad" >/dev/null 2>&1
+  code=$?
+  set -e
+  [ "$code" -ne 0 ] || fail "the recall installer wired --record-attrs $bad"
+done
+set +e
+"$ocmem" --config "$memconfig" --plugin-dir "$memwork/plug" --reader "$(reader records)" \
+  --record-action answer --recorders "main=$(emitter ok)" --record-outcomes "outcome=x" >/dev/null 2>&1
+code=$?
+set -e
+[ "$code" -ne 0 ] || fail "the recall installer wired an outcome key the plugin does not know"
+
+echo "→ and the write path it does wire reaches the config as one piece"
+"$ocmem" --config "$memconfig" --plugin-dir "$memwork/plug" --reader "$(reader records)" \
+  --socket "$memwork/state/main.read.sock" --agent main --thread-kind chat_thread \
+  --record-action answer --recorders "main=$(emitter ok)" \
+  --record-outcomes 'success=success,failure=' --record-attrs 'channel=channel,recalled=recalled' \
+  >/dev/null
+python3 - "$memfragment" "$(emitter ok)" <<'RECCFG' || status=1
+import json, sys
+entry = json.load(open(sys.argv[1]))["plugins"]["entries"]["harness-memory"]
+config = entry["config"]
+problems = []
+if config.get("recordAction") != "answer":
+    problems.append(f"recordAction is {config.get('recordAction')!r}")
+# Keyed by agent id, valued by an argv: a record carries whatever caller its socket signed as, so
+# one recorder for every agent would file each agent's turns under whichever writer that one signs as.
+if config.get("record") != {"main": [sys.argv[2]]}:
+    problems.append(f"record is {config.get('record')!r}, not one argv per agent")
+# An empty spelling is a deployment saying its action has no word for that outcome, so those turns
+# are not recorded at all. It has to survive as an empty string: dropped, it would read as "use the
+# default", which files a failed turn under a word the store refuses.
+if config.get("recordOutcomes") != {"success": "success", "failure": ""}:
+    problems.append(f"recordOutcomes is {config.get('recordOutcomes')!r}")
+if config.get("recordAttrs") != {"channel": "channel", "recalled": "recalled"}:
+    problems.append(f"recordAttrs is {config.get('recordAttrs')!r}")
+# Bounded twice over, like the lookup, and for the same reason: the answer that lands should name the
+# recorder rather than say only that a hook failed.
+budget = config.get("recordTimeoutMs")
+host = entry.get("hooks", {}).get("timeouts", {}).get("agent_end")
+if not isinstance(budget, int) or not isinstance(host, int):
+    problems.append(f"the record write is unbounded: plugin={budget!r} host={host!r}")
+elif host <= budget:
+    problems.append("the host would time out the record write first")
+for problem in problems:
+    print(f"::error::generated fragment: {problem}")
+sys.exit(1 if problems else 0)
+RECCFG
+
+# Put the fragment back to what the rest of this section asserts about.
+"$ocmem" --config "$memconfig" --plugin-dir "$memwork/plug" --reader "$(reader records)" \
+  --socket "$memwork/state/main.read.sock" --agent main >/dev/null
+
 echo "→ a second run changes nothing"
 memdigest="$(cat "$memfragment" "$memwork/plug/index.mjs" | cksum)"
 "$ocmem" --config "$memconfig" --plugin-dir "$memwork/plug" --reader "$(reader records)" \
@@ -1287,7 +1435,9 @@ const mod = await import(modulePath);
 const { recall, renderContext, injectionFrom, report, bounds, actorFor, actorPlan, turnOf, threadOf, HEADING,
         MAX_INFER_CHARS, needleFrom, searchArgv, SEARCH_SHAPE, SEARCH_HEADING, READ_SHAPE,
         actorAllowance, withoutActor, actorWriterIn, DEFAULT_ACTOR_MAX_RECORDS,
-        claimOpening, DIGEST_HEADING, SEEN_SESSIONS } = mod;
+        claimOpening, DIGEST_HEADING, SEEN_SESSIONS,
+        TRUNCATED_NOTE, DIGEST_TRUNCATED_NOTE, OVER_READ,
+        recordTurn, reportRecord, unwritable, alreadyRecorded, RECORD_SUMMARY } = mod;
 
 const problems = [];
 const reader = (name, ...rest) => [`${binDir}/reader-${name}`, "bundle", ...rest];
@@ -1900,11 +2050,23 @@ if (!/Record structure only/.test(block)) problems.push("the digest did not say 
 if (!/records have bodies, and by design no read here returns one/.test(block)) {
   problems.push(`the digest misdescribed the limit as an empty store: ${block.slice(0, 200)}`);
 }
+// A digest cut by its row cap, and one cut by its character ceiling. The two are separate sentences
+// because they are separate cuts with separate fixes: raising `digestMaxChars` does nothing about a
+// window the read never returned, and a reader who cannot tell them apart raises the wrong one.
 SEEN_SESSIONS.clear();
 const cappedDigest = injectionFrom(
   (await spawned({ ...digested, digestMaxRecords: 1, read: reader("digest") }, digestTurn("s-capped", []))).outcome,
 ).prependContext;
-if (!/1 further record/.test(cappedDigest)) problems.push(`a capped digest did not say what it left out: ${cappedDigest}`);
+if (!cappedDigest.includes(DIGEST_TRUNCATED_NOTE)) {
+  problems.push(`a digest cut by its row cap did not say the window held more: ${cappedDigest}`);
+}
+SEEN_SESSIONS.clear();
+const squeezedDigest = injectionFrom(
+  (await spawned({ ...digested, digestMaxChars: 110, read: reader("digest") }, digestTurn("s-squeezed", []))).outcome,
+).prependContext;
+if (!/1 further record/.test(squeezedDigest)) {
+  problems.push(`a digest cut by its character ceiling did not say what it left out: ${squeezedDigest}`);
+}
 
 // **The window read is bounded as a window read.** Both bounds or neither -- the reader refuses one
 // alone on the grounds that it asks a different question -- and none of the bundle's own flags, which
@@ -1927,6 +2089,215 @@ else {
     problems.push(`the window was not the configured 14 days: ${window}`);
   }
 }
+
+// --- a page at the read's limit says it is a page -------------------------------------------------
+// The `bundle` read reports its own cap: the service reads one row past the limit and says
+// `degraded` with the overflow in `omitted`. `search` and `records` do neither -- they hand back a
+// page, no total and no flag -- so a page exactly as long as the limit reads as the whole answer.
+//
+// Measured on the live deployment before this existed: of 116 recall lines, 98 reported exactly
+// `maxRecords` records and all 33 digests reported exactly `digestMaxRecords`; three needles that
+// returned 8 rows at `--limit 8` returned 14, 22 and 21 at `--limit 100`, and the digest's own
+// window held 23 rows for the 12 it asked for. Every one of those pages was cut and none said so.
+const cutSettings = {
+  read: reader("over"), maxRecords: 3, maxChars: 8192,
+  digestDays: 14, digestMaxRecords: 4, digestMaxChars: 8192,
+};
+const cutArgs = `${binDir}/../cut-args`;
+process.env.READER_ARGS_FILE = cutArgs;
+const cut = await recall(cutSettings, { agentId: "main", text: "what did the loader decide", opening: true });
+delete process.env.READER_ARGS_FILE;
+const cutReads = (await import("node:fs")).readFileSync(cutArgs, "utf8").trim().split("\n");
+const cutBlock = injectionFrom(cut)?.prependContext ?? "";
+
+if (cut.kind !== "recalled" || cut.via !== SEARCH_SHAPE) {
+  problems.push(`the full-page reader did not answer via search: ${JSON.stringify(cut)}`);
+}
+if (!cutBlock.includes(TRUNCATED_NOTE)) problems.push(`a page at the read's limit did not say it was a page: ${cutBlock}`);
+if (!cutBlock.includes(DIGEST_TRUNCATED_NOTE)) problems.push(`a digest at its limit did not say the window held more: ${cutBlock}`);
+
+// --- the over-read row is evidence, never content -------------------------------------------------
+// The extra row buys a sentence, not a bigger page. Rendering it would spend the tokens the whole
+// choice was made to avoid, and would put the page one row over the ceiling an operator configured.
+if (cut.count !== 3) problems.push(`the over-read row was counted into the answer: ${cut.count}`);
+if ((cutBlock.match(/^- at=/gm) ?? []).length !== 3) {
+  problems.push(`the over-read row was rendered: ${cutBlock}`);
+}
+if (cut.digestCount !== 4) problems.push(`the digest's over-read row was counted: ${cut.digestCount}`);
+{
+  const searchRead = cutReads.find((line) => line.startsWith("search "));
+  const windowRead = cutReads.find((line) => line.startsWith("records "));
+  if (!searchRead?.includes(`--limit ${3 + OVER_READ}`)) {
+    problems.push(`the search read asked for only the page it would show: ${searchRead}`);
+  }
+  if (!windowRead?.includes(`--limit ${4 + OVER_READ}`)) {
+    problems.push(`the window read asked for only the page it would show: ${windowRead}`);
+  }
+}
+
+// --- a page under the limit claims nothing --------------------------------------------------------
+// The sentence has to be a fact about the read rather than a guess from the page's size, or it fires
+// on every turn and stops being read -- the failure `background-degrades-the-answer` guards against
+// one source over.
+const uncut = await recall({ ...digested, read: reader("fallback"), maxRecords: 8 }, digestTurn("s-uncut", []));
+const uncutBlock = injectionFrom(uncut)?.prependContext ?? "";
+if (uncutBlock.includes(TRUNCATED_NOTE)) problems.push(`a short page claimed it was cut: ${uncutBlock}`);
+if (uncutBlock.includes(DIGEST_TRUNCATED_NOTE)) problems.push(`a short digest claimed the window held more: ${uncutBlock}`);
+
+// --- recording is a hook, and what it may say ------------------------------------------------------
+// `agent_end` fires after a turn is settled and returns nothing: there is no field on its result that
+// could change what the turn said. What it *knows* is that a turn ran, which agent ran it, which
+// conversation it ran in and whether it finished -- so that is what it records, and nothing else.
+const emitter = (name) => [`${binDir}/emitter-${name}`, "--socket", "/dev/null", "--agent", "some_bot"];
+const recordWired = {
+  recordAction: "answer",
+  recordOutcomes: { success: "success", failure: "partial" },
+  recordAttrs: { channel: "channel", recalled: "recalled" },
+  threadEntity: "chat_thread",
+  record: { main: emitter("ok") },
+};
+const wrote = async (settings, event, ctx, facts) => {
+  const file = `${binDir}/../emit-args-${Math.random().toString(36).slice(2)}`;
+  process.env.EMITTER_ARGS_FILE = file;
+  const log = recorder();
+  const outcome = await recordTurn(settings, event, ctx, facts ?? {});
+  reportRecord(outcome, log);
+  delete process.env.EMITTER_ARGS_FILE;
+  const fs = await import("node:fs");
+  const lines = fs.existsSync(file) ? fs.readFileSync(file, "utf8").trim() : "";
+  return { outcome, log, argv: lines ? lines.split("\n") : [] };
+};
+const turnCtx = {
+  agentId: "main", runId: "run-1", channelId: "c0example:thread:1700000000.000100",
+  sessionKey: "s-record",
+};
+// A distinctive token in everything the turn said. It must appear nowhere on the record's line: the
+// turn's text is the only thing in the event that could name a person, and it is never read into a
+// record. That is what makes `subjects:` empty by construction rather than by care.
+const SECRET = "zqx-turn-text-marker";
+const turnEvent = {
+  runId: "run-1", success: true, durationMs: 1234,
+  messages: [{ role: "user", content: SECRET }, { role: "assistant", content: `about ${SECRET}` }],
+};
+
+const recorded = await wrote(recordWired, turnEvent, turnCtx, { channel: "c0example", recalled: true });
+if (recorded.outcome.kind !== "wrote") problems.push(`a finished turn was not recorded: ${JSON.stringify(recorded.outcome)}`);
+if (recorded.argv.length !== 1) problems.push(`a turn produced ${recorded.argv.length} records, not one`);
+{
+  const line = recorded.argv[0] ?? "";
+  for (const expected of ["--action answer", "--outcome success", "--entity=chat_thread:c0example/1700000000.000100",
+                          "--attr=channel=c0example", "--attr-bool=recalled=true"]) {
+    if (!line.includes(expected)) problems.push(`the record did not carry ${expected}: ${line}`);
+  }
+  if (!line.includes(RECORD_SUMMARY)) problems.push(`the record did not carry the fixed summary: ${line}`);
+  if (line.includes(SECRET)) problems.push("the turn's own text reached the record");
+  for (const forbidden of ["--subject", "--data-class", "--infer-entities", "--infer-from", "--backfilled"]) {
+    if (line.includes(forbidden)) problems.push(`the record's line carried ${forbidden}: ${line}`);
+  }
+}
+
+// --- the hook's record is the complement of the agent's, not a duplicate ---------------------------
+// A turn that ran the recorder already has a row that names the action and says why it mattered. A
+// floor beside it would be a second row about one event carrying less, so the hook stands down --
+// and it asks the question structurally, by looking for the name of the recorder it would have run.
+const suppressed = await wrote(recordWired, {
+  ...turnEvent,
+  messages: [{
+    role: "assistant",
+    toolCalls: [{ input: { command: "emitter-ok --action answer --outcome success --summary x" } }],
+  }],
+}, turnCtx, {});
+if (suppressed.outcome.kind !== "recorded-already") {
+  problems.push(`the hook wrote a second row for a turn that recorded itself: ${JSON.stringify(suppressed.outcome)}`);
+}
+if (suppressed.argv.length !== 0) problems.push("the hook spawned a recorder for a turn that had already recorded");
+if (alreadyRecorded([{ text: "nothing to do with it" }], "emitter-ok") !== false) {
+  problems.push("an unrelated turn was read as having recorded itself");
+}
+
+// --- a mention of the recorder is not a use of it ---------------------------------------------------
+// **This narrowing is the difference between a feature and a feature that looks wired.** The name of
+// the recorder is in the instruction that tells an agent to use it, and in whatever documents a turn
+// reads. A scan matching the bare name would stand down on every turn wherever that text reaches the
+// message array -- recording nothing, and saying once per turn that it had nothing to add. So a
+// string has to carry the name *and* both flags the emitter cannot write a record without.
+for (const [label, said] of [
+  ["the instruction that names it", "record what you did by running emitter-ok afterwards"],
+  ["the wrapper's own text read out of a file", "#!/bin/sh\nexec /opt/yaam-emit --socket /x --agent a"],
+  ["flags belonging to something else", "some-other-tool --action build --outcome ok"],
+]) {
+  if (alreadyRecorded([{ role: "user", content: said }], "emitter-ok") !== false) {
+    problems.push(`${label} was read as the recorder having been run`);
+  }
+}
+// And the parts must add up inside one string: a command line is one string, and letting them come
+// from anywhere in a turn is how a document plus an unrelated flag becomes a recorder nobody ran.
+if (alreadyRecorded([{ a: "mentions emitter-ok" }, { b: "--action x" }, { c: "--outcome y" }], "emitter-ok") !== false) {
+  problems.push("three unrelated strings between them were read as one invocation");
+}
+
+// --- a hook must not degrade a turn ----------------------------------------------------------------
+// Recall fails open because a memory service that is down must not be a turn that will not start.
+// Recording fails open for the mirror reason: a store that is unreachable must not be a turn that
+// will not finish. Every one of these resolves, none of them throws, and each says which happened.
+for (const [label, settings, expected] of [
+  ["a recorder that is not there", { ...recordWired, record: { main: [`${binDir}/emitter-absent`] } }, "failed"],
+  ["a refused record", { ...recordWired, record: { main: emitter("refused") } }, "failed"],
+  ["a recorder that never answered", { ...recordWired, record: { main: emitter("slow") }, recordTimeoutMs: 200 }, "failed"],
+]) {
+  const attempt = await wrote(settings, turnEvent, turnCtx, {});
+  if (attempt.outcome.kind !== expected) problems.push(`${label} gave ${attempt.outcome.kind}, not ${expected}`);
+  if (!attempt.outcome.why) problems.push(`${label} gave no reason`);
+  if (!/could not be recorded/.test(said(attempt.log, "warn"))) problems.push(`${label} was not reported`);
+}
+// And the spool, which is the one exit code that looks like a failure and is not.
+const spooled = await wrote({ ...recordWired, record: { main: emitter("spooled") } }, turnEvent, turnCtx, {});
+if (spooled.outcome.kind !== "wrote") problems.push(`a spooled record was read as a failure: ${JSON.stringify(spooled.outcome)}`);
+if (said(spooled.log, "warn")) problems.push(`a spooled record warned: ${said(spooled.log, "warn")}`);
+
+// --- nothing may reach the line that this file did not put there ------------------------------------
+// An allowlist and not a deny list: the emitter has no flag for a subject or a data class today, and
+// refusing every flag this file has not reasoned about is what keeps that true of a flag it grows
+// tomorrow. A refused argv records nothing and names what it refused.
+for (const smuggled of ["--subjects", "--data-class", "--infer-entities", "--summary", "-x"]) {
+  const why = unwritable([`${binDir}/emitter-ok`, smuggled, "whatever"]);
+  if (!why || !why.includes(smuggled)) problems.push(`a recorder argv carrying ${smuggled} was accepted: ${why}`);
+  const attempt = await wrote({ ...recordWired, record: { main: [`${binDir}/emitter-ok`, smuggled, "x"] } }, turnEvent, turnCtx, {});
+  if (attempt.outcome.kind !== "refused") problems.push(`${smuggled} in the argv still recorded: ${attempt.outcome.kind}`);
+  if (attempt.argv.length !== 0) problems.push(`${smuggled} in the argv reached a process`);
+}
+if (unwritable([`${binDir}/emitter-ok`, "--socket", "/tmp/x", "--agent", "a"])) {
+  problems.push("the flags that say who is writing were refused");
+}
+
+// --- a turn nobody named an outcome for is declined, not filed as a success -------------------------
+// A store refuses a record whose action does not declare the outcome it carries, and this file has
+// never seen that declaration. Filing a failed turn as a success because the schema had no word for
+// failure is the default the emitter itself refuses to have.
+const failedTurn = await wrote(recordWired, { ...turnEvent, success: false }, turnCtx, {});
+if (!(failedTurn.argv[0] ?? "").includes("--outcome partial")) {
+  problems.push(`a failed turn was not filed under the outcome the config named: ${failedTurn.argv[0]}`);
+}
+const undeclared = await wrote({ ...recordWired, recordOutcomes: { success: "success", failure: "" } },
+  { ...turnEvent, success: false }, turnCtx, {});
+if (undeclared.outcome.kind !== "undeclared") problems.push(`a turn with no declared outcome gave ${undeclared.outcome.kind}`);
+if (undeclared.argv.length !== 0) problems.push("a turn with no declared outcome was recorded anyway");
+
+// --- and the three ways recording is off ------------------------------------------------------------
+for (const [label, settings, expected] of [
+  ["no action configured", { ...recordWired, recordAction: undefined }, "off"],
+  ["no recorder for this agent", { ...recordWired, record: { other: emitter("ok") } }, "unmapped"],
+  ["no recorders at all", { ...recordWired, record: undefined }, "off"],
+]) {
+  const attempt = await wrote(settings, turnEvent, turnCtx, {});
+  if (attempt.outcome.kind !== expected) problems.push(`${label} gave ${attempt.outcome.kind}, not ${expected}`);
+  if (attempt.argv.length !== 0) problems.push(`${label} spawned a recorder anyway`);
+}
+// A heartbeat is the host talking to itself on a timer. A floor record per tick is a clock in the
+// store rather than work, and it would crowd out the rows an answer is composed from.
+const tick = await wrote(recordWired, turnEvent, { ...turnCtx, trigger: "heartbeat" }, {});
+if (tick.outcome.kind !== "skipped") problems.push(`a heartbeat turn gave ${tick.outcome.kind}`);
+if (tick.argv.length !== 0) problems.push("a heartbeat turn was recorded");
 
 for (const problem of problems) console.log(`::error::openclaw recall: ${problem}`);
 process.exit(problems.length ? 1 : 0);
@@ -1964,7 +2335,7 @@ garbage and no answer; and an empty match reads differently"
   # The fallback presenting a ranked keyword hit as a composed bundle: the provenance the second
   # heading exists to keep. This is the mutant that matters most about the fallback -- everything
   # else it could get wrong is visible, and this one reads as a better answer than it is.
-  mutate search-as-bundle 's/return composed(second, limits, SEARCH_HEADING, { asked: named, via: SEARCH_SHAPE, actor });/return composed(second, limits, HEADING, { asked: named, via: READ_SHAPE, actor });/'
+  mutate search-as-bundle 's/limits, SEARCH_HEADING, { asked: named, via: SEARCH_SHAPE, actor });/limits, HEADING, { asked: named, via: READ_SHAPE, actor });/'
   # A needle that keeps the question mark: the syntax error that made the first version useless.
   mutate needle-unquoted 's/terms.push(`"${word}"`);/terms.push(word);/'
   # The host's envelope left on the front of the message. This is the defect the numbers above came
@@ -2083,6 +2454,64 @@ garbage and no answer; and an empty match reads differently"
   # blunt: it talks an agent out of naming the record whose body it could have asked for.
   mutate digest-denies-the-bodies \
     's|was about: records have " +|was about, and this " +|; s|"bodies, and by design no read here returns one.";|"store holds no prose that could.";|'
+
+  # --- a page at the read's limit says it is a page ---
+  # The two reads with no cap of their own. `bundle` reports its overflow as `degraded`; `search` and
+  # `records` report nothing at all, so a page the size of the limit reads as the whole answer. On
+  # the live deployment 98 of 116 recall lines and every one of 33 digests were exactly at their cap.
+  mutate page-not-over-read 's|return String(maxRecords + OVER_READ);|return String(maxRecords);|'
+  # And the digest's own answer left uncut, which is the same claim reached from the other end: the
+  # window read was the one at its cap on every single turn it fired.
+  mutate digest-page-uncut \
+    's|const window = page(answer, plan.limits.maxRecords);|const window = { ...answer, truncated: false };|'
+  # The over-read row rendered instead of counted: the sentence bought with tokens the choice was
+  # made to avoid, and a page one row past the ceiling an operator set.
+  mutate over-read-row-shown 's|records: records.slice(0, most), truncated: records.length > most|records, truncated: records.length > most|'
+  # The fact known and not said, which is the same failure as `background-unlabelled` one source over.
+  mutate search-cut-unlabelled 's|if (answer?.truncated === true) notes.push(TRUNCATED_NOTE);|if (false) notes.push(TRUNCATED_NOTE);|'
+  mutate digest-cut-unlabelled 's|if (answer?.truncated === true) notes.push(DIGEST_TRUNCATED_NOTE);|if (false) notes.push(DIGEST_TRUNCATED_NOTE);|'
+  # A page called cut because it is full. The sentence has to be a fact about the read rather than a
+  # guess from the page's size, or it fires on every turn and stops being read.
+  mutate cut-guessed-from-the-page 's|truncated: records.length > most|truncated: records.length >= most|'
+
+  # --- recording is a hook, and it may not read the turn ---
+  # **The subject guarantee, seen from the one place it could break.** The turn's text is the only
+  # thing in the event that could name a person; nothing may carry it into a record. A summary built
+  # from the message would be plaintext in a body no erasure reaches.
+  mutate record-reads-the-message \
+    's|    RECORD_SUMMARY,|    RECORD_SUMMARY + JSON.stringify(event?.messages ?? ""),|; s|function recordArgs(settings, argv, action, outcome, facts, thread)|function recordArgs(settings, argv, action, outcome, facts, thread, event)|; s|recordArgs(settings, argv, action, outcome, facts, thread ? `${kind}:${thread}` : undefined)|recordArgs(settings, argv, action, outcome, facts, thread ? `${kind}:${thread}` : undefined, event)|'
+  # The allowlist turned into a pass. It is what keeps a flag the emitter has not grown yet off this
+  # line, so a deny list -- or none -- is the shape that ships the hole.
+  mutate record-any-flag-allowed 's|if (!RECORD_ALLOWED_FLAGS.has(flag)) {|if (false) {|'
+  # Two rows for one event: the hook writing a floor beside the agent's own richer record.
+  mutate record-ignores-suppression 's|if (alreadyRecorded(event?.messages, probe))|if (false)|'
+  # And the other way to get suppression wrong, which is the worse of the two: a scan matching the
+  # bare name stands down wherever the instruction naming the recorder reaches the message array. The
+  # feature then looks wired, records nothing, and says once per turn that it had nothing to add.
+  mutate record-mention-suppresses \
+    's|return value.includes(needle) \&\& RECORD_REQUIRED_FLAGS.every((flag) => value.includes(flag));|return value.includes(needle);|'
+  # And the parts counted across strings rather than within one.
+  mutate record-invocation-split-across-strings \
+    's|budget.left -= value.length;|budget.left -= value.length; if (value.includes(needle)) return true;|'
+  # The spool read as an outage. Exit 7 is the sidecar holding a record and still delivering it, so
+  # this reports a failure every time one is ridden out -- and the record lands anyway.
+  mutate record-spool-is-a-failure 's|code === 0 \|\| code === SPOOLED_EXIT|code === 0|'
+  # A failed turn filed as a success because the outcome map had no word for it. The emitter refuses
+  # to default an outcome for exactly this reason: no later read could tell.
+  mutate record-failure-as-success 's|const key = success ? "success" : "failure";|const key = "success";|'
+  # A heartbeat recorded: a clock in the store rather than work, on every tick, crowding out the rows
+  # an answer is composed from.
+  mutate record-heartbeat-recorded 's|if (SKIPPED_TRIGGERS.has(ctx?.trigger))|if (false)|'
+  # An agent the map does not name recorded anyway. A record carries whatever caller its socket
+  # signed as, so a recorder borrowed from another agent files this turn under the wrong writer.
+  mutate record-unmapped-agent-recorded \
+    's|if (argv === undefined) return { kind: "unmapped", agentId };|if (argv === undefined) argv = Object.values(settings.record)[0];|'
+  # A write failure that reaches the turn. `agent_end` is not awaited by the gateway and its handlers
+  # are caught, so this cannot in fact break a turn -- but a handler that rejects is a handler whose
+  # own report never runs, and the operator loses the one line saying coverage broke.
+  mutate record-throws-on-failure \
+    's|      failed(`the recorder could not be started: \${error?.message ?? error}`);|      throw error;|'
+
   [ "$survived" -eq 0 ] || fail "the fail-open path is asserted rather than exercised"
 else
   fail "node is not installed, so the recall plugin's outcome path went untested"

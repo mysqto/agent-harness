@@ -145,10 +145,11 @@ longer is the missing half of the shell — on 2026.8.1 it would be a second gat
 question — check it rather than assume it, the same way a load path pointing at nothing is worth
 checking.
 
-## The write path needs nothing new
+## The write path: an instruction, and a hook under it
 
-Agents record what they did by running `yaam-emit` through the exec tool. Two settings the policy has
-no opinion on, so the installer prints them rather than emitting them:
+Agents record what they did by running `yaam-emit` through the exec tool. That part needs nothing
+new. Two settings the policy has no opinion on, so the installer prints them rather than emitting
+them:
 
 ```sh
 openclaw approvals allowlist add --agent main "$HOME/.local/bin/yaam-emit"
@@ -159,6 +160,98 @@ openclaw config set env.vars.YAAM_AGENT  "main"
 The socket in the environment rather than on the command line is deliberate: an allowlist pattern
 that had to match a socket path would break the first time the path changed.
 
+### An instructed write path records what the agent remembers to record
+
+Observed on the deployment this was built for: an agent answered a question out of memory and wrote
+nothing. Not blocked, not refused — spool, staging, quarantine and dead-letter all zero, no guard
+refusal, recall fired normally — two and a half hours after following the same instruction correctly.
+It simply skipped, and nothing in the system could tell that apart from a turn with nothing worth
+recording.
+
+So there is a hook under the instruction now, on `agent_end`. It is the only hook in this harness
+that fires after a turn is settled *and* is handed the run: `success`, `error` and `durationMs` on
+the event, and the agent, the session and the conversation on the context. Its handler returns
+nothing, so there is no field on its result that could change what the turn said. Three neighbours
+were ruled out: `before_agent_finalize` can send the turn round again, which is a recorder that can
+loop a conversation; `after_tool_call` fires per tool rather than per turn; `session_end` is one
+event for many turns.
+
+**What a hook can honestly record is not what an agent can, and that difference is the design.** An
+agent knows the action, the outcome, which entities it touched and why they mattered. A hook knows
+that a turn ran, which agent ran it, which conversation it ran in, and whether it finished. Those are
+different records, not a thin version of one. So the hook writes a *floor*: the lowest-fidelity true
+thing, and the body is a fixed sentence saying so. It never reads the turn's prose.
+
+| What goes on the line | Where it comes from |
+|---|---|
+| `--action` | config. A store refuses an action it never declared, so this cannot be invented here |
+| `--outcome` | config, mapped from the one bit the hook has: the turn finished, or it did not |
+| `--summary` | a constant in the plugin. Never the message, and no branch can make it one |
+| `--attr` ×0–2 | the conversation, and whether recall contributed. Keys are the deployment's |
+| `--entity` ×0–1 | the conversation, by the same `threadOf` recall uses, from the same host field |
+
+### Duplication: the hook's row is the complement of the agent's
+
+If the agent records and the hook records too, one event gets two rows. The decision is that it does
+not: the hook stands down when it finds, in the turn's own messages, the name of **the recorder it
+would itself have run**. One name and two uses — the program the hook spawns is the program the agent
+was told to run — so there is no second thing to keep in step with the first, and the question is
+structural rather than hopeful.
+
+A turn that recorded has a row naming what it did; a turn that did not gets a row saying it happened.
+Both ways of being wrong are survivable, and the asymmetry is why this shape was chosen over a
+reserved action name — which the store could not have given us anyway, since every action has to be
+one the deployment declared:
+
+- **A miss** — the agent recorded, the hook did not see it — costs one extra floor row.
+- **A false positive** — the name appeared, the agent recorded nothing — costs the floor row, which
+  is exactly the state this replaces. It cannot be worse than the instruction it is for.
+
+So an unreadable, unfamiliar or oversized message array writes the row. Failing toward recording is
+the point of the change.
+
+### Recording fails open, and it is the mirror of recall
+
+Recall fails open because a memory service that is down must not be a turn that will not start.
+Recording fails open for the mirror reason: a store that cannot be written must not be a turn that
+will not finish. A recording hook that broke turns would be strictly *worse* than the instruction it
+replaces — an ignored instruction costs one missing record, and a broken hook costs the deployment.
+
+Three things make that true rather than intended:
+
+- **The host already contains it.** `agent_end` is dispatched after the turn is settled and the
+  gateway does not await it; every handler is timed out, and a rejection is caught and logged. A
+  handler that threw or hung could not fail a turn or delay a reply.
+- **The plugin does not lean on that.** Every path resolves, nothing throws, and the child is bounded
+  by a budget of the plugin's own that is shorter than the host's — so the line an operator reads
+  names the recorder rather than saying only that a hook failed.
+- **A store outage is not a lost record.** The emitter writes to the sidecar, which spools; its exit
+  code 7 means the record is held and still being delivered, and is read here as a success. So there
+  is no retry to get wrong, and nothing is held between turns.
+
+A heartbeat turn is not recorded. A heartbeat is the host talking to itself on a timer, and a floor
+record per tick is a clock in the store rather than an account of work — on a store where every read
+is already at its cap, that is not free. A cron turn *is* recorded: scheduled work is work.
+
+### Nothing here may write a non-empty `subjects:`
+
+Three layers, and the innermost does not depend on the plugin being right.
+
+1. **The emitter has no flag for it.** Subjects stay empty and the data class stays `internal`, fixed
+   rather than defaulted, because the secret a pseudonym is derived under lives with the service — a
+   subject named on that command line could only be a value invented on a host holding no key
+   material. There is no argument that could express one.
+2. **The plugin builds the whole line.** The only operator input is the argv prefix, and that is
+   checked against an **allowlist** — `--socket`, `--agent`, `--agent-ver`, `--redaction-policy`,
+   `--timeout-ms` and nothing else. An allowlist rather than a deny list precisely so that a flag the
+   emitter grows tomorrow is refused today; a deny list has to be extended on the day the risk
+   appears. `--infer-entities`, the one flag that turns prose into references, is refused by it rather
+   than merely unused.
+3. **No turn text reaches the record.** The summary is a constant, the attributes are an identifier
+   and a boolean, and the entity is a conversation id. The messages are read exactly once, to answer
+   one yes/no question, and are never copied. Prose is the only thing in the event that could name a
+   person — so there would be nothing to resolve even if the store later grew a resolver.
+
 ## The read path: a plugin that owns the memory slot
 
 Recall is wired, by a second plugin and a second installer:
@@ -166,7 +259,9 @@ Recall is wired, by a second plugin and a second installer:
 ```sh
 harnesses/openclaw/install-memory.sh --config ~/.openclaw/openclaw.json --agent main \
   --thread-kind chat_thread --spec-dir /srv/memory/spec \
-  --actors main=main_bot,pr=pr_bot,deploy=deploy_bot --actor-rows 2 --digest-days 14
+  --actors main=main_bot,pr=pr_bot,deploy=deploy_bot --actor-rows 2 --digest-days 14 \
+  --record-action answer --recorders main=/usr/local/bin/record-main \
+  --record-attrs channel=channel,recalled=recalled
 ```
 
 The middle three are what let a bundle name the turn at all; see *[What a turn can say about
@@ -177,6 +272,12 @@ about the turn at all; see *[The session-opening
 digest](#the-session-opening-digest-and-why-it-is-third)*. The four lookups are optional and all four
 are off by default — the plugin says at load which of them is unwired. The allowance is not: it has a
 default because it bounds a source rather than adding one, and a bound with no default is no bound.
+
+The last two are the write half, and they travel together or not at all: an action with no recorder
+writes nowhere, and a recorder with no action would write an action the store never declared, which
+is a rejected write on every turn rather than a quiet one. Both are refused by the installer. See
+*[An instructed write path records what the agent remembers to
+record](#an-instructed-write-path-records-what-the-agent-remembers-to-record)*.
 
 Separate from `install.sh` because it is separate work. Everything that script emits is generated from
 `spec/tool-policy.json`; recall is not a tool rule, and a policy generator emitting memory settings
@@ -190,13 +291,20 @@ would put a decision the policy has no opinion on into output the policy owns.
     "entries": {
       "harness-memory": {
         "enabled": true,
-        "hooks": { "timeouts": { "before_prompt_build": 10000 } },
+        "hooks": {
+          "timeouts": { "before_prompt_build": 10000, "agent_end": 20000 },
+          "allowConversationAccess": true
+        },
         "config": {
           "read": ["…/yaam-read", "bundle", "--socket", "…/main.read.sock"],
           "threadEntity": "chat_thread", "specDir": "/srv/memory/spec",
           "actors": { "main": "main_bot", "pr": "pr_bot", "deploy": "deploy_bot" },
           "actorMaxRecords": 2,
           "digestDays": 14, "digestMaxRecords": 12, "digestMaxChars": 1200,
+          "recordAction": "answer",
+          "record": { "main": ["…/record-main"] },
+          "recordAttrs": { "channel": "channel", "recalled": "recalled" },
+          "recordTimeoutMs": 10000,
           "timeoutMs": 5000, "maxRecords": 8, "maxChars": 2000
         }
       },
@@ -217,15 +325,21 @@ Three things it is *not*, each of which was worth ruling out:
 
 - **`before_agent_start`** takes the same fields and is deprecated in favour of this one, with a
   runtime warning naming the replacement.
-- **`llm_input`** sees the assembled prompt and is a *conversation* hook, which a plugin that did not
-  ship with the harness may not register at all unless the config says
-  `hooks.allowConversationAccess=true`. `before_prompt_build` is not on that list, so this needs no
-  such grant.
+- **`llm_input`** sees the assembled prompt and adds nothing this does not already have.
 - **`heartbeat_prompt_contribution`** contributes to an unprompted turn, not a reply to a person.
 
 `hooks.allowPromptInjection=false` on this plugin's entry silences it — the hook is refused at
 registration with a diagnostic naming the setting. That is the off switch, and it is louder than
 deleting the entry.
+
+**And it needs a grant, which this file used to say it did not.** Every hook that sees a turn is
+*conversation access* in this harness's terms, and a plugin the harness did not ship may register one
+only where `plugins.entries.<id>.hooks.allowConversationAccess=true`. Read off the runtime's own hook
+table at 2026.9.3, `before_prompt_build` is on that list along with `agent_end`, `llm_input`,
+`before_agent_finalize` and four others — so both of this plugin's hooks need it and the installer
+emits it. Without it the plugin loads, warns once per hook naming this setting, and then quietly does
+nothing at all. Which is the argument for reading the runtime rather than the schema: the schema said
+otherwise, and so did this paragraph.
 
 ### Owning the slot is what stops there being two memories
 
@@ -308,6 +422,12 @@ long, and the host's timeout says only that a hook failed. So:
 Nested so the most specific answer available is the one that lands. A bound already named in the
 configured argv is left alone: it was chosen for a reason this plugin cannot see.
 
+The record write is nested the same way and is looser on purpose — `recordTimeoutMs`, default 10 s,
+with `hooks.timeouts.agent_end` at twice that. It runs *behind* the reply rather than in front of it,
+so a generous bound costs a conversation nothing. The host's own default there is 30 s, which is also
+fine and is not what lands: the plugin's shorter bound is, so the line an operator reads names the
+recorder.
+
 ### Why `bundle`, and not `search` or `records`
 
 `bundle` is the read that exists for this: it composes context for one request out of an actor's
@@ -338,6 +458,43 @@ was too strong, and `search` now runs as a *fallback* — see below. What stands
 
 A partial bundle is rendered as partial, and a capped list says how many rows it left out. A short
 list that reads as the whole truth is a list the model will act on.
+
+### A page at the read's limit is not an answer
+
+Which is a claim only one of the three reads could make, and for a while nothing said it.
+
+`bundle` can: the service reads one row past the cap it was given, hands back the cap, and reports
+the overflow — `degraded` set and `omitted` naming the source and the count. That is the whole
+mechanism behind `background.more`, where "there is more of this actor's history" is a fact rather
+than a guess. `search` and `records` do neither. They return a page: no total, no flag, no cursor.
+So a page exactly as long as `--limit` is indistinguishable from the whole answer, and the block
+around it said nothing.
+
+Measured on the deployment this was written for, before the fix:
+
+| | Observed | Asked again, wider |
+|---|---|---|
+| recall lines at exactly `maxRecords` | 98 of 116 | — |
+| digests at exactly `digestMaxRecords` | 33 of 33 | — |
+| three needles at `--limit 8` | 8, 8, 8 | 14, 22, 21 at `--limit 100` |
+| the digest's own 14-day window at `--limit 12` | 12 | 23 at `--limit 200` |
+
+So: truncating, nearly always, silently. Both fixed reads now ask for **one row more than they will
+show**, and whether that row arrives is the evidence. It is dropped rather than rendered — the
+over-read buys a sentence, not a bigger page — and the sentence is a boundary rather than a hole,
+said separately from the `degraded` one that ends "not safe to act on". A cut page's rows are true;
+there are simply more of them.
+
+**Raising the cap was the other option and the measurement is what ruled it out.** A higher cap is
+hit silently too. It costs its extra rows on every turn, in front of a reply that already spends
+around eleven hundred tokens on recall. And the reader's own help says a short page is not proof that
+nothing else matched, whatever the limit — the matches examined are capped before the caller's scope
+is applied, which is why `--limit 100` above still returned 14 rather than the whole store. Two more
+rows of a cut view is worth less than knowing the view was cut.
+
+The digest keeps two sentences rather than one, because it has two cuts with two different fixes: the
+character ceiling drops rows the read *did* return, and the row cap means the read never returned the
+window. Raising `digestMaxChars` fixes the first and does nothing about the second.
 
 ### The search fallback, and why it is second
 
@@ -753,6 +910,32 @@ openclaw plugins inspect harness-memory --runtime --json
 
 Restart the gateway first. A load path pointing at nothing loads silently, and a slot naming a plugin
 that did not load is one warning in a startup log.
+
+### Checking recording
+
+Recording has no dry run of its own worth the name, because the thing to check is what the hook puts
+on the line rather than whether a socket answers. The emitter's own dry run prints the record it
+would send and needs neither:
+
+```sh
+record-main --dry-run --action answer --outcome success --summary 'A turn ran.'             --entity chat_thread:c0example/1700000000.000100
+```
+
+Look at `subjects` and `data_class` in what it prints. They are `[]` and `internal`, and there is no
+flag that could make them anything else — which is the innermost of the three layers under *[Nothing
+here may write a non-empty `subjects:`](#nothing-here-may-write-a-non-empty-subjects)*.
+
+Then read the log, which says which of the several things happened to each turn:
+
+```
+harness-memory: recorded that a turn ran, as main
+harness-memory: no floor record: this turn ran record-main itself, so it already has a record that …
+harness-memory: nothing was recorded: config.record names no recorder for agent "pr" …
+harness-memory: the turn could not be recorded, and the turn itself is unaffected: …
+```
+
+Only the last of those warns. The second is the ordinary case for a turn that did real work: the
+hook's row is the complement of the agent's, not a duplicate of it.
 
 ### The route that looked like a setting, and was not
 

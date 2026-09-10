@@ -85,6 +85,44 @@
         "exclusiveMinimum": 0,
         "title": "Digest characters",
         "description": "Ceiling on the rendered digest, and it belongs below maxChars. A window read returns a window rather than a match, so it is the likelier of the two to be cut — and whatever it cuts is counted in the block."
+      },
+      "record": {
+        "type": "object",
+        "additionalProperties": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "title": "Agent id to recorder argv",
+        "description": "This deployment's map from the host's agent id to that agent's own record tool, as argv up to and including the program — for example {\"main\": [\"/usr/local/bin/record-main\"]}. Set it alongside recordAction and a turn that ran without recording anything gets a floor record from a post-turn hook. Per agent because a record carries whatever caller its socket signed as: another agent's recorder would file the turn under a writer that did not do it, so an agent this map does not name records nothing and says so. The argv may carry only the flags saying who is writing and where — --socket, --agent, --agent-ver, --redaction-policy, --timeout-ms — and one naming anything else records nothing at all. Everything a record says is built by the hook, which is what keeps a subject off that line rather than merely unlikely on it."
+      },
+      "recordAction": {
+        "type": "string",
+        "title": "Action a turn is recorded as",
+        "description": "The action name this deployment's attribute schema declares for an agent turn. There is no default, because a store refuses a record whose action it never declared — so a name invented here would be a rejected write on every turn. Unset is off, and off is the default; set without config.record it stays off, because an action with no recorder writes nowhere."
+      },
+      "recordOutcomes": {
+        "type": "object",
+        "additionalProperties": {
+          "type": "string"
+        },
+        "title": "Turn outcome to declared outcome",
+        "description": "How this deployment spells the two outcomes a post-turn hook can tell apart, as {\"success\": \"success\", \"failure\": \"failure\"} — which is also the default. A store refuses a record whose action does not declare the outcome it carries, so where an action has no word for one of the two, set that entry to the empty string and turns of that kind are not recorded at all. Filing a failed turn as a success because the schema had nowhere else to put it is the one thing this must not do: no later read could tell."
+      },
+      "recordAttrs": {
+        "type": "object",
+        "additionalProperties": {
+          "type": "string"
+        },
+        "title": "Hook fact to declared attribute key",
+        "description": "Which of the two facts a post-turn hook has reach the record, and under which of this deployment's declared attribute keys — as {\"channel\": \"channel\", \"recalled\": \"recalled\"}. Only `channel`, the conversation the turn ran in, and `recalled`, whether recall put anything in front of it, are understood; anything else is warned about at load and never sent, because a key this hook cannot fill would look wired. Unset sends no attributes, which is the working default: a record with none is accepted everywhere, and one carrying a key its action did not declare is refused on every turn."
+      },
+      "recordTimeoutMs": {
+        "type": "integer",
+        "exclusiveMinimum": 0,
+        "title": "Recording budget (ms)",
+        "description": "How long the record write gets. It sits behind a reply rather than in front of one, so it can be generous where the recall budget cannot: the turn has already finished, and the host neither waits for this hook nor lets it fail a turn. When it runs out nothing is recorded and the log says so."
       }
     }
   }

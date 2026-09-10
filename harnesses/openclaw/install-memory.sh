@@ -35,6 +35,15 @@ ACTORS=""
 # is tokens spent on something nobody asked for, and only somebody who can see the store knows whether
 # what comes back reads as background or as noise.
 DIGEST_DAYS=""
+# The write half. All three are empty by default, and empty is off: a store refuses a record whose
+# action it never declared, so an action guessed here would be a rejected write on every turn, and a
+# recorder guessed here would sign one agent's turns as another. Neither is derivable from anything
+# this script can see.
+RECORD_ACTION=""
+RECORDERS=""
+RECORD_OUTCOMES=""
+RECORD_ATTRS=""
+RECORD_MS=10000
 BUDGET_MS=5000
 MAX_RECORDS=8
 MAX_CHARS=2000
@@ -76,6 +85,24 @@ usage: harnesses/openclaw/install-memory.sh [--config FILE] [--plugin-dir DIR] [
   --digest-days N   days of recent activity a session wakes up holding, injected on the turn that
                     opens a session and only where the turn's own entities found nothing.
                     Empty turns it off.                                          (default: unset)
+  --record-action A the action this deployment's attribute schema declares for an agent turn. With
+                    --recorders, a turn that ran without recording anything gets a floor record from
+                    a post-turn hook. Empty turns recording off.                 (default: unset)
+  --recorders MAP   this deployment's map from agent id to that agent's own record tool, as
+                    `main=/usr/local/bin/record-main,pr=...`. Per agent because a record carries
+                    whatever caller its socket signed as, so another agent's recorder would file the
+                    turn under a writer that did not do it. Empty turns recording off.
+                                                                                 (default: unset)
+  --record-outcomes MAP
+                    how this deployment spells the two outcomes a hook can tell apart, as
+                    `success=success,failure=failure`, which is also the default. An action with no
+                    word for one of the two takes `failure=` — turns of that kind are then not
+                    recorded, rather than filed as something they were not.
+  --record-attrs MAP
+                    which of the hook's two facts reach the record and under which declared keys, as
+                    `channel=channel,recalled=recalled`. Only `channel` and `recalled` exist. Empty
+                    sends no attributes, which is the default and is accepted everywhere.
+  --record-ms MS    how long the record write gets, behind the reply           (default 10000)
   --budget-ms MS    how long one lookup gets, in front of a reply        (default 5000)
   --openclaw CMD    the harness CLI, used to apply                       (default openclaw on PATH)
   --apply           merge the fragment with `openclaw config patch`. Without this, nothing outside
@@ -95,6 +122,11 @@ while [ $# -gt 0 ]; do
     --actors)      ACTORS="$2"; shift 2 ;;
     --actor-rows)  ACTOR_ROWS="$2"; shift 2 ;;
     --digest-days) DIGEST_DAYS="$2"; shift 2 ;;
+    --record-action)   RECORD_ACTION="$2"; shift 2 ;;
+    --recorders)       RECORDERS="$2"; shift 2 ;;
+    --record-outcomes) RECORD_OUTCOMES="$2"; shift 2 ;;
+    --record-attrs)    RECORD_ATTRS="$2"; shift 2 ;;
+    --record-ms)       RECORD_MS="$2"; shift 2 ;;
     --budget-ms)   BUDGET_MS="$2"; shift 2 ;;
     --openclaw)    OPENCLAW="$2"; shift 2 ;;
     --apply)       APPLY=1; shift ;;
@@ -187,6 +219,120 @@ if [ -n "$ACTORS" ]; then
   unset IFS
 fi
 
+case "$RECORD_MS" in
+  ''|*[!0-9]*) echo "--record-ms takes milliseconds: $RECORD_MS" >&2; exit 2 ;;
+esac
+[ "$RECORD_MS" -gt 0 ] || { echo "--record-ms must be positive" >&2; exit 2; }
+
+# Both halves of the write path or neither. An action with no recorder writes nowhere and looks
+# wired; a recorder with no action would write an action the store never declared, which is a
+# rejected write on every turn rather than a quiet one. Refused here, where either is a typo.
+if [ -n "$RECORD_ACTION" ] && [ -z "$RECORDERS" ]; then
+  echo "--record-action names an action with no recorder to write it; pass --recorders too" >&2
+  exit 2
+fi
+if [ -n "$RECORDERS" ] && [ -z "$RECORD_ACTION" ]; then
+  echo "--recorders names recorders with no action to write; pass --record-action too" >&2
+  exit 2
+fi
+
+# agent id -> recorder path. A recorder that is not there would be wired anyway and fail on every
+# turn, quietly enough that a deployment could believe it had coverage; refused, as the reader is.
+RECORDERS_JSON=""
+if [ -n "$RECORDERS" ]; then
+  seen=""
+  IFS=','
+  for pair in $RECORDERS; do
+    unset IFS
+    case "$pair" in
+      *=*) ;;
+      *) echo "--recorders takes agent=path pairs: $pair" >&2; exit 2 ;;
+    esac
+    id="${pair%%=*}"
+    tool="${pair#*=}"
+    [ -n "$id" ] && [ -n "$tool" ] || {
+      echo "--recorders pair names no agent or no recorder: $pair" >&2; exit 2
+    }
+    case "$id" in
+      *[!A-Za-z0-9_.-]*) echo "--recorders agent ids are identifiers: $id" >&2; exit 2 ;;
+    esac
+    # A path is not an identifier, so it is checked for the two things that cannot survive: a quote
+    # would break the JSON this script writes by hand, and a leading dash would be read as a flag.
+    case "$tool" in
+      -*) echo "--recorders path '$tool' would be read as a flag" >&2; exit 2 ;;
+      *[\"\\]*) echo "--recorders path '$tool' cannot be written into JSON here" >&2; exit 2 ;;
+    esac
+    command -v "$tool" >/dev/null 2>&1 || [ -x "$tool" ] || {
+      echo "record tool not found: $tool — install it, or fix --recorders" >&2; exit 1
+    }
+    case " $seen " in
+      *" $id "*) echo "--recorders names agent '$id' twice" >&2; exit 2 ;;
+    esac
+    seen="$seen $id"
+    RECORDERS_JSON="$RECORDERS_JSON${RECORDERS_JSON:+, }\"$id\": [\"$tool\"]"
+    IFS=','
+  done
+  unset IFS
+fi
+
+# The outcome and attribute maps. Both are small `key=value` lists whose keys this script knows and
+# whose values are the deployment's own words, so an unknown key is refused rather than written into
+# a config where the plugin would ignore it and nothing would say so.
+# The answer goes in this variable rather than on stdout: a refusal inside a command substitution
+# would exit only the subshell it ran in, leaving the caller to carry on with an empty map and no
+# sign that anything was wrong. A function that refuses has to be able to stop the script.
+PAIRS_JSON=""
+pairs_json() {
+  flag="$1"
+  allowed="$2"
+  raw="$3"
+  empty_ok="$4"
+  PAIRS_JSON=""
+  seen=""
+  IFS=','
+  for pair in $raw; do
+    unset IFS
+    case "$pair" in
+      *=*) ;;
+      *) echo "$flag takes key=value pairs: $pair" >&2; exit 2 ;;
+    esac
+    key="${pair%%=*}"
+    value="${pair#*=}"
+    case " $allowed " in
+      *" $key "*) ;;
+      *) echo "$flag does not know '$key'; it knows$allowed" >&2; exit 2 ;;
+    esac
+    if [ -z "$value" ] && [ "$empty_ok" != yes ]; then
+      echo "$flag gives '$key' no value" >&2
+      exit 2
+    fi
+    case "$value" in
+      *[!A-Za-z0-9_.-]*) echo "$flag value for '$key' is not a declared name: $value" >&2; exit 2 ;;
+    esac
+    case " $seen " in
+      *" $key "*) echo "$flag names '$key' twice" >&2; exit 2 ;;
+    esac
+    seen="$seen $key"
+    PAIRS_JSON="$PAIRS_JSON${PAIRS_JSON:+, }\"$key\": \"$value\""
+    IFS=','
+  done
+  unset IFS
+}
+
+# An empty value is a deployment saying its action has no word for that outcome, so those turns are
+# not recorded at all. That is a real setting here, which is why this map accepts one and the other
+# does not: an attribute key with no value is a key nobody named.
+RECORD_OUTCOMES_JSON=""
+if [ -n "$RECORD_OUTCOMES" ]; then
+  pairs_json --record-outcomes "success failure" "$RECORD_OUTCOMES" yes
+  RECORD_OUTCOMES_JSON="$PAIRS_JSON"
+fi
+RECORD_ATTRS_JSON=""
+if [ -n "$RECORD_ATTRS" ]; then
+  pairs_json --record-attrs "channel recalled" "$RECORD_ATTRS" no
+  RECORD_ATTRS_JSON="$PAIRS_JSON"
+fi
+
 [ -n "$SOCKET" ] || SOCKET="$HOME/.local/state/harness/sockets/$AGENT.read.sock"
 
 # The documented resolution order, replicated rather than asked of the CLI so this gives the same
@@ -228,6 +374,11 @@ echo "→ installed the recall plugin in $PLUGIN_DIR"
 # front of a reply is a conversation that looks hung; and the host's own timeout says only that a
 # hook failed, where the plugin's says whether the store was quiet or the reader was.
 HOST_MS=$((BUDGET_MS * 2))
+# The same nesting for the record hook, and it is the looser of the two on purpose: this one runs
+# behind the reply, so a generous bound costs a conversation nothing. The host's own default for it
+# is 30s, which is fine and is not what lands — the plugin's shorter bound is, so the answer an
+# operator reads names the recorder rather than saying only that a hook failed.
+RECORD_HOST_MS=$((RECORD_MS * 2))
 
 # The socket is on the command line here, unlike the write path, which takes it from the environment.
 # The reason there was an allowlist pattern that would have had to match a socket path; nothing
@@ -258,7 +409,31 @@ if [ -n "$DIGEST_DAYS" ]; then
           \"digestMaxRecords\": $DIGEST_MAX_RECORDS,
           \"digestMaxChars\": $DIGEST_MAX_CHARS,"
 fi
+# The write half, and it travels as one piece for the same reason the digest does: an action with no
+# recorder, or recorders with no action, is wiring that looks live and writes nothing. The two maps
+# below it are optional and each is emitted only when named, because an empty object in the config
+# would read as configured and behave as absent.
+if [ -n "$RECORD_ACTION" ] && [ -n "$RECORDERS_JSON" ]; then
+  TURN="$TURN
+          \"recordAction\": \"$RECORD_ACTION\",
+          \"record\": {$RECORDERS_JSON},
+          \"recordTimeoutMs\": $RECORD_MS,"
+  if [ -n "$RECORD_OUTCOMES_JSON" ]; then
+    TURN="$TURN
+          \"recordOutcomes\": {$RECORD_OUTCOMES_JSON},"
+  fi
+  if [ -n "$RECORD_ATTRS_JSON" ]; then
+    TURN="$TURN
+          \"recordAttrs\": {$RECORD_ATTRS_JSON},"
+  fi
+fi
 
+# `allowConversationAccess` is emitted unconditionally, and it is not a widening this script chose:
+# the harness classes every hook that sees a turn as conversation access, and a plugin it did not
+# ship itself may register one only where this says so. Both of this plugin's hooks are on that list.
+# Without it the host refuses them at registration with a warning naming this exact setting, which is
+# the right way for the grant to work — and the wrong thing to leave for an operator to discover from
+# a plugin that loaded, said nothing, and recalled nothing.
 fragment="$PLUGIN_DIR/config-fragment.json"
 cat > "$fragment" <<JSON
 {
@@ -274,8 +449,10 @@ cat > "$fragment" <<JSON
         "enabled": true,
         "hooks": {
           "timeouts": {
-            "before_prompt_build": $HOST_MS
-          }
+            "before_prompt_build": $HOST_MS,
+            "agent_end": $RECORD_HOST_MS
+          },
+          "allowConversationAccess": true
         },
         "config": {
           "read": ["$READER", "bundle", "--socket", "$SOCKET"],$TURN
