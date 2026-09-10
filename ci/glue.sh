@@ -153,6 +153,10 @@ elif verb == "drop-flag":
     # The interpreter still listed, but the token that hands it a program no longer recognised.
     for entry in policy["inline_programs"]["interpreters"]:
         entry["flags"] = entry["flags"].replace(what, "")
+elif verb == "drop-sink":
+    # The exemption gone, and nothing else touched. This is the state the policy shipped in, where
+    # `/dev/**` answered for the null device the same way it answers for a disk.
+    policy["redirect_sinks"] = [s for s in policy["redirect_sinks"] if s != what]
 elif verb == "widen":
     # A group that gives up on naming what it protects and swallows a directory instead.
     group, _, pattern = what.partition("=")
@@ -412,6 +416,48 @@ note "ordinary work behind a wrapper, and every fetch whose program stays in the
 # rule, so the line goes green and the mutant is caught.
 policy_mutant wrapped-program-unnamed drop-command-program:nc cmd:"timeout 5 nc -l 1234" 0
 policy_mutant wrapped-program-unwrapped drop-wrapper:timeout cmd:"timeout 5 nc -l 1234" 0
+
+## A redirection into a device that stores nothing #############################
+# The one false positive in this family, and the only exemption in the document. `/dev/**` is system
+# configuration, so `> /dev/null` was a refusal -- the most ordinary line a shell has, once per turn
+# on any deployment whose agents can run commands at all. Four device nodes are exempt as
+# *redirection targets*, matched as the literal spelling on the line.
+#
+# Literal rather than glob, because this group admits where every other one denies: a loose denial
+# costs a false refusal and a loose admission hands over the disk. Literal rather than resolved,
+# because `/dev/stdout` canonicalises to whatever descriptor 1 is bound to in whichever process
+# asks -- which on this filesystem is a pipe, and is why that spelling is asserted here rather than
+# only in the cargo tests.
+echo "→ an ordinary redirect into a device that stores nothing is admitted"
+for line in "date > /dev/null" "tool check > /dev/null 2>&1" "echo hi 2>/dev/null" \
+            "date >/dev/null" "date >>/dev/null" "tool run >/dev/stdout" \
+            "tool run 2>/dev/stderr" "tool run >/dev/zero"; do
+  [ "$(keycmd "$line" "$policy")" = 0 ] \
+    || fail "\`$line\` was refused: a redirect into a null device is not a write to the system"
+done
+note "a discard, a discard of both streams, an append and the two standard streams by name"
+
+# What the exemption does not reach, and this is the whole of what keeps the rule it punches
+# through. Four literal paths, so no fifth inherits it: a real device stays refused, both
+# descriptor spellings stay refused -- `/dev/fd/N` names whatever a descriptor this guard cannot
+# see was bound to -- and a *writing program* naming the same path is not a redirection, so
+# `rm /dev/null` still removes nothing.
+echo "→ and it reaches no device that stores anything, and no other way of naming one"
+for line in "echo x > /dev/disk0" "echo x > /dev/rdisk0" "echo x > /dev/sda" \
+            "echo x > /dev/mem" "echo x > /dev/tty" "echo x > /dev/urandom" \
+            "echo x > /dev/fd/3" "echo x > /dev/stdin" \
+            "dd if=/dev/zero of=/dev/disk0" "rm /dev/null" "tee /dev/null" \
+            "sh /dev/stdin" "sh /dev/fd/0" \
+            "cat $keys/keyring.json > /dev/null"; do
+  [ "$(keycmd "$line" "$policy")" = 2 ] \
+    || fail "\`$line\` was admitted: the device exemption reached further than the paths it names"
+done
+note "a disk, a raw disk, kernel memory, a tty, both descriptor spellings, and a secret read past a discard"
+
+# The mutant behind the new claim. One entry out of the list and the most ordinary line on the host
+# has to go dark again -- which is what separates "the exemption admitted it" from "nothing in the
+# document refused it in the first place".
+policy_mutant redirect-sink-unlisted drop-sink:/dev/null cmd:"date > /dev/null" 2
 
 echo "→ installing into a scratch project"
 HARNESS_PROJECT_DIR="$work" harnesses/claude-code/install.sh \

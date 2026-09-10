@@ -36,6 +36,30 @@ pub struct Policy {
     /// guard to get around.
     #[serde(default)]
     pub copy_programs: Vec<String>,
+    /// Device nodes a *redirection* may target, whatever [`Self::protected_paths`] says.
+    ///
+    /// `/dev/**` is system configuration and a write there is refused, which made `> /dev/null` a
+    /// refusal — the most ordinary line a shell has, and a failed tool call per turn on a
+    /// deployment whose agents could run commands at all. What is exempted is a device that stores
+    /// nothing, so a write to it is not a write.
+    ///
+    /// Three things keep this from becoming a hole, and each is asserted in `eval.rs`:
+    ///
+    /// - **Literal, not glob.** Compared by string equality, so no entry can widen to a device
+    ///   that *is* one: `/dev/*` written here would match nothing rather than everything.
+    /// - **The spelling on the line, not the resolved path.** `/dev/stdout` and `/dev/stderr` are
+    ///   symlinks whose canonical target is whatever descriptors 1 and 2 happen to be in the
+    ///   process that resolves them — a tty, a pipe, a file — so a resolved comparison gives a
+    ///   different answer in every process. What the line says is the only stable spelling, and
+    ///   the comparison is exact, so it admits no path it does not name.
+    /// - **A redirection target and nothing else.** Not a writing program's path argument, so
+    ///   `rm /dev/null` still removes nothing.
+    ///
+    /// An absent list is an empty one, not a built-in — the opposite of [`InlinePrograms`], and
+    /// for the reason that rule states: a policy silent about a group must not come out *more*
+    /// permissive than the document. Silence here refuses what the document would admit.
+    #[serde(default)]
+    pub redirect_sinks: Vec<String>,
     /// Paths that must not be read or written, at all.
     #[serde(default)]
     pub secret_paths: Vec<PathRule>,
@@ -269,6 +293,36 @@ mod tests {
         // The wording still comes from somewhere, so a refusal from a partial document reads as a
         // sentence rather than as an empty string.
         assert!(!off.inline_programs.reason.is_empty());
+    }
+
+    /// The one exemption in this document is a list of literal paths, and cannot become a pattern.
+    ///
+    /// Everything else here is a *denial* written as globs, where a loose pattern costs a false
+    /// refusal. This group is the other direction: it admits, so a loose entry costs a false
+    /// admission — `/dev/*` would hand over the disk. It is compared by equality rather than by
+    /// [`crate::glob`] precisely so that it cannot, and this is the assertion that says so out
+    /// loud rather than leaving it to the comparison nobody rereads.
+    #[test]
+    fn the_redirect_sinks_are_literal_paths_that_no_glob_could_widen() {
+        let policy = Policy::baseline().expect("baseline");
+        assert!(!policy.redirect_sinks.is_empty());
+        for sink in &policy.redirect_sinks {
+            assert!(sink.starts_with('/'), "{sink} is not an absolute path");
+            assert!(
+                !sink.contains(['*', '?', '[']),
+                "{sink} reads as a pattern, and this list is matched literally"
+            );
+        }
+    }
+
+    /// A policy silent about the exemption does not get it.
+    ///
+    /// The opposite default to `inline_programs`, and the same reasoning: neither may make a
+    /// partial document more permissive than the one shipped here.
+    #[test]
+    fn a_document_that_does_not_name_the_redirect_sinks_has_none() {
+        let silent = Policy::parse(r#"{"version":1}"#, "test").expect("parse");
+        assert!(silent.redirect_sinks.is_empty());
     }
 
     #[test]

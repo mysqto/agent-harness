@@ -10,6 +10,7 @@
     "mkdir", "touch", "tee"
   ],
   "copy_programs": ["cp", "install", "rsync", "ln"],
+  "redirect_sinks": ["/dev/null", "/dev/zero", "/dev/stdout", "/dev/stderr"],
   "secret_paths": [
     {
       "id": "private-keys",

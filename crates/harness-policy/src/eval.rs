@@ -233,6 +233,9 @@ impl Guard {
             }
         }
         for target in &found.writes {
+            if self.is_redirect_sink(target) {
+                continue;
+            }
             let decision = self.write(target);
             if decision.is_deny() {
                 return decision;
@@ -245,6 +248,20 @@ impl Guard {
             }
         }
         self.egress(found)
+    }
+
+    /// Whether a redirection target is one of the device nodes a write to means nothing.
+    ///
+    /// Exact equality against what the line literally said, both deliberately — see
+    /// [`crate::Policy::redirect_sinks`]. Nothing is resolved first: `/dev/stdout` canonicalises
+    /// to whichever file descriptor 1 is bound to in the process asking, which is a different
+    /// answer in every process and, on a guard spawned per tool call, not the agent's descriptor
+    /// anyway.
+    ///
+    /// Only the redirection asks this. An input redirection is an argument and was never gated
+    /// here, and a writing program's path argument keeps the answer it had.
+    fn is_redirect_sink(&self, target: &str) -> bool {
+        self.policy.redirect_sinks.iter().any(|sink| sink == target)
     }
 
     /// The path arguments this invocation would write to.
@@ -669,6 +686,111 @@ mod tests {
         denied(&Intent::Write("/home/a/notes.md".into()), OUTSIDE_WORKSPACE);
         denied(&Intent::Write("/srv/other/thing".into()), OUTSIDE_WORKSPACE);
         denied(&Intent::Write("../escape".into()), OUTSIDE_WORKSPACE);
+    }
+
+    /// Ordinary shell plumbing redirects into a device that stores nothing, and that is not a
+    /// write to the system.
+    ///
+    /// The false positive this closes, measured on a deployment: `/dev/**` is system
+    /// configuration, so every `> /dev/null` on the host was refused — one failed tool call per
+    /// turn, on the most ordinary line a shell has. Every candidate below was refused before this
+    /// rule existed, and none of them reaches anything that stores a byte.
+    #[test]
+    fn a_redirection_into_a_device_that_stores_nothing_is_admitted() {
+        allowed(&Intent::Command("date > /dev/null".into()));
+        allowed(&Intent::Command("check > /dev/null 2>&1".into()));
+        allowed(&Intent::Command("echo hi 2>/dev/null".into()));
+        allowed(&Intent::Command("cmd >>/dev/null".into()));
+        allowed(&Intent::Command("cmd >/dev/stdout".into()));
+        allowed(&Intent::Command("cmd 2>/dev/stderr".into()));
+        allowed(&Intent::Command("cmd >/dev/zero".into()));
+        // The redirection is not the whole line. Everything else on it is judged as before.
+        denied(
+            &Intent::Command("cat ~/.ssh/id_rsa > /dev/null".into()),
+            "private-keys",
+        );
+        denied(
+            &Intent::Command("rm -rf / 2>/dev/null".into()),
+            OUTSIDE_WORKSPACE,
+        );
+    }
+
+    /// The exemption is four literal spellings, and no fifth path inherits it.
+    ///
+    /// This is the whole of what keeps the rule the exemption punches through: `/dev/**` still
+    /// answers for every device node that is a device. A pattern here would be the fault — one
+    /// `/dev/*` and the disk is writable — so the list is compared by equality and holds no glob.
+    #[test]
+    fn the_device_exemption_reaches_no_device_that_stores_anything() {
+        for device in [
+            "/dev/disk0",
+            "/dev/disk0s1",
+            "/dev/rdisk0",
+            "/dev/sda",
+            "/dev/mem",
+            "/dev/kmem",
+            "/dev/nvme0n1",
+        ] {
+            denied(
+                &Intent::Command(format!("echo x > {device}")),
+                "system-configuration",
+            );
+            denied(&Intent::Write(device.into()), "system-configuration");
+        }
+        // A raw device named as `dd`'s operand is answered before any path rule is asked, and
+        // exempting the source it reads from does not change which rule answers.
+        denied(
+            &Intent::Command("dd if=/dev/zero of=/dev/disk0".into()),
+            "raw-device-write",
+        );
+        // Neither descriptor spelling is exempt. `/dev/fd/N` names whatever a descriptor this
+        // guard cannot see was bound to, which is a real file as easily as a device; `/dev/stdin`
+        // is the same path by another name, and the inline-program rule already reads it as a
+        // place a *program* comes from.
+        denied(
+            &Intent::Command("echo x > /dev/fd/3".into()),
+            "system-configuration",
+        );
+        denied(
+            &Intent::Command("echo x > /dev/stdin".into()),
+            "system-configuration",
+        );
+        denied(&Intent::Command("sh /dev/stdin".into()), INLINE_PROGRAM);
+        denied(&Intent::Command("sh /dev/fd/0".into()), INLINE_PROGRAM);
+        // And the rest of `/dev` is untouched.
+        denied(
+            &Intent::Command("echo x > /dev/tty".into()),
+            "system-configuration",
+        );
+        denied(
+            &Intent::Command("echo x > /dev/urandom".into()),
+            "system-configuration",
+        );
+    }
+
+    /// A redirection target and an input are different questions, and only the target moved.
+    ///
+    /// The guard already tells them apart: `> path` is recovered as a write and `< path` stays an
+    /// argument, so a read of `/dev/zero` was never refused — only writing to it was, and the
+    /// direction the exemption applies to is the one that was over-refusing. It stops at the
+    /// redirection: a writing program's path argument keeps its own answer, which is why
+    /// `rm /dev/null` still cannot delete the device node.
+    #[test]
+    fn the_exemption_is_a_redirection_target_and_not_every_way_of_naming_the_path() {
+        // The input direction, unchanged and admitted before this rule existed.
+        allowed(&Intent::Command("head -c 10 /dev/zero".into()));
+        allowed(&Intent::Command("cat < /dev/zero".into()));
+        allowed(&Intent::Command("cat /dev/null".into()));
+        // A writing program naming it is not a redirection, and is answered as it was.
+        denied(
+            &Intent::Command("rm /dev/null".into()),
+            "system-configuration",
+        );
+        denied(
+            &Intent::Command("tee /dev/null".into()),
+            "system-configuration",
+        );
+        denied(&Intent::Write("/dev/null".into()), "system-configuration");
     }
 
     #[test]
