@@ -179,6 +179,14 @@ impl RecordingAdapter {
             .map(|d| d.text.clone())
             .collect::<Vec<_>>()
     }
+
+    /// Everything that reached this adapter, whole.
+    ///
+    /// Separate from [`RecordingAdapter::texts`]: a failure notice is addressed as well as worded,
+    /// and where it went is half of what makes it a notice rather than a log line.
+    pub fn sent(&self) -> Vec<Delivery> {
+        guard(&self.sent).clone()
+    }
 }
 
 #[async_trait::async_trait]

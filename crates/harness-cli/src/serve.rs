@@ -426,12 +426,20 @@ mod tests {
                     envelope_line("cli-9", "nosuchintent please"),
                     envelope_line("cli-1", "echo still here"),
                 ],
-                1,
+                2,
             )
             .await;
 
+        // The unroutable envelope is answered rather than passed over in silence: §5.6's failure
+        // notice comes back down the same connection an answer would have.
+        assert_eq!(deliveries[0].envelope_id, "cli-9");
+        assert!(
+            deliveries[0].text.contains("no agent handles intent"),
+            "a refusal must say what it refused: {:?}",
+            deliveries[0].text
+        );
         assert_eq!(
-            deliveries[0].text, "still here",
+            deliveries[1].text, "still here",
             "an unroutable envelope and two malformed lines must not end the connection"
         );
         served.shutdown().await.expect("clean shutdown");

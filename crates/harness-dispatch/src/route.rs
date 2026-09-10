@@ -14,6 +14,16 @@ use crate::worker::{Handing, Handout, Route};
 /// Deadline handed to an agent when the source does not name one.
 const DEFAULT_DEADLINE_MS: u64 = 5_000;
 
+/// How many bytes of a failure notice may reach a channel.
+///
+/// A refusal quotes text this process did not write — what a worker said about itself, what the
+/// store said it left out — and nothing bounds either at the source. A notice that pasted one in
+/// whole would be its own incident, so it is cut here and the log keeps the rest.
+const NOTICE_MAX_BYTES: usize = 512;
+
+/// Marks a notice that was cut, so a short reason and a truncated one cannot be confused.
+const CUT_MARK: char = '…';
+
 /// What a dispatch produced.
 #[derive(Debug)]
 pub struct Dispatched {
@@ -196,8 +206,9 @@ impl Dispatcher {
     ///
     /// The returned deliveries are what the agent asked to send; what the adapter received is that
     /// text with every filter applied.
+    /// A refusal reaches whoever asked, as well as the log. See [`Dispatcher::reporting`].
     pub async fn dispatch(&self, envelope: Envelope) -> crate::Result<Dispatched> {
-        self.handle(envelope, Callee::Agent).await
+        self.reporting(envelope, Callee::Agent).await
     }
 
     /// Handles one envelope end to end, handing it to a worker.
@@ -208,7 +219,62 @@ impl Dispatcher {
     /// `route_id`, `envelope_id`, `bundle_id`, `args` — reaches it through [`crate::Handed::route`], and
     /// the bundle those ids name travels with them.
     pub async fn hand_off(&self, envelope: Envelope) -> crate::Result<Dispatched> {
-        self.handle(envelope, Callee::Worker).await
+        self.reporting(envelope, Callee::Worker).await
+    }
+
+    /// [`Dispatcher::handle`], with §5.6's failure notice on the way out.
+    ///
+    /// A refusal used to reach a log and nothing else, so whoever asked saw silence and could not
+    /// tell "no answer" from "no bot". That was tolerable while every delegation was prose an agent
+    /// sent for itself and visibly failed; it stops being tolerable the moment a dispatcher can
+    /// refuse one, because a refused hand-off is a delegation that never happened and nobody knows.
+    ///
+    /// The notice is posted here rather than by the caller for two reasons. The courier is the only
+    /// way out, so a notice raised anywhere else would be the one outbound message that skipped the
+    /// filters and the screen — and a refusal quotes text this process did not write. And the reply
+    /// route for an envelope may be torn down as soon as the caller has its answer, so by the time
+    /// an error has been returned there can be nowhere left to post it.
+    ///
+    /// The error is still returned. The notice is an addition, never a substitution.
+    async fn reporting(&self, envelope: Envelope, callee: Callee) -> crate::Result<Dispatched> {
+        let asked = Asked::of(&envelope);
+        match self.handle(envelope, callee).await {
+            Ok(dispatched) => Ok(dispatched),
+            Err(error) => {
+                self.notify(&asked, &error).await;
+                Err(error)
+            }
+        }
+    }
+
+    /// Posts one bounded failure notice, and says so in the log either way.
+    ///
+    /// Both halves are §5.6's invariant: the notice is for whoever asked, and the log is for ops.
+    /// Neither substitutes for the other — a channel nobody is watching and a log nobody is reading
+    /// fail in opposite directions.
+    async fn notify(&self, asked: &Asked, error: &crate::Error) {
+        tracing::error!(
+            envelope_id = %asked.envelope_id,
+            target = %asked.target,
+            %error,
+            "refused; posting a failure notice"
+        );
+        let delivery = Delivery {
+            envelope_id: asked.envelope_id.clone(),
+            target: asked.target.clone(),
+            text: notice(&asked.envelope_id, error),
+            thread: asked.thread.clone(),
+        };
+        if let Err(undelivered) = self.courier.deliver(vec![delivery]).await {
+            // The one path where a refusal is still silent to whoever asked. It is logged as such
+            // rather than returned, because the caller needs the reason the dispatch failed and not
+            // the reason the apology for it failed.
+            tracing::error!(
+                envelope_id = %asked.envelope_id,
+                %undelivered,
+                "the failure notice could not be posted; this refusal reached nobody"
+            );
+        }
     }
 
     /// The one path both entry points take.
@@ -552,6 +618,66 @@ fn deadline_ms(envelope: &Envelope) -> u64 {
         .unwrap_or(DEFAULT_DEADLINE_MS)
 }
 
+/// Where a failure notice for one envelope has to go.
+///
+/// Taken before the envelope is handed to [`Dispatcher::handle`], which consumes it: by the time
+/// there is a refusal to report, the message that caused it is gone.
+struct Asked {
+    envelope_id: String,
+    target: String,
+    thread: Option<String>,
+}
+
+impl Asked {
+    fn of(envelope: &Envelope) -> Self {
+        Self {
+            envelope_id: envelope.envelope_id.clone(),
+            // The same rule an agent's own reply follows, so a notice cannot land somewhere the
+            // answer would not have.
+            target: envelope.reply_to.clone().unwrap_or_default(),
+            // Adapter-supplied, like the intent and the entities: a source with threads names the
+            // one the message arrived on, and one without names nothing. §5.6 asks for the notice
+            // to reach *the thread*, and a notice in the channel root is one nobody who asked is
+            // reading.
+            thread: envelope
+                .extra
+                .get("thread")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
+        }
+    }
+}
+
+/// Renders a refusal as the notice that goes to the channel.
+///
+/// The envelope id is in the text rather than only in the log, because it is the only thing that
+/// ties what somebody read in a thread to the line an operator can search for.
+fn notice(envelope_id: &str, error: &crate::Error) -> String {
+    cut(
+        &format!("dispatch refused (envelope {envelope_id}): {error}"),
+        NOTICE_MAX_BYTES,
+    )
+}
+
+/// Truncates to at most `max` bytes, marking a cut.
+///
+/// On a character boundary, because the text being cut is somebody else's and can put a multi-byte
+/// character across the limit — and a panic in the one path whose job is to report a failure would
+/// take the report down with the thing it was reporting. The marker is inside the budget rather
+/// than added to it, so `max` is what it says it is.
+fn cut(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_owned();
+    }
+    let mut end = max - CUT_MARK.len_utf8();
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut out = text[..end].to_owned();
+    out.push(CUT_MARK);
+    out
+}
+
 /// Turns what the agent wants said into addressed deliveries.
 ///
 /// An empty target means "wherever this came from", so an agent that has no opinion about routing
@@ -771,7 +897,15 @@ mod tests {
             "a store can report a partial bundle without saying what it left out"
         );
         assert_eq!(agent.calls(), 0, "the agent must never have been invoked");
-        assert!(adapter.texts().is_empty());
+        assert!(
+            !adapter.texts().iter().any(|text| text.contains("applied")),
+            "an agent that never ran must not appear to have answered"
+        );
+        assert_eq!(
+            adapter.texts().len(),
+            1,
+            "the refusal itself is the one thing that reaches the channel"
+        );
     }
 
     #[tokio::test]
@@ -1176,9 +1310,22 @@ mod tests {
         );
         assert_eq!(agent.calls(), 2);
         assert_eq!(
-            adapter.texts(),
-            vec!["one event"],
+            adapter
+                .texts()
+                .iter()
+                .filter(|text| *text == "one event")
+                .count(),
+            1,
             "the reply must not go out twice"
+        );
+        assert_eq!(
+            adapter
+                .texts()
+                .iter()
+                .filter(|text| text.starts_with("dispatch refused"))
+                .count(),
+            1,
+            "nor may the notice for a refusal that repeats identically"
         );
     }
 
@@ -1796,7 +1943,13 @@ mod tests {
             .await
             .expect_err("the worker could not attempt it");
         assert!(matches!(error, crate::Error::Agent(_)));
-        assert!(adapter.texts().is_empty());
+        assert!(
+            !adapter
+                .texts()
+                .iter()
+                .any(|text| text.contains("summarise ord-1")),
+            "a run that never started must not appear to have answered"
+        );
         assert!(store.submitted().is_empty());
 
         dispatcher
@@ -1804,6 +1957,366 @@ mod tests {
             .await
             .expect_err("still failing");
         assert_eq!(worker.calls(), 2, "a failed run must be retryable");
+    }
+
+    // §5.6's failure notice ///////////////////////////////////////////////////////////////////
+    //
+    // A refusal used to reach a log and nothing else, so the person who asked saw silence and
+    // could not tell "no answer" from "no bot". Each test below names one property of the notice
+    // that closes that.
+
+    /// An envelope naming the thread it arrived on, the way an adapter with threads would.
+    fn envelope_in_thread(body: &str, thread: &str) -> harness_envelope::Envelope {
+        let mut envelope = envelope(body);
+        envelope
+            .extra
+            .insert("thread".into(), serde_json::json!(thread));
+        envelope
+    }
+
+    #[tokio::test]
+    async fn a_refusal_reaches_the_channel_that_asked() {
+        // The whole point: nothing claims this intent, so no agent runs and no agent can reply.
+        // Without a notice the asker gets silence.
+        let adapter = Arc::new(RecordingAdapter::working());
+        let dispatcher = dispatcher(
+            &[],
+            Arc::new(FakeStore::healthy()),
+            Courier::new(filters(vec![]), Box::new(adapter.clone())),
+        );
+
+        dispatcher
+            .dispatch(envelope("summarise all"))
+            .await
+            .expect_err("nothing claims `summarise`");
+
+        let posted = adapter.sent();
+        assert_eq!(posted.len(), 1, "a refusal must post exactly one notice");
+        assert_eq!(posted[0].target, "stdout", "it goes where the reply would");
+        assert_eq!(posted[0].envelope_id, "cli-1");
+        assert!(
+            posted[0].text.contains("summarise"),
+            "the notice must name what was refused: {:?}",
+            posted[0].text
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failure_notice_names_the_envelope_so_ops_can_find_it() {
+        // "Ops must be able to tell 'no answer' from 'no bot'". The envelope id is what ties the
+        // notice in the channel to the line in the log.
+        let adapter = Arc::new(RecordingAdapter::working());
+        let dispatcher = dispatcher(
+            &[],
+            Arc::new(FakeStore::healthy()),
+            Courier::new(filters(vec![]), Box::new(adapter.clone())),
+        );
+
+        dispatcher
+            .dispatch(envelope("summarise all"))
+            .await
+            .expect_err("unroutable");
+
+        assert!(
+            adapter.texts()[0].contains("cli-1"),
+            "{:?}",
+            adapter.texts()[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failure_notice_is_bounded() {
+        // A refusal quotes what a worker said, and nothing bounds that at the source. A notice
+        // that pasted an unbounded reason into a channel would be its own incident.
+        let adapter = Arc::new(RecordingAdapter::working());
+        let worker = Arc::new(
+            RecordingWorker::new("lookup", &[("summarise", false)])
+                .unavailable(&"x".repeat(20_000)),
+        );
+        let dispatcher = worker_dispatcher(
+            std::slice::from_ref(&worker),
+            Arc::new(FakeStore::healthy()),
+            Courier::new(filters(vec![]), Box::new(adapter.clone())),
+        );
+
+        dispatcher
+            .hand_off(envelope("summarise all"))
+            .await
+            .expect_err("the worker cannot work");
+
+        let text = &adapter.texts()[0];
+        assert!(
+            text.len() <= super::NOTICE_MAX_BYTES,
+            "a notice of {} bytes is not bounded",
+            text.len()
+        );
+        assert!(
+            text.ends_with('…'),
+            "a cut notice must say it was cut: {text:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bounded_notice_is_still_cut_on_a_character_boundary() {
+        // The reason is somebody else's text, so it can put a multi-byte character across the cut.
+        // Slicing bytes there would panic in the one path whose job is to report a failure.
+        let adapter = Arc::new(RecordingAdapter::working());
+        let worker = Arc::new(
+            RecordingWorker::new("lookup", &[("summarise", false)])
+                .unavailable(&"é".repeat(20_000)),
+        );
+        let dispatcher = worker_dispatcher(
+            std::slice::from_ref(&worker),
+            Arc::new(FakeStore::healthy()),
+            Courier::new(filters(vec![]), Box::new(adapter.clone())),
+        );
+
+        dispatcher
+            .hand_off(envelope("summarise all"))
+            .await
+            .expect_err("the worker cannot work");
+
+        assert!(adapter.texts()[0].len() <= super::NOTICE_MAX_BYTES);
+    }
+
+    #[tokio::test]
+    async fn a_failure_notice_is_screened_on_the_way_out() {
+        // The reason a notice goes through the courier rather than straight to the adapter: a
+        // refusal quotes text this process did not write, and that text can carry a credential.
+        let adapter = Arc::new(RecordingAdapter::working());
+        let worker = Arc::new(
+            RecordingWorker::new("lookup", &[("summarise", false)])
+                .unavailable("cannot reach the source with xoxb-1234567890abcdef"),
+        );
+        let dispatcher = worker_dispatcher(
+            std::slice::from_ref(&worker),
+            Arc::new(FakeStore::healthy()),
+            Courier::new(filters(vec![]), Box::new(adapter.clone())),
+        );
+
+        dispatcher
+            .hand_off(envelope("summarise all"))
+            .await
+            .expect_err("the worker cannot work");
+
+        let text = &adapter.texts()[0];
+        assert!(
+            !text.contains("xoxb-1234567890abcdef"),
+            "a notice carried a credential out: {text:?}"
+        );
+        assert!(text.contains("[redacted:chat-token]"), "{text:?}");
+    }
+
+    #[tokio::test]
+    async fn a_failure_notice_passes_every_filter() {
+        // Same argument as the screen, one layer earlier: the courier is the only way out, so a
+        // notice raised anywhere else would be the one outbound message that skipped the filters.
+        let adapter = Arc::new(RecordingAdapter::working());
+        let dispatcher = dispatcher(
+            &[],
+            Arc::new(FakeStore::healthy()),
+            Courier::new(
+                filters(vec![Box::new(Suffix(" [filtered]"))]),
+                Box::new(adapter.clone()),
+            ),
+        );
+
+        dispatcher
+            .dispatch(envelope("summarise all"))
+            .await
+            .expect_err("unroutable");
+
+        assert!(
+            adapter.texts()[0].ends_with(" [filtered]"),
+            "{:?}",
+            adapter.texts()[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failure_notice_goes_to_the_thread_the_envelope_named() {
+        // §5.6 says the notice posts *to the thread*. An adapter with threads names one, and a
+        // notice that landed in the channel root would be a notice nobody who asked is reading.
+        let adapter = Arc::new(RecordingAdapter::working());
+        let dispatcher = dispatcher(
+            &[],
+            Arc::new(FakeStore::healthy()),
+            Courier::new(filters(vec![]), Box::new(adapter.clone())),
+        );
+
+        dispatcher
+            .dispatch(envelope_in_thread("summarise all", "t-9"))
+            .await
+            .expect_err("unroutable");
+
+        assert_eq!(adapter.sent()[0].thread, Some("t-9".to_string()));
+    }
+
+    #[tokio::test]
+    async fn a_refusal_still_returns_the_error_it_reported() {
+        // The notice is an addition, not a substitution. A caller that stopped seeing the refusal
+        // would stop being able to retry it or to exit non-zero on it.
+        let dispatcher = dispatcher(&[], Arc::new(FakeStore::healthy()), plain_courier());
+
+        let error = dispatcher
+            .dispatch(envelope("summarise all"))
+            .await
+            .expect_err("unroutable");
+
+        assert!(matches!(error, crate::Error::Unroutable(ref i) if i == "summarise"));
+    }
+
+    #[tokio::test]
+    async fn every_kind_of_refusal_posts_a_notice() {
+        // Each of these was silent before. Enumerated rather than sampled: a refusal added later
+        // that forgets the notice is exactly the regression this file exists to prevent.
+        // Unroutable.
+        let unroutable = Arc::new(RecordingAdapter::working());
+        dispatcher(
+            &[],
+            Arc::new(FakeStore::healthy()),
+            Courier::new(filters(vec![]), Box::new(unroutable.clone())),
+        )
+        .dispatch(envelope("summarise all"))
+        .await
+        .expect_err("unroutable");
+        assert_eq!(unroutable.sent().len(), 1, "Unroutable posted no notice");
+
+        // Unreachable.
+        let unreachable = Arc::new(RecordingAdapter::working());
+        let down = Arc::new(
+            RecordingWorker::new("lookup", &[("summarise", false)])
+                .unavailable("the source is down"),
+        );
+        worker_dispatcher(
+            std::slice::from_ref(&down),
+            Arc::new(FakeStore::healthy()),
+            Courier::new(filters(vec![]), Box::new(unreachable.clone())),
+        )
+        .hand_off(envelope("summarise all"))
+        .await
+        .expect_err("unreachable");
+        assert_eq!(unreachable.sent().len(), 1, "Unreachable posted no notice");
+
+        // Underspecified.
+        let underspecified = Arc::new(RecordingAdapter::working());
+        let picky =
+            Arc::new(RecordingWorker::new("lookup", &[("summarise", false)]).needing("ref"));
+        worker_dispatcher(
+            std::slice::from_ref(&picky),
+            Arc::new(FakeStore::healthy()),
+            Courier::new(filters(vec![]), Box::new(underspecified.clone())),
+        )
+        .hand_off(envelope("summarise all"))
+        .await
+        .expect_err("underspecified");
+        assert_eq!(
+            underspecified.sent().len(),
+            1,
+            "Underspecified posted no notice"
+        );
+
+        // RefusedDegraded.
+        let refused = Arc::new(RecordingAdapter::working());
+        let mutating = Arc::new(RecordingWorker::new("writer", &[("apply", true)]));
+        worker_dispatcher(
+            std::slice::from_ref(&mutating),
+            Arc::new(FakeStore::degraded()),
+            Courier::new(filters(vec![]), Box::new(refused.clone())),
+        )
+        .hand_off(envelope("apply the change"))
+        .await
+        .expect_err("a mutating intent on degraded context");
+        assert_eq!(refused.sent().len(), 1, "RefusedDegraded posted no notice");
+    }
+
+    #[tokio::test]
+    async fn a_handed_off_refusal_reaches_the_channel_too() {
+        // The hand-off path is the one being wired, and it is the one where a silent refusal is
+        // worst: a worker has no channel of its own, so the dispatcher is the only thing that can
+        // say the delegation did not happen.
+        let adapter = Arc::new(RecordingAdapter::working());
+        let dispatcher = worker_dispatcher(
+            &[],
+            Arc::new(FakeStore::healthy()),
+            Courier::new(filters(vec![]), Box::new(adapter.clone())),
+        );
+
+        dispatcher
+            .hand_off(envelope("review all"))
+            .await
+            .expect_err("no worker claims `review`");
+
+        assert_eq!(adapter.sent().len(), 1);
+        assert!(
+            adapter.texts()[0].contains("review"),
+            "{:?}",
+            adapter.texts()[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_notice_that_cannot_be_posted_leaves_the_refusal_unchanged() {
+        // The one case where a refusal is still silent to whoever asked. It must not also become a
+        // different refusal: the caller needs the reason the dispatch failed, not the reason the
+        // apology failed.
+        let dispatcher = dispatcher(
+            &[],
+            Arc::new(FakeStore::healthy()),
+            Courier::new(
+                filters(vec![]),
+                Box::new(RecordingAdapter::unavailable("the channel is down")),
+            ),
+        );
+
+        let error = dispatcher
+            .dispatch(envelope("summarise all"))
+            .await
+            .expect_err("unroutable");
+
+        assert!(matches!(error, crate::Error::Unroutable(ref i) if i == "summarise"));
+    }
+
+    #[tokio::test]
+    async fn a_dispatch_that_worked_posts_no_notice() {
+        // The notice must be reachable only from the refusal path. An agent's own reply is the
+        // only thing an answered envelope puts in the channel.
+        let adapter = Arc::new(RecordingAdapter::working());
+        let agent =
+            Arc::new(RecordingAgent::new("reader", &[("summarise", false)]).replying("one event"));
+        let dispatcher = dispatcher(
+            std::slice::from_ref(&agent),
+            Arc::new(FakeStore::healthy()),
+            Courier::new(filters(vec![]), Box::new(adapter.clone())),
+        );
+
+        dispatcher
+            .dispatch(envelope("summarise all"))
+            .await
+            .expect("dispatched");
+
+        assert_eq!(adapter.texts(), vec!["one event".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn one_refusal_posts_one_notice_however_often_it_is_redelivered() {
+        // Delivery is idempotent on what was asked to be sent, and a notice is a delivery. A
+        // source that retries a message it will always be refused for must not fill the thread.
+        let adapter = Arc::new(RecordingAdapter::working());
+        let dispatcher = dispatcher(
+            &[],
+            Arc::new(FakeStore::healthy()),
+            Courier::new(filters(vec![]), Box::new(adapter.clone())),
+        );
+
+        for _ in 0..3 {
+            dispatcher
+                .dispatch(envelope("summarise all"))
+                .await
+                .expect_err("unroutable");
+        }
+
+        assert_eq!(adapter.sent().len(), 1);
     }
 }
 
