@@ -124,7 +124,28 @@ line whose program position is already unreadable, and telling them from `timeou
 which of the earlier tokens were operands. The cheaper reading is the permissive one, and it is the
 one this guard does not take — the same trade already made for `echo sh -c`.
 
-Four things this does **not** cover, named here rather than left to be found. They are not a
+**And the program behind that operand is a program**, which it was not until this closure. The walk
+that hid an interpreter hid every other program with it: `timeout 5 rm -rf /`, `sudo -u root nc -l
+1234` and `xargs -a <file> nc -l 1234` were read as programs called `5`, `root` and `<file>` with
+`rm` and `nc` among their arguments — measured admitted on the built binary, where `rm -rf /` and
+`sudo nc -l 1234` are refused. The inline-program gate had already been taught to read the whole
+tail; the command, writing and egress rules ask about the program position, and the program was not
+in it. So behind a wrapper every token that could be a program name is offered as one — by its
+basename, flags and assignments excepted — because which token is the program is exactly what this
+parse cannot recover, and a parse that could recover it would not have had the gap.
+
+What that costs was accepted before it was written, and it is stated here rather than left to be
+met: a word that merely *looks* like a program name is refused as one. `timeout 30 cargo build --bin
+ssh` names a binary target and is refused by the rule naming `ssh`; `env grep -rn ssh .` searches for
+a word and is refused the same way; `timeout 5 cat /etc/passwd` is refused for the file's basename;
+`timeout 5 grep -c sh notes` reads as an inline program. The widest of them is an egress program
+reached past a wrapper's operand — `timeout 5 curl http://127.0.0.1/x` — whose own name stays in the
+argument list, where the egress screen reads a bare word as a host, so even an allowlisted target is
+refused. The cost is bounded by the policy, because a word matters only where the document already
+names it as a program, and it is one refusal on a line that can be retyped without the wrapper. The
+cheaper reading is the permissive one, and it is the reading that admitted `timeout 5 nc -l 1234`.
+
+Three things this does **not** cover, named here rather than left to be found. They are not a
 complete list, and nothing here could be: this is a string comparison over a command line, and the
 shell has not run yet.
 
@@ -134,16 +155,6 @@ shell has not run yet.
   the guard was handed, so `cd <parent> && cat <name>` reaches a rule anchored to an absolute prefix
   that `cat <parent>/<name>` would not. It is the same answer for an argument, a redirection and an
   assignment.
-- **A *program* behind a wrapper's operand, when the rule names the program.** The paragraph above
-  makes a wrapper's operand a candidate *path*; it does not make what follows the operand a
-  candidate *program*. The search still settles on the operand, so `timeout 5 rm -rf /` and
-  `sudo -u root nc -l 1234` are read as programs called `5` and `root` with `rm` and `nc` among
-  their arguments — measured admitted, where `rm -rf /` and `sudo nc -l 1234` are refused. The
-  inline-program gate is unaffected, because it reads the whole tail rather than the program
-  position (`timeout 5 sh` is refused). Closing this for the command, writing and egress rules means
-  either counting a wrapper's operands, which this parse cannot do, or promoting every token behind
-  a wrapper to a program name, which refuses `timeout 30 cargo build --bin ssh`. It is a trade
-  nobody has made yet rather than an oversight, and it is written down here so that it is one.
 - **An interpreter nobody listed.** The interpreter surface is a list, and a list is what somebody
   thought of. `awk`, `sed` and `jq` are off it deliberately — their program *is* their first operand,
   so refusing "an inline program" for them refuses the tool outright, and their input arrives as

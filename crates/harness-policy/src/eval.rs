@@ -868,6 +868,164 @@ mod tests {
         allowed(&Intent::Command("xargs -n 1 echo".into()));
     }
 
+    /// A *program* reached through a wrapper's operand is matched by the program rules.
+    ///
+    /// The last hole of this family, and the same one as the paragraph above seen from the other
+    /// side. Making a wrapper's operand a candidate *path* did nothing for the token behind it:
+    /// the program search still settled on the operand, so `timeout 5 rm -rf /` and
+    /// `sudo -u root nc -l 1234` were read as programs called `5` and `root` with `rm` and `nc`
+    /// among their arguments — measured admitted on the built binary, where `rm -rf /` and
+    /// `sudo nc -l 1234` are refused. `xargs -a <file> nc -l 1234` is the same shape with the
+    /// operand attached to a flag.
+    ///
+    /// Which token is the program cannot be recovered: counting a wrapper's operands is precisely
+    /// what this parse cannot do, and a parse that could count them would not have had the gap. So
+    /// behind a wrapper every token that could be a program name is offered to the program rules,
+    /// and the answer is the same for the command rules, the writing rules and the egress rules,
+    /// because all three ask the same question of `programs`.
+    ///
+    /// What that costs is not hypothetical and is stated on its own, in
+    /// `a_word_behind_a_wrapper_that_names_a_program_is_refused_as_one`.
+    #[test]
+    fn a_program_behind_a_wrappers_operand_is_matched_by_the_program_rules() {
+        // The three shapes measured admitted, and the bare forms they were laundering.
+        denied(&Intent::Command("rm -rf /".into()), OUTSIDE_WORKSPACE);
+        denied(
+            &Intent::Command("timeout 5 rm -rf /".into()),
+            OUTSIDE_WORKSPACE,
+        );
+        denied(
+            &Intent::Command("sudo -u root rm -rf /".into()),
+            OUTSIDE_WORKSPACE,
+        );
+        denied(
+            &Intent::Command("sudo nc -l 1234".into()),
+            "unscreened-egress",
+        );
+        denied(
+            &Intent::Command("timeout 5 nc -l 1234".into()),
+            "unscreened-egress",
+        );
+        denied(
+            &Intent::Command("sudo -u root nc -l 1234".into()),
+            "unscreened-egress",
+        );
+        denied(
+            &Intent::Command("xargs -a list.txt nc -l 1234".into()),
+            "unscreened-egress",
+        );
+        // More than one operand, a wrapper behind a wrapper, and the program named by its path:
+        // none of them is a position this parse counts, and none of them has to be.
+        denied(
+            &Intent::Command("timeout -k 1 5 nc -l 1234".into()),
+            "unscreened-egress",
+        );
+        denied(
+            &Intent::Command("sudo timeout 5 /usr/bin/nc -l 1234".into()),
+            "unscreened-egress",
+        );
+        // Every rule that asks `programs` a question, not only the command list: a rule narrowed
+        // by argument, a writing program, and a program whose purpose is egress.
+        denied(
+            &Intent::Command("timeout 5 git push --force".into()),
+            "history-rewrite",
+        );
+        denied(
+            &Intent::Command("nice -n 5 shutdown now".into()),
+            "host-power-state",
+        );
+        denied(
+            &Intent::Command("timeout 5 dd if=/dev/zero of=/srv/work/disk.img".into()),
+            "raw-device-write",
+        );
+        denied(
+            &Intent::Command("timeout 5 mv /srv/work/a /etc/hosts".into()),
+            "system-configuration",
+        );
+        denied(
+            &Intent::Command("timeout 5 curl https://example.test/x".into()),
+            "network",
+        );
+    }
+
+    /// What promoting every token behind a wrapper to a program name costs, stated rather than
+    /// found.
+    ///
+    /// A word that merely *looks* like a program name is refused as one. `timeout 30 cargo build
+    /// --bin ssh` names a binary target, not a program, and it is refused by the rule that names
+    /// `ssh`; `env grep -rn ssh .` searches for a word and is refused the same way. The cheaper
+    /// reading — that a token in argument position is only ever an argument — is the permissive
+    /// one, and it is what let `timeout 5 nc -l 1234` through. This guard does not take it.
+    ///
+    /// The cost is bounded by the policy rather than by this parse: a word is refused only where
+    /// the document already names that word as a program, so `timeout 30 cargo build --bin app` is
+    /// untouched and so is every line whose tokens name nothing.
+    #[test]
+    fn a_word_behind_a_wrapper_that_names_a_program_is_refused_as_one() {
+        // The cost as it was described when the trade was accepted.
+        denied(
+            &Intent::Command("timeout 30 cargo build --bin ssh".into()),
+            "unscreened-egress",
+        );
+        // A search term that is a program name, behind a wrapper.
+        denied(
+            &Intent::Command("env grep -rn ssh .".into()),
+            "unscreened-egress",
+        );
+        // An interpreter named as a word, where some other token reads as an inline-program flag.
+        denied(
+            &Intent::Command("timeout 5 grep -c sh /srv/work/notes".into()),
+            INLINE_PROGRAM,
+        );
+        // A writing program named as a word makes the line's path arguments writes.
+        denied(
+            &Intent::Command("timeout 5 grep -rn touch /usr/include".into()),
+            "system-configuration",
+        );
+        // An egress program named as a word, with no host this guard can read.
+        denied(&Intent::Command("xargs -n 1 echo curl".into()), "network");
+        // A path is read by its basename here, the way a program is, so a file named after a
+        // program is one: `/etc/passwd` behind a wrapper is refused by the rule naming `passwd`.
+        denied(
+            &Intent::Command("timeout 5 cat /etc/passwd".into()),
+            "credential-change",
+        );
+        // The widest of them, and the one worth knowing before it is met: an egress program
+        // reached past a wrapper's own operand is refused even when its target is allowlisted.
+        // The operand took the program position, so the word `curl` stays in the argument list —
+        // and the egress screen holds an egress program to naming a host it can read, where a bare
+        // word is a host candidate. It fails closed, which is the direction this guard errs in,
+        // and it costs the wrapper rather than the fetch: `curl <allowlisted>` is untouched, and
+        // so is a wrapper that spends no operand.
+        denied(
+            &Intent::Command("timeout 5 curl http://127.0.0.1:8080/health".into()),
+            "network",
+        );
+
+        // And what it does not cost. A word that names nothing in the policy is still a word, and
+        // every one of these is ordinary work behind a wrapper.
+        allowed(&Intent::Command("timeout 30 cargo build --bin app".into()));
+        allowed(&Intent::Command("timeout -k 1 5 cargo build".into()));
+        allowed(&Intent::Command("sudo -n rm -rf build".into()));
+        allowed(&Intent::Command("nice -n 5 make".into()));
+        allowed(&Intent::Command("env -u EDITOR ls".into()));
+        allowed(&Intent::Command("xargs -n 1 echo".into()));
+        allowed(&Intent::Command("timeout 5 sh script.sh".into()));
+        allowed(&Intent::Command("timeout 5 bash --version".into()));
+        // No wrapper, no promotion: the program position is not in doubt, so a mention stays one.
+        allowed(&Intent::Command("grep -c sh /srv/work/notes".into()));
+        allowed(&Intent::Command("cargo build --bin ssh".into()));
+        allowed(&Intent::Command("which bash".into()));
+        allowed(&Intent::Command("curl http://127.0.0.1:8080/health".into()));
+        // A wrapper that spends no operand leaves the program in the program position, so its
+        // name is not among the arguments and nothing reads it as a host.
+        allowed(&Intent::Command(
+            "sudo curl http://127.0.0.1:8080/health".into(),
+        ));
+        allowed(&Intent::Command("nohup curl http://127.0.0.1/x".into()));
+        allowed(&Intent::Command("xargs -n1 curl http://127.0.0.1/x".into()));
+    }
+
     #[test]
     fn a_dollar_quoted_path_is_read_as_the_path_it_names() {
         // `$'…'` and `$"…"` quote their contents; the `$` is not part of the word. Left attached it

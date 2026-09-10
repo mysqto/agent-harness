@@ -14,10 +14,11 @@
 /// One command found in a line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Invocation {
-    /// Program basenames this invocation runs, wrappers first, real program last.
+    /// Program basenames this invocation runs: wrappers first, then the token the program search
+    /// settled on, then — behind a wrapper only — every token that could have been the program.
     ///
     /// A rule matches if *any* of them matches, so `sudo` cannot launder `rm` and a rule naming
-    /// `sudo` itself still fires.
+    /// `sudo` itself still fires. See [`promoted`] for why the tail is in here too.
     pub programs: Vec<String>,
     /// Arguments after the program, with redirection syntax removed.
     pub args: Vec<String>,
@@ -114,7 +115,13 @@ fn invocation(tokens: Vec<String>, wrappers: &[String]) -> Invocation {
                 rest = tail;
             }
             Some((first, tail)) => {
+                // A wrapper was walked iff something is already here, and that is what decides
+                // whether the token below is the program or one of a wrapper's operands.
+                let behind_a_wrapper = !programs.is_empty();
                 programs.push(basename(first).to_string());
+                if behind_a_wrapper {
+                    programs.extend(promoted(tail));
+                }
                 return Invocation {
                     programs,
                     args: tail.to_vec(),
@@ -167,6 +174,33 @@ fn skip_prelude<'a>(tokens: &'a [String], assigned: &mut Vec<String>) -> &'a [St
         assigned.push(operand.clone());
     }
     &tokens[skip..]
+}
+
+/// The tokens behind a wrapper that could name the program the line really runs.
+///
+/// The other half of the fault [`skip_prelude`] documents, and the half a path candidate does not
+/// answer. The program search settles on a wrapper's operand, so the program is left in the
+/// argument list where no *program* rule reaches it: `timeout 5 rm -rf /` and `sudo -u root nc -l
+/// 1234` were measured admitted on the built binary, where `rm -rf /` and `sudo nc -l 1234` are
+/// refused. Which token is the program cannot be recovered — counting a wrapper's operands is
+/// exactly what this parse cannot do, and a parse that could count them would not have had the
+/// gap — so behind a wrapper every token that could be one is offered as one.
+///
+/// Flags and assignments are not offered: no program is named `-rf` or `FOO=bar`, and an
+/// assignment's value is already a path candidate. A basename, because that is how the program
+/// position is read, and an empty one (`/`) names nothing.
+///
+/// The cost, which was accepted rather than discovered: a word that merely looks like a program
+/// name is refused as one, so `timeout 30 cargo build --bin ssh` is refused by the rule that names
+/// `ssh`. It is bounded by the policy — a word matters only where the document already names it —
+/// and the cheaper reading is the permissive one, which is what let the shapes above through.
+fn promoted(tokens: &[String]) -> Vec<String> {
+    tokens
+        .iter()
+        .filter(|token| !token.starts_with('-') && !is_assignment(token))
+        .map(|token| basename(token).to_string())
+        .filter(|name| !name.is_empty())
+        .collect()
 }
 
 fn is_assignment(token: &str) -> bool {
@@ -258,7 +292,7 @@ mod tests {
     use super::{Invocation, parse};
 
     fn wrappers() -> Vec<String> {
-        ["sudo", "env", "xargs"]
+        ["sudo", "env", "xargs", "timeout"]
             .iter()
             .map(ToString::to_string)
             .collect()
@@ -369,6 +403,48 @@ mod tests {
             parsed("TOKEN=abc curl http://example.test")[0].assigned,
             vec!["abc"]
         );
+    }
+
+    /// Behind a wrapper, every token that could be the program is read as one.
+    ///
+    /// The operand takes the program position, so the program the line actually runs sits in the
+    /// tail with nothing naming it. Which token that is cannot be recovered — counting a wrapper's
+    /// operands is exactly what this parse cannot do — so each of them is offered to the program
+    /// rules, and the cost is a word matched as a program name.
+    #[test]
+    fn every_token_behind_a_wrapper_is_offered_as_a_program_name() {
+        // The wrapper's own operand settles the search; `nc` is behind it and is a program.
+        let found = parsed("xargs -a /tmp/list nc -l 1234");
+        assert_eq!(found[0].programs, vec!["xargs", "list", "nc", "1234"]);
+        assert_eq!(found[0].args, vec!["nc", "-l", "1234"]);
+
+        // A flag's operand, a positional operand, and a wrapper behind a wrapper.
+        assert_eq!(
+            parsed("sudo -u root rm -rf /")[0].programs,
+            vec!["sudo", "root", "rm"]
+        );
+        assert_eq!(
+            parsed("timeout 5 rm -rf /")[0].programs,
+            vec!["timeout", "5", "rm"]
+        );
+        assert_eq!(
+            parsed("sudo timeout 5 nc -l 1")[0].programs,
+            vec!["sudo", "timeout", "5", "nc", "1"]
+        );
+        // By its basename, the way the program position is read.
+        assert_eq!(
+            parsed("timeout 5 /usr/bin/nc")[0].programs,
+            vec!["timeout", "5", "nc"]
+        );
+
+        // A flag is not a program name, and neither is an assignment: what it carries is a path
+        // candidate and `assigned` already has it.
+        let found = parsed("env FOO=bar rm -rf /tmp/x");
+        assert_eq!(found[0].programs, vec!["env", "rm", "x"]);
+
+        // Nothing is promoted where no wrapper was walked: the program position is not in doubt,
+        // and `grep -c sh notes` says nothing about running `sh`.
+        assert_eq!(parsed("grep -c sh notes")[0].programs, vec!["grep"]);
     }
 
     #[test]

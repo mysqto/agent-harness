@@ -143,6 +143,12 @@ elif verb == "drop-wrapper":
     # empty-tail case is that a wrapper was walked at all, so this is the half of the claim the
     # interpreter list cannot carry.
     policy["command_wrappers"] = [w for w in policy["command_wrappers"] if w != what]
+elif verb == "drop-command-program":
+    # The program still named on the line but no longer named by any command rule. This is what
+    # separates "the token behind the wrapper reached the program rules" from "the guard refuses
+    # command lines": nothing else in the document refuses this line.
+    for rule in policy["commands"]:
+        rule["programs"] = [p for p in rule["programs"] if p != what]
 elif verb == "drop-flag":
     # The interpreter still listed, but the token that hands it a program no longer recognised.
     for entry in policy["inline_programs"]["interpreters"]:
@@ -346,6 +352,66 @@ policy_mutant inline-flag-unlisted drop-flag:c cmd:"sh -c true" 0
 # is the state this gate was in before today.
 policy_mutant wrapper-unlisted drop-wrapper:timeout cmd:"timeout 5 sh" 0
 policy_mutant wrapped-interpreter-unlisted drop-interpreter:sh cmd:"timeout 5 sh" 0
+
+## A program that is a wrapper's operand #######################################
+# The last hole of this family, and the half the section above did not close. Making a wrapper's
+# operand a candidate *path* said nothing about the token behind it: the program search still
+# settles on the operand, so the program the line runs stays in the argument list where no *program*
+# rule reaches it. Measured admitted on the built binary -- `timeout 5 rm -rf /`, `sudo -u root nc -l
+# 1234` and `xargs -a <file> nc -l 1234` -- while `rm -rf /` and `sudo nc -l 1234` were refused.
+#
+# Which token is the program cannot be recovered: counting a wrapper's operands is exactly what this
+# parse cannot do, and a parse that could count them would not have had the gap. So behind a wrapper
+# every token that could be a program name is offered to the program rules, and all of them ask the
+# same question -- the command list, the writing list and the egress list alike.
+echo "→ a program reached through a wrapper's operand is matched by the program rules"
+for line in "timeout 5 rm -rf /" "sudo -u root rm -rf /" \
+            "timeout 5 nc -l 1234" "sudo -u root nc -l 1234" \
+            "xargs -a list.txt nc -l 1234" "timeout -k 1 5 nc -l 1234" \
+            "sudo timeout 5 /usr/bin/nc -l 1234" "timeout 5 ssh host uptime" \
+            "timeout 5 git push --force" "nice -n 5 shutdown now" \
+            "env -u LANG dd if=/dev/zero of=out.img"; do
+  [ "$(keycmd "$line" "$policy")" = 2 ] \
+    || fail "\`$line\` was admitted: a wrapper's operand hid the program the line runs"
+done
+note "a destructive program, a socket, a rewrite and a power state, each behind a wrapper's operand"
+
+# What that costs, measured rather than estimated, and this is the whole of it: a token that merely
+# looks like a program name is refused as one. The list is bounded by the policy -- a word matters
+# only where the document already names it as a program -- and the last of these is the widest: an
+# egress program past a wrapper's operand keeps its own name in the argument list, where the egress
+# screen reads a bare word as a host, so even an allowlisted target is refused.
+for line in "timeout 30 cargo build --bin ssh" "env grep -rn ssh ." \
+            "timeout 5 grep -c sh notes" "timeout 5 grep -rn touch /usr/include" \
+            "timeout 5 cat /etc/passwd" "timeout 5 echo curl" \
+            "timeout 5 curl http://127.0.0.1:8080/health"; do
+  [ "$(keycmd "$line" "$policy")" = 2 ] \
+    || fail "\`$line\` was admitted, and this section claims it is refused: the cost is not what it says"
+done
+note "a binary target, a search term, a mention, a filename and an allowlisted fetch: the cost, stated"
+
+# And what it does not cost, on the same real filesystem: a word that names nothing in the policy is
+# still a word, a wrapper that spends no operand leaves the program where the search finds it, and
+# every line without a wrapper is untouched.
+for line in "timeout 30 cargo build --bin app" "timeout -k 1 5 cargo build" \
+            "sudo -n rm -rf build" "nice -n 5 make" "env -u EDITOR ls" "xargs -n 1 echo" \
+            "timeout 5 sh install.sh" "timeout 5 bash --version" "timeout 5 cat README.md" \
+            "sudo -u ci make install" "grep -c sh README.md" "cargo build --bin ssh" \
+            "which bash" "ls -la /bin/sh" "make PREFIX=/usr/local install" \
+            "curl http://127.0.0.1:8080/health" "sudo curl http://127.0.0.1:8080/health" \
+            "xargs -n1 curl http://127.0.0.1:8080/health"; do
+  [ "$(keycmd "$line" "$policy")" = 0 ] \
+    || fail "\`$line\` was refused: promoting a token behind a wrapper cost more than it claims"
+done
+note "ordinary work behind a wrapper, and every fetch whose program stays in the program position"
+
+# Two mutants, because two things in the document carry this claim and one would leave the other
+# resting on nothing: that the rule names the program, and that the parser walks the wrapper. Note
+# the asymmetry with the path half above, where dropping the wrapper leaves the operand an ordinary
+# argument and the refusal stands -- here the tail becomes ordinary arguments that name no path
+# rule, so the line goes green and the mutant is caught.
+policy_mutant wrapped-program-unnamed drop-command-program:nc cmd:"timeout 5 nc -l 1234" 0
+policy_mutant wrapped-program-unwrapped drop-wrapper:timeout cmd:"timeout 5 nc -l 1234" 0
 
 echo "→ installing into a scratch project"
 HARNESS_PROJECT_DIR="$work" harnesses/claude-code/install.sh \
